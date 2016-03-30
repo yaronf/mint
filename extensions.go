@@ -3,6 +3,7 @@ package mint
 import (
 	"bytes"
 	"fmt"
+	"encoding/binary"
 )
 
 type extensionBody interface {
@@ -486,4 +487,44 @@ func (dv *draftVersionExtension) Unmarshal(data []byte) (int, error) {
 
 	dv.version = (int(data[0]) << 8) + int(data[1])
 	return 2, nil
+}
+
+type pinningTicketExtension struct {
+	roleIsServer bool
+	pinningTicket []byte
+	pinningProof []byte
+	lifetime uint32
+}
+
+// TODO: add proof-length to draft (1 byte)
+func (pt *pinningTicketExtension) Marshal() ([]byte, error) {
+	if pt.roleIsServer {
+		pte := []byte{}
+		proofLen := len(pt.pinningProof)
+		proofLenHeader := []byte{byte(proofLen)}
+		lifetimeBytes := []byte{}
+		binary.BigEndian.PutUint32(lifetimeBytes, pt.lifetime)
+		pte = append(pte, proofLenHeader...)
+		pte = append(pte, pt.pinningProof...)
+		pte = append(pte, pt.pinningTicket...)
+		pte = append(pte, lifetimeBytes...)
+		return pte, nil
+	} else { // client
+		if pt.pinningTicket == nil || len(pt.pinningTicket) == 0 {
+			return nil, fmt.Errorf("tls.pinningTicket: missing pinning ticket")
+		}
+		return pt.pinningTicket, nil
+	}
+}
+
+func (pt *pinningTicketExtension) Unmarshal(data []byte) (int, error) {
+	if pt.roleIsServer {
+		proofLen := (int(data[0]) << 8) + int(data[1]) // may be 0
+		pt.pinningProof = data[2:proofLen]
+		pt.pinningTicket = data[2 + proofLen: len(data) - 4] // may be empty
+		pt.lifetime = binary.BigEndian.Uint32(data[len(data) - 4:])
+	} else {
+		pt.pinningTicket = data // may be empty
+	}
+	return len(data), nil
 }

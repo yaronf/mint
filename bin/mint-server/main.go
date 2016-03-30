@@ -1,15 +1,55 @@
 package main
 
 import (
-	"github.com/bifurcation/mint"
+	"github.com/yaronf/mint"
 	"log"
 	"net"
+	"crypto/x509"
+	"os"
+	"io/ioutil"
+	"encoding/pem"
 )
+
+func readConfig() *mint.Config {
+	serverName := os.Args[1]
+	serverCertFile := os.Args[2]
+	serverKeyFile := os.Args[3]
+	serverKeyBytes, err := ioutil.ReadFile(serverKeyFile)
+	if err != nil {
+		log.Fatalf("Cannot read key: %s", serverKeyFile)
+	}
+	serverCertBytes, err := ioutil.ReadFile(serverCertFile)
+	if err != nil {
+		log.Fatalf("Cannot read cert: %s", serverCertFile)
+	}
+	serverKeyPEM, _ := pem.Decode(serverKeyBytes)
+	serverKeyDER := serverKeyPEM.Bytes
+	serverCertPEM, _ := pem.Decode(serverCertBytes)
+	serverCertDER := serverCertPEM.Bytes
+	serverCert, _    := x509.ParseCertificate(serverCertDER)
+	serverKey, _    := x509.ParsePKCS1PrivateKey(serverKeyDER)
+	certificates := []*mint.Certificate{
+		&mint.Certificate{
+			Chain:      []*x509.Certificate{serverCert},
+			PrivateKey: serverKey,
+		},
+	}
+	config := &mint.Config{
+		ServerName: serverName,
+		Certificates: certificates,
+	}
+	return config
+}
 
 func main() {
 
 	service := "0.0.0.0:4430"
-	listener, err := mint.Listen("tcp", service, &mint.Config{})
+	if len(os.Args) < 4 || os.Args[0] == "--help"  {
+		log.Printf("Usage: %s server-name cert-file private-key-file", os.Args[0])
+		os.Exit(1)
+	}
+	config := readConfig()
+	listener, err := mint.Listen("tcp", service, config)
 	if err != nil {
 		log.Fatalf("server: listen: %s", err)
 	}

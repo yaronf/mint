@@ -68,6 +68,9 @@ type Config struct {
 	enabledGroup map[namedGroup]bool
 	certsByName  map[string]*Certificate
 
+	// Ticket pinning
+	pinningDB string
+
 	// The same config object can be shared among different connections, so it
 	// needs its own mutex
 	mutex sync.RWMutex
