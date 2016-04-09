@@ -25,7 +25,7 @@ const (
 	// Omitted: *_RESERVED
 	handshakeTypeClientHello         handshakeType = 1
 	handshakeTypeServerHello         handshakeType = 2
-	handshakeTypeSessionTicket       handshakeType = 4
+	handshakeTypeNewSessionTicket    handshakeType = 4
 	handshakeTypeHelloRetryRequest   handshakeType = 6
 	handshakeTypeEncryptedExtensions handshakeType = 8
 	handshakeTypeCertificate         handshakeType = 11
@@ -53,9 +53,11 @@ const (
 	TLS_PSK_WITH_AES_256_GCM_SHA384             cipherSuite = 0x00A9
 	TLS_PSK_WITH_CHACHA20_POLY1305_SHA256       cipherSuite = 0xCCAB
 	TLS_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256 cipherSuite = 0xCCAC
+	TLS_DHE_RSA_WITH_AES_128_GCM_SHA256         cipherSuite = 0x009E
+	TLS_DHE_RSA_WITH_AES_256_GCM_SHA384         cipherSuite = 0x009F
 	// FAKE
-	TLS_ECDHE_PSK_WITH_AES_128_GCM_SHA256 cipherSuite = 0xFF01
-	TLS_ECDHE_PSK_WITH_AES_256_GCM_SHA384 cipherSuite = 0xFF02
+	TLS_ECDHE_PSK_WITH_AES_128_GCM_SHA256 cipherSuite = 0xD001
+	TLS_ECDHE_PSK_WITH_AES_256_GCM_SHA384 cipherSuite = 0xD002
 )
 
 // enum {...} HashAlgorithm
@@ -99,8 +101,9 @@ const (
 	extensionTypeServerName          helloExtensionType = 0
 	extensionTypeSupportedGroups     helloExtensionType = 10
 	extensionTypeSignatureAlgorithms helloExtensionType = 13
-	extensionTypeKeyShare            helloExtensionType = 40     // Provisional value, from NSS
-	extensionTypePreSharedKey        helloExtensionType = 41     // Provisional value, from NSS
+	extensionTypeKeyShare            helloExtensionType = 40
+	extensionTypePreSharedKey        helloExtensionType = 41
+	extensionTypeEarlyData           helloExtensionType = 42
 	extensionTypeDraftVersion        helloExtensionType = 0xff02 // Required for NSS
 )
 

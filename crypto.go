@@ -13,6 +13,7 @@ import (
 	"encoding/asn1"
 	"fmt"
 	"math/big"
+	"time"
 
 	// Blank includes to ensure hash support
 	_ "crypto/sha1"
@@ -32,10 +33,11 @@ const (
 )
 
 type cipherSuiteParams struct {
-	mode   handshakeMode // PSK, DH, or both
-	hash   crypto.Hash   // Hash function
-	keyLen int           // Key length in octets
-	ivLen  int           // IV length in octets
+	sig    signatureAlgorithm // RSA, ECDSA, or both
+	mode   handshakeMode      // PSK, DH, or both
+	hash   crypto.Hash        // Hash function
+	keyLen int                // Key length in octets
+	ivLen  int                // IV length in octets
 }
 
 var (
@@ -49,12 +51,14 @@ var (
 	cipherSuiteMap = map[cipherSuite]cipherSuiteParams{
 		// REQUIRED
 		TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256: cipherSuiteParams{
+			sig:    signatureAlgorithmECDSA,
 			mode:   handshakeModeDH,
 			hash:   crypto.SHA256,
 			keyLen: 16,
 			ivLen:  12,
 		},
 		TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256: cipherSuiteParams{
+			sig:    signatureAlgorithmRSA,
 			mode:   handshakeModeDH,
 			hash:   crypto.SHA256,
 			keyLen: 16,
@@ -62,12 +66,14 @@ var (
 		},
 		// RECOMMENDED
 		TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384: cipherSuiteParams{
+			sig:    signatureAlgorithmECDSA,
 			mode:   handshakeModeDH,
 			hash:   crypto.SHA384,
 			keyLen: 32,
 			ivLen:  12,
 		},
 		TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384: cipherSuiteParams{
+			sig:    signatureAlgorithmRSA,
 			mode:   handshakeModeDH,
 			hash:   crypto.SHA384,
 			keyLen: 32,
@@ -80,7 +86,26 @@ var (
 			keyLen: 16,
 			ivLen:  12,
 		},
-		// FAKE
+		TLS_PSK_WITH_AES_256_GCM_SHA384: cipherSuiteParams{
+			mode:   handshakeModePSK,
+			hash:   crypto.SHA384,
+			keyLen: 32,
+			ivLen:  12,
+		},
+		TLS_DHE_RSA_WITH_AES_128_GCM_SHA256: cipherSuiteParams{
+			sig:    signatureAlgorithmRSA,
+			mode:   handshakeModeDH,
+			hash:   crypto.SHA256,
+			keyLen: 16,
+			ivLen:  12,
+		},
+		TLS_DHE_RSA_WITH_AES_256_GCM_SHA384: cipherSuiteParams{
+			sig:    signatureAlgorithmRSA,
+			mode:   handshakeModeDH,
+			hash:   crypto.SHA384,
+			keyLen: 32,
+			ivLen:  12,
+		},
 		TLS_ECDHE_PSK_WITH_AES_128_GCM_SHA256: cipherSuiteParams{
 			mode:   handshakeModePSKAndDH,
 			hash:   crypto.SHA256,
@@ -88,7 +113,7 @@ var (
 			ivLen:  12,
 		},
 		TLS_ECDHE_PSK_WITH_AES_256_GCM_SHA384: cipherSuiteParams{
-			mode:   handshakeModeDH,
+			mode:   handshakeModePSKAndDH,
 			hash:   crypto.SHA384,
 			keyLen: 32,
 			ivLen:  12,
@@ -139,6 +164,34 @@ func keyExchangeSizeFromNamedGroup(group namedGroup) (size int) {
 	return
 }
 
+func primeFromNamedGroup(group namedGroup) (p *big.Int) {
+	switch group {
+	case namedGroupFF2048:
+		p = finiteFieldPrime2048
+	case namedGroupFF3072:
+		p = finiteFieldPrime3072
+	case namedGroupFF4096:
+		p = finiteFieldPrime4096
+	case namedGroupFF6144:
+		p = finiteFieldPrime6144
+	case namedGroupFF8192:
+		p = finiteFieldPrime8192
+	}
+	return
+}
+
+func ffdheKeyShareFromPrime(p *big.Int) (priv, pub *big.Int, err error) {
+	// g = 2 for all ffdhe groups
+	priv, err = rand.Int(prng, p)
+	if err != nil {
+		return
+	}
+
+	pub = big.NewInt(0)
+	pub.Exp(big.NewInt(2), priv, p)
+	return
+}
+
 func newKeyShare(group namedGroup) (pub []byte, priv []byte, err error) {
 	switch group {
 	case namedGroupP256, namedGroupP384, namedGroupP521:
@@ -151,6 +204,19 @@ func newKeyShare(group namedGroup) (pub []byte, priv []byte, err error) {
 
 		pub = elliptic.Marshal(crv, x, y)
 		pub = append([]byte{byte(len(pub))}, pub...)
+		return
+
+	case namedGroupFF2048, namedGroupFF3072, namedGroupFF4096,
+		namedGroupFF6144, namedGroupFF8192:
+		p := primeFromNamedGroup(group)
+		x, X, err2 := ffdheKeyShareFromPrime(p)
+		if err2 != nil {
+			err = err2
+			return
+		}
+
+		priv = x.Bytes()
+		pub = X.Bytes()
 		return
 
 	default:
@@ -177,6 +243,14 @@ func keyAgreement(group namedGroup, pub []byte, priv []byte) ([]byte, error) {
 		}
 		return xBytes, nil
 
+	case namedGroupFF2048, namedGroupFF3072, namedGroupFF4096,
+		namedGroupFF6144, namedGroupFF8192:
+		p := primeFromNamedGroup(group)
+		x := big.NewInt(0).SetBytes(priv)
+		Y := big.NewInt(0).SetBytes(pub)
+		Z := big.NewInt(0).Exp(Y, x, p)
+		return Z.Bytes(), nil
+
 	default:
 		return nil, fmt.Errorf("tls.keyagreement: Unsupported group %v", group)
 	}
@@ -198,9 +272,14 @@ func newSelfSigned(name string, alg signatureAndHashAlgorithm, priv crypto.Signe
 	if !ok {
 		return nil, fmt.Errorf("tls.selfsigned: Unknown signature algorithm")
 	}
+	if len(name) == 0 {
+		return nil, fmt.Errorf("tls.selfsigned: No name provided")
+	}
 
 	template := &x509.Certificate{
 		SerialNumber:       big.NewInt(0xA0A0A0A0),
+		NotBefore:          time.Now(),
+		NotAfter:           time.Now().AddDate(0, 0, 1),
 		SignatureAlgorithm: sigAlg,
 		Subject:            pkix.Name{CommonName: name},
 		DNSNames:           []string{name},
@@ -377,11 +456,13 @@ func hkdfExpandLabel(hash crypto.Hash, secret []byte, label string, hashValue []
 }
 
 const (
-	labelMSS            = "expanded static secret"
-	labelMES            = "expanded ephemeral secret"
-	labelTrafficSecret  = "traffic secret"
-	labelServerFinished = "server finished"
-	labelClientFinished = "client finished"
+	labelMSS              = "expanded static secret"
+	labelMES              = "expanded ephemeral secret"
+	labelTrafficSecret    = "traffic secret"
+	labelResumptionSecret = "resumption master secret"
+	labelExporterSecret   = "exporter master secret"
+	labelServerFinished   = "server finished"
+	labelClientFinished   = "client finished"
 
 	phaseEarlyHandshake = "early handshake key expansion"
 	phaseEarlyData      = "early application data key expansion"
@@ -411,7 +492,6 @@ const (
 	ctxStateComplete
 )
 
-// XXX: This might be specific to 1xRTT; we'll figure out how to adapt later
 type cryptoContext struct {
 	state ctxState
 
@@ -437,8 +517,17 @@ type cryptoContext struct {
 	clientFinishedData []byte
 	clientFinished     *finishedBody
 
-	trafficSecret   []byte
-	applicationKeys keySet
+	trafficSecret    []byte
+	resumptionSecret []byte
+	exporterSecret   []byte
+	applicationKeys  keySet
+
+	// 0xRTT early data
+	earlyHandshakeKeys   keySet
+	earlyApplicationKeys keySet
+	earlyFinishedKey     []byte
+	earlyFinishedData    []byte
+	earlyFinished        *finishedBody
 }
 
 func (c *cryptoContext) marshalTranscript() []byte {
@@ -475,7 +564,47 @@ func (c *cryptoContext) Init(suite cipherSuite) error {
 	return nil
 }
 
+func (c *cryptoContext) ComputeEarlySecrets(SS []byte, chm *handshakeMessage) error {
+	if c.state != ctxStateInit {
+		return fmt.Errorf("tls.cryptobase: wrong state")
+	}
+
+	c.SS = make([]byte, len(SS))
+	copy(c.SS, SS)
+
+	c.xSS = hkdfExtract(c.params.hash, nil, c.SS)
+
+	// XXX: Assumes ClientHello is the only message in the client's first flight,
+	//      i.e., no client authentication
+	c.transcript = []*handshakeMessage{chm}
+	context := c.marshalTranscript()
+	h := c.params.hash.New()
+	h.Write(context)
+	handshakeHash := h.Sum(nil)
+
+	c.earlyHandshakeKeys = c.makeTrafficKeys(c.xSS, phaseEarlyHandshake, handshakeHash)
+	c.earlyApplicationKeys = c.makeTrafficKeys(c.xSS, phaseEarlyData, handshakeHash)
+
+	L := c.params.hash.Size()
+	c.earlyFinishedKey = hkdfExpandLabel(c.params.hash, c.xSS, labelClientFinished, []byte{}, L)
+
+	earlyFinishedMAC := hmac.New(c.params.hash.New, c.earlyFinishedKey)
+	earlyFinishedMAC.Write(handshakeHash)
+	c.earlyFinishedData = earlyFinishedMAC.Sum(nil)
+	logf(logTypeCrypto, "client Finished data: [%d] %x", len(handshakeHash), handshakeHash)
+
+	c.earlyFinished = &finishedBody{
+		verifyDataLen: L,
+		verifyData:    c.earlyFinishedData,
+	}
+
+	return nil
+}
+
 func (c *cryptoContext) ComputeBaseSecrets(dhSecret, pskSecret []byte) error {
+	logf(logTypeCrypto, "dhSecret: [%d] %x", len(dhSecret), dhSecret)
+	logf(logTypeCrypto, "pskSecret: [%d] %x", len(pskSecret), pskSecret)
+
 	if c.state != ctxStateInit {
 		return fmt.Errorf("tls.cryptobase: wrong state")
 	}
@@ -483,6 +612,7 @@ func (c *cryptoContext) ComputeBaseSecrets(dhSecret, pskSecret []byte) error {
 	// Compute ES, SS
 	switch c.params.mode {
 	case handshakeModePSK:
+		logf(logTypeHandshake, "ComputeBaseSecrets(PSK)")
 		if pskSecret == nil {
 			return fmt.Errorf("tls.cryptobase: PSK selected but no PSK secret provided")
 		}
@@ -492,6 +622,7 @@ func (c *cryptoContext) ComputeBaseSecrets(dhSecret, pskSecret []byte) error {
 		copy(c.SS, pskSecret)
 		copy(c.ES, pskSecret)
 	case handshakeModePSKAndDH:
+		logf(logTypeHandshake, "ComputeBaseSecrets(PSK and DH)")
 		if pskSecret == nil {
 			return fmt.Errorf("tls.cryptobase: PSK selected but no PSK secret provided")
 		}
@@ -504,6 +635,7 @@ func (c *cryptoContext) ComputeBaseSecrets(dhSecret, pskSecret []byte) error {
 		copy(c.SS, pskSecret)
 		copy(c.ES, dhSecret)
 	case handshakeModeDH:
+		logf(logTypeHandshake, "ComputeBaseSecrets(DH)")
 		if dhSecret == nil {
 			return fmt.Errorf("tls.cryptobase: DH selected but no DH secret provided")
 		}
@@ -571,12 +703,10 @@ func (c *cryptoContext) Update(messages []*handshakeMessage) error {
 	// Compute mSS, mES = HKDF-Expand-Label(xSS, label, handshake_hash, L)
 	L := c.params.hash.Size()
 	c.mSS = hkdfExpandLabel(c.params.hash, c.xSS, labelMSS, handshakeHash, L)
-	c.mES = hkdfExpandLabel(c.params.hash, c.xSS, labelMES, handshakeHash, L)
+	c.mES = hkdfExpandLabel(c.params.hash, c.xES, labelMES, handshakeHash, L)
 
-	// Compute master_secret, traffic_secret_0
+	// Compute master_secret and traffic secret
 	c.masterSecret = hkdfExtract(c.params.hash, c.mSS, c.mES)
-
-	// Compute traffic_secret_0
 	c.trafficSecret = hkdfExpandLabel(c.params.hash, c.masterSecret, labelTrafficSecret, handshakeHash, L)
 
 	// Compute client and server Finished keys
@@ -611,8 +741,15 @@ func (c *cryptoContext) Update(messages []*handshakeMessage) error {
 		verifyData:    c.clientFinishedData,
 	}
 
-	// application_key_0
+	// Compute application_key_0
 	c.applicationKeys = c.makeTrafficKeys(c.trafficSecret, phaseApplication, handshakeHash)
+
+	// Add clientFinished to transcript and compute the resumption / exporter secrets
+	clientFinishedMessage, _ := handshakeMessageFromBody(c.clientFinished)
+	h.Write(clientFinishedMessage.Marshal())
+	handshakeHash = h.Sum(nil)
+	c.resumptionSecret = hkdfExpandLabel(c.params.hash, c.masterSecret, labelResumptionSecret, handshakeHash, L)
+	c.exporterSecret = hkdfExpandLabel(c.params.hash, c.masterSecret, labelExporterSecret, handshakeHash, L)
 
 	c.state = ctxStateComplete
 	return nil

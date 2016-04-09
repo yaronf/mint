@@ -55,8 +55,11 @@ type Config struct {
 	ClientPSKs      map[string]PreSharedKey
 
 	// Server fields
-	Certificates []*Certificate
-	ServerPSKs   []PreSharedKey
+	Certificates       []*Certificate
+	ServerPSKs         []PreSharedKey
+	SendSessionTickets bool
+	TicketLifetime     uint32
+	TicketLen          int
 
 	// Shared fields
 	CipherSuites        []cipherSuite
@@ -76,7 +79,7 @@ type Config struct {
 	mutex sync.RWMutex
 }
 
-func (c *Config) init(isClient bool) error {
+func (c *Config) Init(isClient bool) error {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
@@ -89,6 +92,12 @@ func (c *Config) init(isClient bool) error {
 	}
 	if len(c.SignatureAlgorithms) == 0 {
 		c.SignatureAlgorithms = defaultSignatureAlgorithms
+	}
+	if c.TicketLen == 0 {
+		c.TicketLen = defaultTicketLen
+	}
+	if c.ClientPSKs == nil {
+		c.ClientPSKs = map[string]PreSharedKey{}
 	}
 
 	// If there is no certificate, generate one
@@ -121,9 +130,6 @@ func (c *Config) init(isClient bool) error {
 	c.enabledGroup = map[namedGroup]bool{}
 	c.certsByName = map[string]*Certificate{}
 
-	for _, suite := range c.CipherSuites {
-		c.enabledSuite[suite] = true
-	}
 	for _, group := range c.Groups {
 		c.enabledGroup[group] = true
 	}
@@ -134,7 +140,22 @@ func (c *Config) init(isClient bool) error {
 		for _, name := range cert.Chain[0].DNSNames {
 			c.certsByName[name] = cert
 		}
+		for _, suite := range c.CipherSuites {
+			if cipherSuiteMap[suite].sig == signatureAlgorithmRSA {
+				if cert.Chain[0].PublicKeyAlgorithm == x509.RSA {
+					c.enabledSuite[suite] = true
+				}
+			} else if cipherSuiteMap[suite].sig == signatureAlgorithmECDSA {
+				if cert.Chain[0].PublicKeyAlgorithm == x509.ECDSA {
+					c.enabledSuite[suite] = true
+				}
+			} else {
+				// PSK modes work for every handshake signature type
+				c.enabledSuite[suite] = true
+			}
+		}
 	}
+	logf(logTypeCrypto, "Enabled suites [%v]", c.enabledSuite)
 
 	return nil
 }
@@ -173,6 +194,8 @@ var (
 		signatureAndHashAlgorithm{hashAlgorithmSHA512, signatureAlgorithmRSA},
 		signatureAndHashAlgorithm{hashAlgorithmSHA512, signatureAlgorithmECDSA},
 	}
+
+	defaultTicketLen = 16
 )
 
 // Conn implements the net.Conn interface, as with "crypto/tls"
@@ -182,6 +205,9 @@ type Conn struct {
 	config   *Config
 	conn     net.Conn
 	isClient bool
+
+	earlyData        []byte
+	earlyCipherSuite cipherSuite
 
 	handshakeMutex    sync.Mutex
 	handshakeErr      error
@@ -216,7 +242,51 @@ func (c *Conn) extendBuffer(n int) error {
 
 		switch pt.contentType {
 		case recordTypeHandshake:
-			// TODO: Handle post-handshake handshake messages
+			// We do not support fragmentation of post-handshake handshake messages
+			// TODO: Factor this more elegantly; coalesce with handshakeLayer.ReadMessage()
+			start := 0
+			for start < len(pt.fragment) {
+				if len(pt.fragment[start:]) < handshakeHeaderLen {
+					return fmt.Errorf("Post-handshake handshake message too short for header")
+				}
+
+				hm := &handshakeMessage{}
+				hm.msgType = handshakeType(pt.fragment[start])
+				hmLen := (int(pt.fragment[start+1]) << 16) + (int(pt.fragment[start+2]) << 8) + int(pt.fragment[start+3])
+
+				if len(pt.fragment[start+handshakeHeaderLen:]) < hmLen {
+					return fmt.Errorf("Post-handshake handshake message too short for body")
+				}
+				hm.body = pt.fragment[start+handshakeHeaderLen : start+handshakeHeaderLen+hmLen]
+
+				switch hm.msgType {
+				case handshakeTypeNewSessionTicket:
+					var tkt newSessionTicketBody
+					read, err := tkt.Unmarshal(hm.body)
+					if err != nil {
+						return err
+					}
+					if read != len(hm.body) {
+						return fmt.Errorf("Malformed handshake message [%v] != [%v]", read, len(hm.body))
+					}
+
+					logf(logTypeHandshake, "Storing new session ticket with identity [%v]", tkt.ticket)
+					psk := PreSharedKey{
+						Identity: tkt.ticket,
+						Key:      c.context.resumptionSecret,
+					}
+					c.config.ClientPSKs[c.config.ServerName] = psk
+
+				case handshakeTypeKeyUpdate:
+					// TODO: Support KeyUpdate
+					fallthrough
+				default:
+					c.sendAlert(alertUnexpectedMessage)
+					return fmt.Errorf("Unsupported post-handshake handshake message [%v]", hm.msgType)
+				}
+
+				start += handshakeHeaderLen + hmLen
+			}
 		case recordTypeAlert:
 			logf(logTypeIO, "extended buffer (for alert): [%d] %x", len(c.readBuffer), c.readBuffer)
 			if len(pt.fragment) != 2 {
@@ -290,11 +360,6 @@ func (c *Conn) Read(buffer []byte) (int, error) {
 
 // Write application data
 func (c *Conn) Write(buffer []byte) (int, error) {
-	// XXX crypto/tls has an interlock with Close here.  Do we need that?
-	if err := c.Handshake(); err != nil {
-		return 0, err
-	}
-
 	// Lock the output channel
 	c.out.Lock()
 	defer c.out.Unlock()
@@ -348,8 +413,8 @@ func (c *Conn) sendAlert(err alert) error {
 		fragment:    tmp},
 	)
 
-	// closeNotify is a special case in that it isn't an error:
-	if err != alertCloseNotify {
+	// close_notify and end_of_early_data are not actually errors
+	if err != alertCloseNotify && err != alertEndOfEarlyData {
 		return &net.OpError{Op: "local error", Err: err}
 	}
 	return nil
@@ -405,7 +470,7 @@ func (c *Conn) Handshake() error {
 		return nil
 	}
 
-	if err := c.config.init(c.isClient); err != nil {
+	if err := c.config.Init(c.isClient); err != nil {
 		return err
 	}
 
@@ -426,28 +491,13 @@ func (c *Conn) Handshake() error {
 }
 
 func (c *Conn) clientHandshake() error {
+	logf(logTypeHandshake, "Starting clientHandshake")
+
 	hIn := newHandshakeLayer(c.in)
 	hOut := newHandshakeLayer(c.out)
 
-	// XXX Config
-	/*
-		config := struct {
-			serverName    string
-			authCallback  func(chain []*x509.Certificate) error
-			preSharedKeys map[string]preSharedKey
-		}{
-			serverName:   "example.com",
-			authCallback: func(chain []*x509.Certificate) error { return nil },
-			preSharedKeys: map[string]preSharedKey{
-				"example.com": preSharedKey{
-					identity: []byte{0, 1, 2, 3},
-					key:      []byte("sixteen byte key"),
-				},
-			},
-		}
-	*/
-
 	// Construct some extensions
+	logf(logTypeHandshake, "Constructing ClientHello")
 	privateKeys := map[namedGroup][]byte{}
 	ks := keyShareExtension{
 		roleIsServer: false,
@@ -470,15 +520,33 @@ func (c *Conn) clientHandshake() error {
 
 	var psk *preSharedKeyExtension
 	if key, ok := c.config.ClientPSKs[c.config.ServerName]; ok {
+		logf(logTypeHandshake, "Sending PSK")
 		psk = &preSharedKeyExtension{
 			roleIsServer: false,
 			identities:   [][]byte{key.Identity},
+		}
+	} else {
+		logf(logTypeHandshake, "No PSK found for [%v] in %+v", c.config.ServerName, c.config.ClientPSKs)
+	}
+
+	var ed *earlyDataExtension
+	if c.earlyData != nil {
+		if psk == nil {
+			return fmt.Errorf("tls.client: Can't send early data without a PSK")
+		}
+
+		ed = &earlyDataExtension{
+			cipherSuite: c.earlyCipherSuite,
 		}
 	}
 
 	// Construct and write ClientHello
 	ch := &clientHelloBody{
 		cipherSuites: c.config.CipherSuites,
+	}
+	_, err := prng.Read(ch.random[:])
+	if err != nil {
+		return err
 	}
 	for _, ext := range []extensionBody{&sni, &ks, &sg, &sa, &dv} {
 		err := ch.extensions.Add(ext)
@@ -492,11 +560,62 @@ func (c *Conn) clientHandshake() error {
 			return err
 		}
 	}
+	if ed != nil {
+		err := ch.extensions.Add(ed)
+		if err != nil {
+			return err
+		}
+	}
 	chm, err := hOut.WriteMessageBody(ch)
 	if err != nil {
 		return err
 	}
 	logf(logTypeHandshake, "Sent ClientHello")
+
+	// Send early data
+	if ed != nil {
+		logf(logTypeHandshake, "[client] Processing early data...")
+		// We will only get here if we sent exactly one PSK, and this is it
+		pskSecret := c.config.ClientPSKs[c.config.ServerName].Key
+		ctx := cryptoContext{}
+		ctx.Init(c.earlyCipherSuite)
+		ctx.ComputeEarlySecrets(pskSecret, chm)
+
+		// Rekey output to early handshake keys
+		logf(logTypeHandshake, "[client] Rekey -> handshake...")
+		err = c.out.Rekey(ctx.suite, ctx.earlyHandshakeKeys.clientWriteKey, ctx.earlyHandshakeKeys.clientWriteIV)
+		if err != nil {
+			return err
+		}
+
+		// Send early finished message
+		logf(logTypeHandshake, "[client] Sending Finished...")
+		_, err = hOut.WriteMessageBody(ctx.earlyFinished)
+		if err != nil {
+			return err
+		}
+
+		// Rekey output to early data keys
+		logf(logTypeHandshake, "[client] Rekey -> application...")
+		err = c.out.Rekey(ctx.suite, ctx.earlyApplicationKeys.clientWriteKey, ctx.earlyApplicationKeys.clientWriteIV)
+		if err != nil {
+			return err
+		}
+
+		// Send early application data
+		logf(logTypeHandshake, "[client] Sending data...")
+		_, err = c.Write(c.earlyData)
+		if err != nil {
+			return err
+		}
+
+		// Send end_of_earlyData
+		logf(logTypeHandshake, "[client] Sending end_of_early_data...")
+		err = c.sendAlert(alertEndOfEarlyData)
+		if err != nil {
+			return err
+		}
+	}
 
 	// Read ServerHello
 	sh := new(serverHelloBody)
@@ -649,40 +768,10 @@ func (c *Conn) clientHandshake() error {
 }
 
 func (c *Conn) serverHandshake() error {
+	logf(logTypeHandshake, "Starting serverHandshake")
+
 	hIn := newHandshakeLayer(c.in)
 	hOut := newHandshakeLayer(c.out)
-
-	// Config
-	/*
-		config := struct {
-			supportedGroup       map[namedGroup]bool
-			supportedCiphersuite map[cipherSuite]bool
-			privateKey           crypto.Signer
-			certicate            *x509.Certificate
-			preSharedKeys        []preSharedKey
-		}{
-			supportedGroup: map[namedGroup]bool{
-				namedGroupP256: true,
-				namedGroupP384: true,
-				namedGroupP521: true,
-			},
-			supportedCiphersuite: map[cipherSuite]bool{
-				//TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256: true,
-				//TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:   true,
-				TLS_PSK_WITH_AES_128_GCM_SHA256: true, // use to force PSK
-				//TLS_ECDHE_PSK_WITH_AES_128_GCM_SHA256: true, // use to force PSK+DH
-			},
-			preSharedKeys: []preSharedKey{
-				preSharedKey{
-					identity: []byte{0, 1, 2, 3},
-					key:      []byte("sixteen byte key"),
-				},
-			},
-		}
-		config.privateKey, _ = newSigningKey(signatureAlgorithmRSA)
-		config.certicate, _ = newSelfSigned("example.com",
-			signatureAndHashAlgorithm{hashAlgorithmSHA256, signatureAlgorithmRSA}, config.privateKey)
-	*/
 
 	// Read ClientHello and extract extensions
 	ch := new(clientHelloBody)
@@ -698,12 +787,14 @@ func (c *Conn) serverHandshake() error {
 	signatureAlgorithms := new(signatureAlgorithmsExtension)
 	clientKeyShares := &keyShareExtension{roleIsServer: false}
 	clientPSK := &preSharedKeyExtension{roleIsServer: false}
+	clientEarlyData := &earlyDataExtension{roleIsServer: false}
 
 	gotServerName := ch.extensions.Find(serverName)
 	gotSupportedGroups := ch.extensions.Find(supportedGroups)
 	gotSignatureAlgorithms := ch.extensions.Find(signatureAlgorithms)
 	gotKeyShares := ch.extensions.Find(clientKeyShares)
 	gotPSK := ch.extensions.Find(clientPSK)
+	gotEarlyData := ch.extensions.Find(clientEarlyData)
 	if !gotServerName || !gotSupportedGroups || !gotSignatureAlgorithms {
 		logf(logTypeHandshake, "Insufficient extensions")
 		return fmt.Errorf("tls.server: Missing extension in ClientHello (%v %v %v %v)",
@@ -759,16 +850,109 @@ func (c *Conn) serverHandshake() error {
 		}
 	}
 
+	// Find early_data extension and handle early data
+	if gotEarlyData {
+		logf(logTypeHandshake, "[server] Processing early data")
+
+		// Can't do early data if we don't have a PSK
+		// TODO Handle this more elegantly
+		if pskSecret == nil {
+			return fmt.Errorf("tls.server: EarlyData with no PSK")
+		}
+		if !c.config.enabledSuite[clientEarlyData.cipherSuite] {
+			return fmt.Errorf("tls.server: EarlyData with an unsupported ciphersuite")
+		}
+
+		// Compute early handshake / traffic keys from pskSecret
+		logf(logTypeHandshake, "[server] Computing early secrets...")
+		ctx := cryptoContext{}
+		ctx.Init(clientEarlyData.cipherSuite)
+		ctx.ComputeEarlySecrets(pskSecret, chm)
+
+		// Rekey read channel to early handshake keys
+		logf(logTypeHandshake, "[server] Rekey -> handshake...")
+		err = c.in.Rekey(ctx.suite, ctx.earlyHandshakeKeys.clientWriteKey, ctx.earlyHandshakeKeys.clientWriteIV)
+		if err != nil {
+			return err
+		}
+
+		// Read finished message and verify
+		logf(logTypeHandshake, "[server] Reading finished...")
+		earlyFin := new(finishedBody)
+		earlyFin.verifyDataLen = ctx.earlyFinished.verifyDataLen
+		_, err = hIn.ReadMessageBody(earlyFin)
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(earlyFin.verifyData, ctx.earlyFinished.verifyData) {
+			return fmt.Errorf("tls.client: Client's early Finished failed to verify")
+		}
+
+		// Rekey read channel to early traffic keys
+		logf(logTypeHandshake, "[server] Rekey -> application...")
+		err = c.in.Rekey(ctx.suite, ctx.earlyApplicationKeys.clientWriteKey, ctx.earlyApplicationKeys.clientWriteIV)
+		if err != nil {
+			return err
+		}
+
+		// Read to end of early data
+		logf(logTypeHandshake, "[server] Reading early data...")
+		done := false
+		for !done {
+			logf(logTypeHandshake, "  Record!")
+			pt, err := c.in.ReadRecord()
+			if err != nil {
+				return err
+			}
+
+			switch pt.contentType {
+			case recordTypeAlert:
+				alertType := alert(pt.fragment[1])
+				if alertType == alertEndOfEarlyData {
+					done = true
+				} else {
+					return fmt.Errorf("tls.server: Unexpected alert in early data [%v]", alertType)
+				}
+			case recordTypeApplicationData:
+				// XXX: Should expose early data differently
+				c.readBuffer = append(c.readBuffer, pt.fragment...)
+			default:
+				return fmt.Errorf("tls.server: Unexpected content type in early data [%v] %x", pt.contentType, pt.fragment)
+			}
+		}
+
+		logf(logTypeHandshake, "[server] Done reading early data [%d] %x", len(c.readBuffer), c.readBuffer)
+	}
+
 	// Pick a ciphersuite
 	var chosenSuite cipherSuite
 	foundCipherSuite := false
 	for _, suite := range ch.cipherSuites {
+		// Only use PSK modes if we got a PSK
+		mode := cipherSuiteMap[suite].mode
+		if gotPSK && (mode != handshakeModePSK) && (mode != handshakeModePSKAndDH) {
+			continue
+		}
+
 		if c.config.enabledSuite[suite] {
 			chosenSuite = suite
 			foundCipherSuite = true
 			break
 		}
 	}
+
+	// If there are no matching suites and PSK is present, check non-PSK
+	if !foundCipherSuite {
+		for _, suite := range ch.cipherSuites {
+			if c.config.enabledSuite[suite] {
+				chosenSuite = suite
+				foundCipherSuite = true
+				break
+			}
+		}
+	}
+
+	logf(logTypeCrypto, "Supported Client suites [%v]", ch.cipherSuites)
 	if !foundCipherSuite {
 		logf(logTypeHandshake, "No acceptable ciphersuites")
 		return fmt.Errorf("tls.server: No acceptable ciphersuites")
@@ -795,6 +979,10 @@ func (c *Conn) serverHandshake() error {
 	// Create the ServerHello
 	sh := &serverHelloBody{
 		cipherSuite: chosenSuite,
+	}
+	_, err = prng.Read(sh.random[:])
+	if err != nil {
+		return err
 	}
 	if sendKeyShare {
 		sh.extensions.Add(serverKeyShare)
@@ -911,6 +1099,28 @@ func (c *Conn) serverHandshake() error {
 	err = c.out.Rekey(ctx.suite, ctx.applicationKeys.serverWriteKey, ctx.applicationKeys.serverWriteIV)
 	if err != nil {
 		return err
+	}
+
+	// Send a new session ticket
+	tkt, err := newSessionTicket(c.config.TicketLifetime, c.config.TicketLen)
+	if err != nil {
+		return err
+	}
+
+	if c.config.SendSessionTickets {
+		newPSK := PreSharedKey{
+			Identity: tkt.ticket,
+			Key:      ctx.resumptionSecret,
+		}
+		c.config.ServerPSKs = append(c.config.ServerPSKs, newPSK)
+
+		logf(logTypeHandshake, "About to write NewSessionTicket %v", tkt.ticket)
+		_, err = hOut.WriteMessageBody(tkt)
+		logf(logTypeHandshake, "Wrote NewSessionTicket %v", tkt.ticket)
+		if err != nil {
+			logf(logTypeHandshake, "Returning error: %v", err)
+			return err
+		}
 	}
 
 	c.context = ctx

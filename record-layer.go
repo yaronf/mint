@@ -54,6 +54,8 @@ func (r *recordLayer) Rekey(suite cipherSuite, key []byte, iv []byte) error {
 		TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
 		TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
 		TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+		TLS_DHE_RSA_WITH_AES_128_GCM_SHA256,
+		TLS_DHE_RSA_WITH_AES_256_GCM_SHA384,
 		TLS_PSK_WITH_AES_128_GCM_SHA256,
 		TLS_ECDHE_PSK_WITH_AES_128_GCM_SHA256:
 		params := cipherSuiteMap[suite]
@@ -103,7 +105,7 @@ func (r *recordLayer) encrypt(pt *tlsPlaintext, padLen int) *tlsPlaintext {
 
 	// Assemble the revised plaintext
 	out := &tlsPlaintext{
-		contentType: pt.contentType,
+		contentType: recordTypeApplicationData,
 		fragment:    make([]byte, ciphertextLen),
 	}
 	copy(out.fragment, pt.fragment)
