@@ -5,7 +5,7 @@ import (
 	"log"
 	"net"
 
-	"github.com/bifurcation/mint"
+	"../../../mint"
 )
 
 var port string
