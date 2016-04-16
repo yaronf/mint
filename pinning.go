@@ -125,12 +125,33 @@ func (ps *pinningStore) storeProtectionKey(keyID int, key []byte, validFrom time
 }
 
 func (ps *pinningStore) readProtectionKey(keyID int) (key []byte, validFrom time.Time, validUntil time.Time, found bool) {
-	stmt, err := ps.db.Prepare("select key_blob, valid_from, valid_until from protection_keys where key_id = ?")
+	stmt, err := ps.db.Prepare("select key, valid_from, valid_until from protection_keys where keyid = ?")
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer stmt.Close()
 	rows, err := stmt.Query(keyID)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		found = false
+		return
+	}
+	rows.Scan(&key, &validFrom, &validUntil)
+	found = true
+	return
+}
+
+func (ps *pinningStore) readCurrentProtectionKey() (key []byte, validFrom time.Time, validUntil time.Time, found bool) {
+	now := time.Now()
+	stmt, err := ps.db.Prepare("select key, valid_from, valid_until from protection_keys where ? between valid_from and valid_until")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer stmt.Close()
+	rows, err := stmt.Query(now)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -164,26 +185,26 @@ func (pt *pinningTicket) Protect(protectionKey []byte) []byte {
 	if err != nil {
 		panic(err.Error())
 	}
-	nonce := make([]byte, block.BlockSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		panic(err.Error())
-	}
 	aesgcm, err := cipher.NewGCM(block)
 	if err != nil {
 		panic(err.Error())
 	}
-	var pkIDbytes []byte
+	nonce := make([]byte, aesgcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		panic(err.Error())
+	}
+	pkIDbytes := make([]byte, 4)
 	binary.BigEndian.PutUint32(pkIDbytes, pt.protectionKeyID)
 	encryptedTicket := aesgcm.Seal(nil, nonce, pt.ticketSecret, pkIDbytes)
 	return bytes.Join([][]byte{pkIDbytes, nonce, encryptedTicket}, []byte{})
 }
 
 func ReadProtectionKeyID(sealedTicket []byte) int {
-	return int(binary.BigEndian.Uint32(sealedTicket[0:3]))
+	return int(binary.BigEndian.Uint32(sealedTicket[0:4]))
 }
 
 func Validate(sealedTicket []byte, protectionKey []byte) (pt pinningTicket, valid bool) {
-	pt.protectionKeyID = binary.BigEndian.Uint32(sealedTicket[0:3])
+	pt.protectionKeyID = binary.BigEndian.Uint32(sealedTicket[0:4])
 	block, err := aes.NewCipher(protectionKey)
 	if err != nil {
 		panic(err.Error())
@@ -192,9 +213,9 @@ func Validate(sealedTicket []byte, protectionKey []byte) (pt pinningTicket, vali
 	if err != nil {
 		panic(err.Error())
 	}
-	nonce := sealedTicket[4 : 4+block.BlockSize()]
-	cipherText := sealedTicket[4+block.BlockSize():]
-	var pkIDbytes []byte
+	nonce := sealedTicket[4 : 4+aesgcm.NonceSize()]
+	cipherText := sealedTicket[4+aesgcm.NonceSize():]
+	pkIDbytes := make([]byte, 4)
 	binary.BigEndian.PutUint32(pkIDbytes, pt.protectionKeyID)
 	pt.ticketSecret, err = aesgcm.Open(nil, nonce, cipherText, pkIDbytes)
 	valid = (err == nil)
