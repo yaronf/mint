@@ -37,6 +37,14 @@ func TestStoreTicket(t *testing.T) {
 	assertEquals(t, found, true)
 	tkt, psec, _, found = ps.readTicket("no such origin")
 	assertEquals(t, found, false)
+
+	origin = "orig2.example.com"
+	ticket = []byte("1122334455aabbccddee")
+	pinningSecret = []byte("zzxxccvv!!@@##$$")
+	lifetime = -60 // negative to ensure expiry!
+	ps.storeTicket(origin, ticket, pinningSecret, lifetime)
+	_, _, _, found = ps.readTicket(origin)
+	assertEquals(t, found, false)
 }
 
 func TestStoreProtectionKey(t *testing.T) {
@@ -46,7 +54,7 @@ func TestStoreProtectionKey(t *testing.T) {
 	keyID := 0x11223344
 	key := []byte("this is a key")
 	validFrom := time.Now()
-	validUntil := time.Now().Add(time.Duration(1 * time.Hour))
+	validUntil := time.Now().Add(1 * time.Hour)
 	ps.storeProtectionKey(keyID, key, validFrom, validUntil)
 	key2, validFrom2, validUntil2, found := ps.readProtectionKey(keyID)
 	assertEquals(t, found, true)
