@@ -1,8 +1,14 @@
 package mint
 
 import (
+	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
 	"database/sql"
+	"encoding/binary"
 	_ "github.com/mattn/go-sqlite3"
+	"io"
 	"log"
 	"time"
 )
@@ -65,8 +71,7 @@ func (ps *pinningStore) deleteDB() {
 	}
 }
 
-
-func (ps *pinningStore) storeTicket(origin string, ticket []byte, pinningSecret [] byte, lifetime int) {
+func (ps *pinningStore) storeTicket(origin string, ticket []byte, pinningSecret []byte, lifetime int) {
 	stmt, err := ps.db.Prepare("insert or replace into tickets values (?, ?, ?, ?)")
 	if err != nil {
 		log.Fatal(err)
@@ -107,6 +112,38 @@ func (ps *pinningStore) readTicket(origin string) (opaque []byte, pinningSecret 
 	return
 }
 
+func (ps *pinningStore) storeProtectionKey(keyID int, key []byte, validFrom time.Time, validUntil time.Time) {
+	stmt, err := ps.db.Prepare("insert or replace into protection_keys values (?, ?, ?, ?)")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer stmt.Close()
+	_, err = stmt.Exec(keyID, key, validFrom, validUntil)
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+func (ps *pinningStore) readProtectionKey(keyID int) (key []byte, validFrom time.Time, validUntil time.Time, found bool) {
+	stmt, err := ps.db.Prepare("select key_blob, valid_from, valid_until from protection_keys where key_id = ?")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer stmt.Close()
+	rows, err := stmt.Query(keyID)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		found = false
+		return
+	}
+	rows.Scan(&key, &validFrom, &validUntil)
+	found = true
+	return
+}
+
 // Delete all tickets from client's store
 func (ps *pinningStore) clientCleanup() {
 	_, err := ps.db.Exec("delete from tickets")
@@ -116,3 +153,50 @@ func (ps *pinningStore) clientCleanup() {
 }
 
 // TODO Add server-create-first-key, server-rotate, client-cleanup, server-ramp-down ops
+
+type pinningTicket struct {
+	protectionKeyID uint32 // integrity protected (AAD)
+	ticketSecret    []byte // encrypted
+}
+
+func (pt *pinningTicket) Protect(protectionKey []byte) []byte {
+	block, err := aes.NewCipher(protectionKey)
+	if err != nil {
+		panic(err.Error())
+	}
+	nonce := make([]byte, block.BlockSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		panic(err.Error())
+	}
+	aesgcm, err := cipher.NewGCM(block)
+	if err != nil {
+		panic(err.Error())
+	}
+	var pkIDbytes []byte
+	binary.BigEndian.PutUint32(pkIDbytes, pt.protectionKeyID)
+	encryptedTicket := aesgcm.Seal(nil, nonce, pt.ticketSecret, pkIDbytes)
+	return bytes.Join([][]byte{pkIDbytes, nonce, encryptedTicket}, []byte{})
+}
+
+func ReadProtectionKeyID(sealedTicket []byte) int {
+	return int(binary.BigEndian.Uint32(sealedTicket[0:3]))
+}
+
+func Validate(sealedTicket []byte, protectionKey []byte) (pt pinningTicket, valid bool) {
+	pt.protectionKeyID = binary.BigEndian.Uint32(sealedTicket[0:3])
+	block, err := aes.NewCipher(protectionKey)
+	if err != nil {
+		panic(err.Error())
+	}
+	aesgcm, err := cipher.NewGCM(block)
+	if err != nil {
+		panic(err.Error())
+	}
+	nonce := sealedTicket[4 : 4+block.BlockSize()]
+	cipherText := sealedTicket[4+block.BlockSize():]
+	var pkIDbytes []byte
+	binary.BigEndian.PutUint32(pkIDbytes, pt.protectionKeyID)
+	pt.ticketSecret, err = aesgcm.Open(nil, nonce, cipherText, pkIDbytes)
+	valid = (err == nil)
+	return
+}
