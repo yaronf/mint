@@ -597,12 +597,12 @@ type pinningTicketExtension struct {
 	lifetime uint32
 }
 
-func (pt *pinningTicketExtension) Type() helloExtensionType {
+func (pt pinningTicketExtension) Type() helloExtensionType {
 	return extensionTypePinningTicket
 }
 
 // TODO: add proof-length to draft (1 byte)
-func (pt *pinningTicketExtension) Marshal() ([]byte, error) {
+func (pt pinningTicketExtension) Marshal() ([]byte, error) {
 	if pt.roleIsServer {
 		pte := []byte{}
 		proofLen := len(pt.pinningProof)
@@ -616,13 +616,13 @@ func (pt *pinningTicketExtension) Marshal() ([]byte, error) {
 		return pte, nil
 	} else { // client
 		if pt.pinningTicket == nil || len(pt.pinningTicket) == 0 {
-			return nil, fmt.Errorf("tls.pinningTicket: missing pinning ticket")
+			return []byte{}, nil
 		}
 		return pt.pinningTicket, nil
 	}
 }
 
-func (pt *pinningTicketExtension) Unmarshal(data []byte) (int, error) {
+func (pt pinningTicketExtension) Unmarshal(data []byte) (int, error) {
 	if pt.roleIsServer {
 		proofLen := (int(data[0]) << 8) + int(data[1]) // may be 0
 		pt.pinningProof = data[2:proofLen]

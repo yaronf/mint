@@ -82,8 +82,7 @@ func main() {
 	}
 
 	if pinningEnabled {
-		ps := mint.PinningStore{}
-		ps.InitDB(config)
+		mint.InitPinningStore(&config)
 	}
 
 	service := "0.0.0.0:" + port

@@ -5,14 +5,14 @@ import (
 	"time"
 )
 
-func initTest() PinningStore {
+func initTest() pinningStore {
 	config := Config{PinningDB: "testDB.db"}
-	ps := PinningStore{}
-	ps.InitDB(config)
+	ps := pinningStore{}
+	ps.initDB(config)
 	return ps
 }
 
-func finalizeTest(ps PinningStore) {
+func finalizeTest(ps pinningStore) {
 	ps.deleteDB()
 	ps.closeDB()
 }

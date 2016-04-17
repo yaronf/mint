@@ -28,8 +28,7 @@ func main() {
 	}
 
 	if pinningEnabled {
-		ps := mint.PinningStore{}
-		ps.InitDB(config)
+		mint.InitPinningStore(&config)
 	}
 
 	conn, err := mint.Dial("tcp", addr, &config)

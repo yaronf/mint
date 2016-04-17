@@ -218,6 +218,9 @@ type Conn struct {
 	in, out           *recordLayer
 	inMutex, outMutex sync.Mutex
 	context           cryptoContext
+
+	// pinning
+	pinningSecret	  []byte
 }
 
 func newConn(conn net.Conn, config *Config, isClient bool) *Conn {
@@ -519,6 +522,22 @@ func (c *Conn) clientHandshake() error {
 	sa := signatureAlgorithmsExtension{algorithms: c.config.SignatureAlgorithms}
 	dv := draftVersionExtension{version: draftVersionImplemented}
 
+	var pt *pinningTicketExtension
+
+	if c.config.PinningEnabled {
+		origin := c.config.ServerName // TODO: add scheme (protocol) and port, RFC 6454 (or change the draft)
+		opaque, secret, _, found := ps.readTicket(origin)
+		if !found {
+			pt = &pinningTicketExtension{roleIsServer:false}
+		} else {
+			c.pinningSecret = secret
+			pt = &pinningTicketExtension{
+				roleIsServer:false,
+				pinningTicket:opaque,
+			}
+		}
+	}
+
 	var psk *preSharedKeyExtension
 	if key, ok := c.config.ClientPSKs[c.config.ServerName]; ok {
 		logf(logTypeHandshake, "Sending PSK")
@@ -567,6 +586,14 @@ func (c *Conn) clientHandshake() error {
 			return err
 		}
 	}
+
+	if pt != nil {
+		err := ch.extensions.Add(pt)
+		if err != nil {
+			return err
+		}
+	}
+
 	chm, err := hOut.WriteMessageBody(ch)
 	if err != nil {
 		return err
@@ -789,6 +816,7 @@ func (c *Conn) serverHandshake() error {
 	clientKeyShares := &keyShareExtension{roleIsServer: false}
 	clientPSK := &preSharedKeyExtension{roleIsServer: false}
 	clientEarlyData := &earlyDataExtension{roleIsServer: false}
+	pinningTicket := &pinningTicketExtension{roleIsServer: false}
 
 	gotServerName := ch.extensions.Find(serverName)
 	gotSupportedGroups := ch.extensions.Find(supportedGroups)
@@ -796,6 +824,10 @@ func (c *Conn) serverHandshake() error {
 	gotKeyShares := ch.extensions.Find(clientKeyShares)
 	gotPSK := ch.extensions.Find(clientPSK)
 	gotEarlyData := ch.extensions.Find(clientEarlyData)
+	gotPinning := ch.extensions.Find(pinningTicket)
+	if gotPinning {
+		println("Hey, got a pinning ext!")
+	}
 	if !gotServerName || !gotSupportedGroups || !gotSignatureAlgorithms {
 		logf(logTypeHandshake, "Insufficient extensions")
 		return fmt.Errorf("tls.server: Missing extension in ClientHello (%v %v %v %v)",
