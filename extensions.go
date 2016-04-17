@@ -597,6 +597,10 @@ type pinningTicketExtension struct {
 	lifetime uint32
 }
 
+func (pt *pinningTicketExtension) Type() helloExtensionType {
+	return extensionTypePinningTicket
+}
+
 // TODO: add proof-length to draft (1 byte)
 func (pt *pinningTicketExtension) Marshal() ([]byte, error) {
 	if pt.roleIsServer {

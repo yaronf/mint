@@ -14,6 +14,8 @@ import (
 
 var port string
 var serverName, serverKeyFile, serverCertFile string
+var pinningEnabled bool
+var pinningDB string
 
 func readServerKey(serverKeyFile string) *rsa.PrivateKey {
 	serverKeyBytes, err := ioutil.ReadFile(serverKeyFile)
@@ -50,7 +52,17 @@ func main() {
 	flag.StringVar(&serverName, "servername", "", "server name")
 	flag.StringVar(&serverKeyFile, "keyfile", "", "private key file")
 	flag.StringVar(&serverCertFile, "certfile", "", "certificate file")
+	flag.BoolVar(&pinningEnabled, "pinning", false, "ticket pinning enabled")
+	flag.StringVar(&pinningDB, "pinningDB", "", "pinning database file (will be created or opened)")
 	flag.Parse()
+
+	if pinningEnabled && (pinningDB == "") {
+		log.Fatal("For ticket pinning, you must specify a pinning database file")
+	}
+
+	if serverKeyFile == "" || serverCertFile == "" {
+		log.Fatal("You must specify a private key file and a certificate file")
+	}
 
 	serverKey := readServerKey(serverKeyFile)
 	serverCert := readServerCert(serverCertFile)
@@ -61,9 +73,17 @@ func main() {
 			PrivateKey: serverKey,
 		},
 	}
+
 	config = mint.Config{
 		ServerName: serverName,
 		Certificates: certificates,
+		PinningEnabled:pinningEnabled,
+		PinningDB:pinningDB,
+	}
+
+	if pinningEnabled {
+		ps := mint.PinningStore{}
+		ps.InitDB(config)
 	}
 
 	service := "0.0.0.0:" + port

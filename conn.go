@@ -66,13 +66,14 @@ type Config struct {
 	Groups              []namedGroup
 	SignatureAlgorithms []signatureAndHashAlgorithm
 
+	// Ticket pinning (shared)
+	PinningEnabled	bool
+	PinningDB 	string
+
 	// Hidden fields (used for caching in convenient form)
 	enabledSuite map[cipherSuite]bool
 	enabledGroup map[namedGroup]bool
 	certsByName  map[string]*Certificate
-
-	// Ticket pinning
-	pinningDB string
 
 	// The same config object can be shared among different connections, so it
 	// needs its own mutex

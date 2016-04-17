@@ -13,16 +13,12 @@ import (
 	"time"
 )
 
-type pinningStore struct {
+type PinningStore struct {
 	db sql.DB
 }
 
-func (ps *pinningStore) initDB(config Config) {
-	if config.pinningDB == "" {
-		return
-	}
-
-	db, err := sql.Open("sqlite3", config.pinningDB)
+func (ps *PinningStore) InitDB(config Config) {
+	db, err := sql.Open("sqlite3", config.PinningDB)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -53,14 +49,14 @@ func (ps *pinningStore) initDB(config Config) {
 	}
 }
 
-func (ps *pinningStore) closeDB() {
+func (ps *PinningStore) closeDB() {
 	err := ps.db.Close()
 	if err != nil {
 		log.Fatal(err)
 	}
 }
 
-func (ps *pinningStore) deleteDB() {
+func (ps *PinningStore) deleteDB() {
 	_, err := ps.db.Exec("delete from tickets")
 	if err != nil {
 		log.Fatal(err)
@@ -72,7 +68,7 @@ func (ps *pinningStore) deleteDB() {
 }
 
 // Store ticket in client-side database. Lifetime given in seconds.
-func (ps *pinningStore) storeTicket(origin string, ticket []byte, pinningSecret []byte, lifetime int) {
+func (ps *PinningStore) storeTicket(origin string, ticket []byte, pinningSecret []byte, lifetime int) {
 	stmt, err := ps.db.Prepare("insert or replace into tickets values (?, ?, ?, ?)")
 	if err != nil {
 		log.Fatal(err)
@@ -86,13 +82,13 @@ func (ps *pinningStore) storeTicket(origin string, ticket []byte, pinningSecret 
 }
 
 // Client check: is ticket expired? Client only sends the ticket up to 10s before the nominal expiry
-func (ps *pinningStore) expired(validUntil time.Time) bool {
+func (ps *PinningStore) expired(validUntil time.Time) bool {
 	const validityMargin = 10 * time.Second
 	return validUntil.Before(time.Now().Add(-validityMargin))
 }
 
 // Read the ticket from the store, indexed by origin. Ticket must be unexpired
-func (ps *pinningStore) readTicket(origin string) (opaque []byte, pinningSecret []byte, validUntil time.Time, found bool) {
+func (ps *PinningStore) readTicket(origin string) (opaque []byte, pinningSecret []byte, validUntil time.Time, found bool) {
 	stmt, err := ps.db.Prepare("select opaque, pinning_secret, valid_until from tickets where origin = ?")
 	if err != nil {
 		log.Fatal(err)
@@ -113,7 +109,7 @@ func (ps *pinningStore) readTicket(origin string) (opaque []byte, pinningSecret 
 	return
 }
 
-func (ps *pinningStore) storeProtectionKey(keyID int, key []byte, validFrom time.Time, validUntil time.Time) {
+func (ps *PinningStore) storeProtectionKey(keyID int, key []byte, validFrom time.Time, validUntil time.Time) {
 	stmt, err := ps.db.Prepare("insert or replace into protection_keys values (?, ?, ?, ?)")
 	if err != nil {
 		log.Fatal(err)
@@ -125,7 +121,7 @@ func (ps *pinningStore) storeProtectionKey(keyID int, key []byte, validFrom time
 	}
 }
 
-func (ps *pinningStore) readProtectionKey(keyID int) (key []byte, validFrom time.Time, validUntil time.Time, found bool) {
+func (ps *PinningStore) readProtectionKey(keyID int) (key []byte, validFrom time.Time, validUntil time.Time, found bool) {
 	stmt, err := ps.db.Prepare("select key, valid_from, valid_until from protection_keys where keyid = ?")
 	if err != nil {
 		log.Fatal(err)
@@ -146,7 +142,7 @@ func (ps *pinningStore) readProtectionKey(keyID int) (key []byte, validFrom time
 }
 
 // Read the current protection key. If there are several that are current, reads an arbitrary one.
-func (ps *pinningStore) readCurrentProtectionKey() (key []byte, validFrom time.Time, validUntil time.Time, found bool) {
+func (ps *PinningStore) readCurrentProtectionKey() (key []byte, validFrom time.Time, validUntil time.Time, found bool) {
 	now := time.Now()
 	// sqlite: this is string comparison, and it works!
 	stmt, err := ps.db.Prepare("select key, valid_from, valid_until from protection_keys where ? between valid_from and valid_until")
@@ -169,7 +165,7 @@ func (ps *pinningStore) readCurrentProtectionKey() (key []byte, validFrom time.T
 }
 
 // Delete all tickets from client's store
-func (ps *pinningStore) clientCleanup() {
+func (ps *PinningStore) clientCleanup() {
 	_, err := ps.db.Exec("delete from tickets")
 	if err != nil {
 		log.Fatal(err)
