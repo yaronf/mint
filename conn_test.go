@@ -284,3 +284,31 @@ func Test0xRTT(t *testing.T) {
 	assertContextEquals(t, client.context, server.context)
 	assertByteEquals(t, client.earlyData, server.readBuffer)
 }
+
+func TestBasicFlowsWithPinning(t *testing.T) {
+	for _, conf := range []*Config{basicConfig, pskConfig, pskDHConfig, ffdhConfig} {
+		cConn, sConn := pipe()
+
+		conf.PinningEnabled = true
+		conf.PinningDB = "connTestDB"
+		InitPinningStore(conf)	// will be shared between client and server
+
+		client := Client(cConn, conf)
+		server := Server(sConn, conf)
+
+		done := make(chan bool)
+		go func(t *testing.T) {
+			err := server.Handshake()
+			assertNotError(t, err, "Server failed handshake")
+			done <- true
+		}(t)
+
+		err := client.Handshake()
+		assertNotError(t, err, "Client failed handshake")
+
+		<-done
+
+		assertContextEquals(t, client.context, server.context)
+	}
+}
+

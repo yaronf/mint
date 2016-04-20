@@ -67,8 +67,9 @@ type Config struct {
 	SignatureAlgorithms []signatureAndHashAlgorithm
 
 	// Ticket pinning (shared)
-	PinningEnabled	bool
-	PinningDB 	string
+	PinningEnabled		bool
+	PinningDB 		string
+	PinningTicketLifetime 	int
 
 	// Hidden fields (used for caching in convenient form)
 	enabledSuite map[cipherSuite]bool
@@ -99,6 +100,10 @@ func (c *Config) Init(isClient bool) error {
 	}
 	if c.ClientPSKs == nil {
 		c.ClientPSKs = map[string]PreSharedKey{}
+	}
+
+	if c.PinningTicketLifetime == 0 {
+		c.PinningTicketLifetime = int(defaultPinningTicketLifetime)
 	}
 
 	// If there is no certificate, generate one
@@ -197,6 +202,8 @@ var (
 	}
 
 	defaultTicketLen = 16
+
+	defaultPinningTicketLifetime = 30 * 24 * time.Hour // 1 month (default not specified in draft)
 )
 
 // Conn implements the net.Conn interface, as with "crypto/tls"
@@ -220,7 +227,7 @@ type Conn struct {
 	context           cryptoContext
 
 	// pinning
-	pinningSecret	  []byte
+	pinningSecret, newPinningSecret	  []byte  // client and server
 }
 
 func newConn(conn net.Conn, config *Config, isClient bool) *Conn {
@@ -816,7 +823,7 @@ func (c *Conn) serverHandshake() error {
 	clientKeyShares := &keyShareExtension{roleIsServer: false}
 	clientPSK := &preSharedKeyExtension{roleIsServer: false}
 	clientEarlyData := &earlyDataExtension{roleIsServer: false}
-	pinningTicket := &pinningTicketExtension{roleIsServer: false}
+	pinningTicketExt := &pinningTicketExtension{roleIsServer: false}
 
 	gotServerName := ch.extensions.Find(serverName)
 	gotSupportedGroups := ch.extensions.Find(supportedGroups)
@@ -824,14 +831,40 @@ func (c *Conn) serverHandshake() error {
 	gotKeyShares := ch.extensions.Find(clientKeyShares)
 	gotPSK := ch.extensions.Find(clientPSK)
 	gotEarlyData := ch.extensions.Find(clientEarlyData)
-	gotPinning := ch.extensions.Find(pinningTicket)
-	if gotPinning {
-		println("Hey, got a pinning ext!")
-	}
+	gotPinning := ch.extensions.Find(pinningTicketExt)
 	if !gotServerName || !gotSupportedGroups || !gotSignatureAlgorithms {
 		logf(logTypeHandshake, "Insufficient extensions")
 		return fmt.Errorf("tls.server: Missing extension in ClientHello (%v %v %v %v)",
 			gotServerName, gotSupportedGroups, gotSignatureAlgorithms, gotKeyShares)
+	}
+
+	// Handle received ticket pinning extension, if any
+	if c.config.PinningEnabled {
+		if gotPinning {
+			println("Hey, got a pinning ext!")
+			if gotPSK {
+				return fmt.Errorf("Pinning ticket: not supported with PSK")
+			}
+			if pinningTicketExt.pinningTicket != nil {
+				protectionKeyID, err := readProtectionKeyID(pinningTicketExt.pinningTicket)
+				if err != nil {
+					return err
+				}
+				protectionKey, found := ps.readProtectionKey(protectionKeyID)
+				if !found {
+					return fmt.Errorf("Ticket pinning: protection key not found")
+				}
+				receivedTicket, valid := validate(pinningTicketExt.pinningTicket, protectionKey)
+				if !valid {
+					return fmt.Errorf("Ticket pinning: client ticket failed to validate")
+				}
+				c.pinningSecret = receivedTicket.ticketSecret
+			} else {
+				// Received an empty extension (initial connection)
+			}
+		} else {
+			// Did not receive an extension at all
+		}
 	}
 
 	// Find pre_shared_key extension and look it up
@@ -1047,8 +1080,39 @@ func (c *Conn) serverHandshake() error {
 		return err
 	}
 
+	// Ticket pinning: prepare returned ticket extension
+	var pExt extension
+	if c.config.PinningEnabled && gotPinning {
+		pinningProof, err := newPinningProof()
+		if err != nil {
+			return fmt.Errorf("Pinning ticket: failed to create proof")
+		}
+		ticketSecretLen := 16
+		newTicketSecret := newTicketSecret(hashAlgorithmSHA256, ctx.xSS, ctx.xES, ticketSecretLen) // todo: use handshake hash alg
+		protectionKey, keyID, found := ps.readCurrentProtectionKey()
+		if !found {
+			return fmt.Errorf("Pinning ticket: could not find a valid protection key")
+		}
+		newTicket := pinningTicket{protectionKeyID:uint32(keyID), ticketSecret:newTicketSecret}
+		sealedPinningTicket := newTicket.protect(protectionKey)
+		pinningTicketExt = &pinningTicketExtension{
+			roleIsServer:true,
+			pinningTicket:sealedPinningTicket,
+			pinningProof: pinningProof,
+			lifetime:uint32(c.config.PinningTicketLifetime),
+		}
+		pExtBody, err := pinningTicketExt.Marshal()
+		if err != nil {
+			return fmt.Errorf("Pinning ticket: failed to marshal extension")
+		}
+		pExt = extension{extensionType:pinningTicketExt.Type(), extensionData:pExtBody}
+	}
+
 	// Send an EncryptedExtensions message (even if it's empty)
-	ee := &encryptedExtensionsBody{}
+	eeb := encryptedExtensionsBody{}
+	eeb[0] = pExt
+
+	ee := &eeb
 	eem, err := hOut.WriteMessageBody(ee)
 	if err != nil {
 		return err

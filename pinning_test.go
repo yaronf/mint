@@ -56,14 +56,12 @@ func TestStoreProtectionKey(t *testing.T) {
 	validFrom := time.Now()
 	validUntil := time.Now().Add(1 * time.Hour)
 	ps.storeProtectionKey(keyID, key, validFrom, validUntil)
-	key2, validFrom2, validUntil2, found := ps.readProtectionKey(keyID)
+	key2, found := ps.readProtectionKey(keyID)
 	assertEquals(t, found, true)
 	assertDeepEquals(t, key, key2)
-	assert(t, validFrom.Equal(validFrom2), "Incorrect validFrom")
-	assert(t, validUntil.Equal(validUntil2), "Incorrect validUntil")
 
 	keyID = 0x777777
-	key2, validFrom2, validUntil2, found = ps.readProtectionKey(keyID)
+	key2, found = ps.readProtectionKey(keyID)
 	assertEquals(t, found, false)
 }
 
@@ -76,7 +74,7 @@ func TestReadCurrentProtectionKey(t *testing.T) {
 	validFrom := time.Now().Add(-3 * time.Minute)
 	validUntil := time.Now().Add(-2 * time.Hour)
 	ps.storeProtectionKey(keyID, key, validFrom, validUntil)
-	key2, validFrom2, validUntil2, found := ps.readCurrentProtectionKey()
+	key2, keyID, found := ps.readCurrentProtectionKey()
 	assertEquals(t, found, false)
 
 	keyID = 0x11223344
@@ -84,26 +82,26 @@ func TestReadCurrentProtectionKey(t *testing.T) {
 	validFrom = time.Now().Add(-1 * time.Minute)
 	validUntil = time.Now().Add(1 * time.Hour)
 	ps.storeProtectionKey(keyID, key, validFrom, validUntil)
-	key2, validFrom2, validUntil2, found = ps.readCurrentProtectionKey()
+	key2, keyID, found = ps.readCurrentProtectionKey()
 	assertEquals(t, found, true)
 	assertDeepEquals(t, key, key2)
-	assert(t, validFrom.Equal(validFrom2), "Incorrect validFrom")
-	assert(t, validUntil.Equal(validUntil2), "Incorrect validUntil")
 }
 
 func TestProtectTicket(t *testing.T) {
 	pt := pinningTicket{protectionKeyID: 33, ticketSecret: []byte("this is so very secret")}
 	protectionKey := []byte("0123456789012345") // 16 bytes, 128 bit
-	protectedTicket := pt.Protect(protectionKey)
+	protectedTicket := pt.protect(protectionKey)
 	// println("protected ticket", string(protectedTicket))
-	assertEquals(t, ReadProtectionKeyID(protectedTicket), 33)
-	pt2, valid := Validate(protectedTicket, protectionKey)
+	id, err := readProtectionKeyID(protectedTicket)
+	assertEquals(t, id, 33)
+	assertNotError(t, err, "read Protection Key?")
+	pt2, valid := validate(protectedTicket, protectionKey)
 	assertEquals(t, valid, true)
 	assertDeepEquals(t, pt2, pt)
 
 	badTicket := make([]byte, len(protectedTicket))
 	copy(badTicket, protectedTicket)
 	badTicket[0] = byte(10)
-	pt2, valid = Validate(badTicket, protectionKey)
+	pt2, valid = validate(badTicket, protectionKey)
 	assertEquals(t, valid, false)
 }

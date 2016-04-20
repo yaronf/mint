@@ -11,6 +11,8 @@ import (
 	"io"
 	"log"
 	"time"
+	"fmt"
+//	"crypto"
 )
 
 type pinningStore struct {
@@ -128,7 +130,7 @@ func (ps *pinningStore) storeProtectionKey(keyID int, key []byte, validFrom time
 	}
 }
 
-func (ps *pinningStore) readProtectionKey(keyID int) (key []byte, validFrom time.Time, validUntil time.Time, found bool) {
+func (ps *pinningStore) readProtectionKey(keyID int) (key []byte, found bool) {
 	stmt, err := ps.db.Prepare("select key, valid_from, valid_until from protection_keys where keyid = ?")
 	if err != nil {
 		log.Fatal(err)
@@ -143,16 +145,16 @@ func (ps *pinningStore) readProtectionKey(keyID int) (key []byte, validFrom time
 		found = false
 		return
 	}
-	rows.Scan(&key, &validFrom, &validUntil)
+	rows.Scan(&key)
 	found = true
 	return
 }
 
 // Read the current protection key. If there are several that are current, reads an arbitrary one.
-func (ps *pinningStore) readCurrentProtectionKey() (key []byte, validFrom time.Time, validUntil time.Time, found bool) {
+func (ps *pinningStore) readCurrentProtectionKey() (key []byte, keyID int, found bool) {
 	now := time.Now()
 	// sqlite: this is string comparison, and it works!
-	stmt, err := ps.db.Prepare("select key, valid_from, valid_until from protection_keys where ? between valid_from and valid_until")
+	stmt, err := ps.db.Prepare("select key, keyid from protection_keys where ? between valid_from and valid_until")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -166,7 +168,7 @@ func (ps *pinningStore) readCurrentProtectionKey() (key []byte, validFrom time.T
 		found = false
 		return
 	}
-	rows.Scan(&key, &validFrom, &validUntil)
+	rows.Scan(&key, &keyID)
 	found = true
 	return
 }
@@ -186,7 +188,7 @@ type pinningTicket struct {
 	ticketSecret    []byte // encrypted
 }
 
-func (pt *pinningTicket) Protect(protectionKey []byte) []byte {
+func (pt *pinningTicket) protect(protectionKey []byte) []byte {
 	block, err := aes.NewCipher(protectionKey)
 	if err != nil {
 		panic(err.Error())
@@ -205,11 +207,18 @@ func (pt *pinningTicket) Protect(protectionKey []byte) []byte {
 	return bytes.Join([][]byte{pkIDbytes, nonce, encryptedTicket}, []byte{})
 }
 
-func ReadProtectionKeyID(sealedTicket []byte) int {
-	return int(binary.BigEndian.Uint32(sealedTicket[0:4]))
+func readProtectionKeyID(sealedTicket []byte) (pkID int, err error) {
+	if len(sealedTicket) < 4 {
+		return 0, fmt.Errorf("Sealed ticket too short")
+	}
+	return int(binary.BigEndian.Uint32(sealedTicket[0:4])), nil
 }
 
-func Validate(sealedTicket []byte, protectionKey []byte) (pt pinningTicket, valid bool) {
+func validate(sealedTicket []byte, protectionKey []byte) (pt pinningTicket, valid bool) {
+	if len(sealedTicket) < 4 {
+		valid = false
+		return
+	}
 	pt.protectionKeyID = binary.BigEndian.Uint32(sealedTicket[0:4])
 	block, err := aes.NewCipher(protectionKey)
 	if err != nil {
@@ -226,4 +235,12 @@ func Validate(sealedTicket []byte, protectionKey []byte) (pt pinningTicket, vali
 	pt.ticketSecret, err = aesgcm.Open(nil, nonce, cipherText, pkIDbytes)
 	valid = (err == nil)
 	return
+}
+
+func newTicketSecret(hash hashAlgorithm, xSS, xES []byte, length int) []byte {
+	panic("unimplemented")
+}
+
+func newPinningProof() (proof []byte, err error) {
+	panic("unimplemented")
 }
