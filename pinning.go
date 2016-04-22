@@ -12,7 +12,9 @@ import (
 	"log"
 	"time"
 	"fmt"
-//	"crypto"
+	"crypto"
+	"crypto/x509"
+	"crypto/hmac"
 )
 
 type pinningStore struct {
@@ -20,6 +22,10 @@ type pinningStore struct {
 }
 
 var ps pinningStore
+
+const (
+	pinningTicketSecretLen = 16 // bytes
+)
 
 func InitPinningStore(config *Config) {
 	ps = pinningStore{}
@@ -237,10 +243,23 @@ func validate(sealedTicket []byte, protectionKey []byte) (pt pinningTicket, vali
 	return
 }
 
-func newTicketSecret(hash hashAlgorithm, xSS, xES []byte, length int) []byte {
-	panic("unimplemented")
+func newTicketSecret(hash crypto.Hash, xES []byte) []byte {
+	length := pinningTicketSecretLen
+	ext := hkdfExtract(hash, nil, xES)
+	return hkdfExpandLabel(hash, ext, "Ticket Pinning", nil, length)
 }
 
-func newPinningProof() (proof []byte, err error) {
-	panic("unimplemented")
+func newPinningProof(hash crypto.Hash, pinningSecret []byte, cRandom []byte, sRandom []byte, pubKey crypto.PublicKey) (proof []byte, err error) {
+	der, err := x509.MarshalPKIXPublicKey(pubKey)
+	if err != nil {
+		return
+	}
+	h := hash.New()
+	h.Write(der)
+	pkeyHash := h.Sum(nil)
+	rawProof := bytes.Join([][]byte{[]byte("pinning proof"), []byte{0}, cRandom, sRandom, pkeyHash}, nil)
+	hm := hmac.New(hash.New, pinningSecret)
+	hm.Write(rawProof)
+	proof = hm.Sum(nil)
+	return
 }

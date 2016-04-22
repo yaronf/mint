@@ -802,6 +802,28 @@ func (c *Conn) clientHandshake() error {
 	return nil
 }
 
+func (c *Conn) selectCertificate(serverName *serverNameExtension) (privateKey crypto.Signer, chain []*x509.Certificate, err error){
+	for _, cert := range c.config.Certificates {
+		for _, name := range cert.Chain[0].DNSNames {
+			if name == string(*serverName) {
+				chain = cert.Chain
+				privateKey = cert.PrivateKey
+			}
+		}
+	}
+
+	// If there's no name match, use the first in the list or fail
+	if chain == nil {
+		if len(c.config.Certificates) > 0 {
+			chain = c.config.Certificates[0].Chain
+			privateKey = c.config.Certificates[0].PrivateKey
+		} else {
+			err = fmt.Errorf("No certificate found for %s", string(*serverName))
+		}
+	}
+	return
+}
+
 func (c *Conn) serverHandshake() error {
 	logf(logTypeHandshake, "Starting serverHandshake")
 
@@ -841,7 +863,6 @@ func (c *Conn) serverHandshake() error {
 	// Handle received ticket pinning extension, if any
 	if c.config.PinningEnabled {
 		if gotPinning {
-			println("Hey, got a pinning ext!")
 			if gotPSK {
 				return fmt.Errorf("Pinning ticket: not supported with PSK")
 			}
@@ -1080,15 +1101,25 @@ func (c *Conn) serverHandshake() error {
 		return err
 	}
 
+	// Need to move cert selection up so that the pinning ticket can use the correct public key in the proof
+	var privateKey crypto.Signer
+	var chain []*x509.Certificate
+	if !sendPSK {
+		// Select a certificate
+		privateKey, chain, err = c.selectCertificate(serverName)
+		if err != nil {
+			return err
+		}
+	}
+
 	// Ticket pinning: prepare returned ticket extension
 	var pExt extension
 	if c.config.PinningEnabled && gotPinning {
-		pinningProof, err := newPinningProof()
+		pinningProof, err := newPinningProof(c.context.params.hash, c.pinningSecret, ch.random[:], sh.random[:], privateKey.Public())
 		if err != nil {
 			return fmt.Errorf("Pinning ticket: failed to create proof")
 		}
-		ticketSecretLen := 16
-		newTicketSecret := newTicketSecret(hashAlgorithmSHA256, ctx.xSS, ctx.xES, ticketSecretLen) // todo: use handshake hash alg
+		newTicketSecret := newTicketSecret(c.context.params.hash, ctx.xES)
 		protectionKey, keyID, found := ps.readCurrentProtectionKey()
 		if !found {
 			return fmt.Errorf("Pinning ticket: could not find a valid protection key")
@@ -1109,8 +1140,7 @@ func (c *Conn) serverHandshake() error {
 	}
 
 	// Send an EncryptedExtensions message (even if it's empty)
-	eeb := encryptedExtensionsBody{}
-	eeb[0] = pExt
+	eeb := encryptedExtensionsBody{pExt}
 
 	ee := &eeb
 	eem, err := hOut.WriteMessageBody(ee)
@@ -1121,28 +1151,6 @@ func (c *Conn) serverHandshake() error {
 
 	// Authenticate with a certificate if required
 	if !sendPSK {
-		// Select a certificate
-		var privateKey crypto.Signer
-		var chain []*x509.Certificate
-		for _, cert := range c.config.Certificates {
-			for _, name := range cert.Chain[0].DNSNames {
-				if name == string(*serverName) {
-					chain = cert.Chain
-					privateKey = cert.PrivateKey
-				}
-			}
-		}
-
-		// If there's no name match, use the first in the list or fail
-		if chain == nil {
-			if len(c.config.Certificates) > 0 {
-				chain = c.config.Certificates[0].Chain
-				privateKey = c.config.Certificates[0].PrivateKey
-			} else {
-				return fmt.Errorf("No certificate found for %s", string(*serverName))
-			}
-		}
-
 		// Create and send Certificate, CertificateVerify
 		// TODO Certificate selection based on ClientHello
 		certificate := &certificateBody{
