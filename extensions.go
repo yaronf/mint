@@ -601,14 +601,13 @@ func (pt pinningTicketExtension) Type() helloExtensionType {
 	return extensionTypePinningTicket
 }
 
-// TODO: add proof-length to draft (1 byte)
 func (pt pinningTicketExtension) Marshal() ([]byte, error) {
 	if pt.roleIsServer {
-		pte := []byte{}
 		proofLen := len(pt.pinningProof)
 		proofLenHeader := []byte{byte(proofLen)}
 		lifetimeBytes := []byte{}
 		binary.BigEndian.PutUint32(lifetimeBytes, pt.lifetime)
+		pte := make([]byte, 1 + proofLen + len(pt.pinningTicket) + 4)
 		pte = append(pte, proofLenHeader...)
 		pte = append(pte, pt.pinningProof...)
 		pte = append(pte, pt.pinningTicket...)

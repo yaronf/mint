@@ -53,7 +53,7 @@ func (ps *pinningStore) initDB(config Config) {
 
 	// Server-side
 	sqlStmt = `
-	create table if not exists protection_keys (keyid integer not null primary key,
+	create table if not exists protection_keys (keyid integer primary key autoincrement,
 		key blob not null,
 		valid_from datetime,
 		valid_until datetime);
@@ -84,13 +84,8 @@ func (ps *pinningStore) deleteDB() {
 
 // Store ticket in client-side database. Lifetime given in seconds.
 func (ps *pinningStore) storeTicket(origin string, ticket []byte, pinningSecret []byte, lifetime int) {
-	stmt, err := ps.db.Prepare("insert or replace into tickets values (?, ?, ?, ?)")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer stmt.Close()
 	validUntil := time.Now().Add(time.Duration(lifetime) * time.Second).Unix()
-	_, err = stmt.Exec(origin, ticket, pinningSecret, validUntil)
+	_, err := ps.db.Exec("insert or replace into tickets values (?, ?, ?, ?)", origin, ticket, pinningSecret, validUntil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -104,12 +99,7 @@ func (ps *pinningStore) expired(validUntil time.Time) bool {
 
 // Read the ticket from the store, indexed by origin. Ticket must be unexpired
 func (ps *pinningStore) readTicket(origin string) (opaque []byte, pinningSecret []byte, validUntil time.Time, found bool) {
-	stmt, err := ps.db.Prepare("select opaque, pinning_secret, valid_until from tickets where origin = ?")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer stmt.Close()
-	rows, err := stmt.Query(origin)
+	rows, err := ps.db.Query("select opaque, pinning_secret, valid_until from tickets where origin = ?", origin)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -124,25 +114,20 @@ func (ps *pinningStore) readTicket(origin string) (opaque []byte, pinningSecret 
 	return
 }
 
-func (ps *pinningStore) storeProtectionKey(keyID int, key []byte, validFrom time.Time, validUntil time.Time) {
-	stmt, err := ps.db.Prepare("insert or replace into protection_keys values (?, ?, ?, ?)")
+func (ps *pinningStore) storeProtectionKey(key []byte, validFrom time.Time, validUntil time.Time) uint64 {
+	result, err := ps.db.Exec("insert into protection_keys(key, valid_from, valid_until) values (?, ?, ?)", key, validFrom, validUntil)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer stmt.Close()
-	_, err = stmt.Exec(keyID, key, validFrom, validUntil)
+	keyID, err := result.LastInsertId()
 	if err != nil {
 		log.Fatal(err)
 	}
+	return uint64(keyID)
 }
 
-func (ps *pinningStore) readProtectionKey(keyID int) (key []byte, found bool) {
-	stmt, err := ps.db.Prepare("select key, valid_from, valid_until from protection_keys where keyid = ?")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer stmt.Close()
-	rows, err := stmt.Query(keyID)
+func (ps *pinningStore) readProtectionKey(keyID uint64) (key []byte, found bool) {
+	rows, err := ps.db.Query("select key from protection_keys where keyid = ?", keyID)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -157,15 +142,10 @@ func (ps *pinningStore) readProtectionKey(keyID int) (key []byte, found bool) {
 }
 
 // Read the current protection key. If there are several that are current, reads an arbitrary one.
-func (ps *pinningStore) readCurrentProtectionKey() (key []byte, keyID int, found bool) {
+func (ps *pinningStore) readCurrentProtectionKey() (key []byte, keyID uint64, found bool) {
 	now := time.Now()
 	// sqlite: this is string comparison, and it works!
-	stmt, err := ps.db.Prepare("select key, keyid from protection_keys where ? between valid_from and valid_until")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer stmt.Close()
-	rows, err := stmt.Query(now)
+	rows, err := ps.db.Query("select key, keyid from protection_keys where ? between valid_from and valid_until", now)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -179,6 +159,17 @@ func (ps *pinningStore) readCurrentProtectionKey() (key []byte, keyID int, found
 	return
 }
 
+// Create a protection key that's immediately valid
+func (ps *pinningStore) createValidProtectionKey() {
+	key := make([]byte, 16) // AES-256
+	if _, err := io.ReadFull(rand.Reader, key); err != nil {
+		panic(err.Error())
+	}
+	validFrom := time.Now().Add(-1 * time.Minute)
+	validUntil := time.Now().Add(1 * time.Hour)
+	_ = ps.storeProtectionKey(key, validFrom, validUntil)
+}
+
 // Delete all tickets from client's store
 func (ps *pinningStore) clientCleanup() {
 	_, err := ps.db.Exec("delete from tickets")
@@ -190,7 +181,7 @@ func (ps *pinningStore) clientCleanup() {
 // TODO Add server-create-first-key, server-rotate, client-cleanup, server-ramp-down ops
 
 type pinningTicket struct {
-	protectionKeyID uint32 // integrity protected (AAD)
+	protectionKeyID uint64 // integrity protected (AAD)
 	ticketSecret    []byte // encrypted
 }
 
@@ -207,25 +198,25 @@ func (pt *pinningTicket) protect(protectionKey []byte) []byte {
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
 		panic(err.Error())
 	}
-	pkIDbytes := make([]byte, 4)
-	binary.BigEndian.PutUint32(pkIDbytes, pt.protectionKeyID)
+	pkIDbytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(pkIDbytes, pt.protectionKeyID)
 	encryptedTicket := aesgcm.Seal(nil, nonce, pt.ticketSecret, pkIDbytes)
 	return bytes.Join([][]byte{pkIDbytes, nonce, encryptedTicket}, []byte{})
 }
 
-func readProtectionKeyID(sealedTicket []byte) (pkID int, err error) {
+func readProtectionKeyID(sealedTicket []byte) (pkID uint64, err error) {
 	if len(sealedTicket) < 4 {
 		return 0, fmt.Errorf("Sealed ticket too short")
 	}
-	return int(binary.BigEndian.Uint32(sealedTicket[0:4])), nil
+	return binary.BigEndian.Uint64(sealedTicket[0:8]), nil
 }
 
 func validate(sealedTicket []byte, protectionKey []byte) (pt pinningTicket, valid bool) {
-	if len(sealedTicket) < 4 {
+	if len(sealedTicket) < 8 {
 		valid = false
 		return
 	}
-	pt.protectionKeyID = binary.BigEndian.Uint32(sealedTicket[0:4])
+	pt.protectionKeyID = binary.BigEndian.Uint64(sealedTicket[0:8])
 	block, err := aes.NewCipher(protectionKey)
 	if err != nil {
 		panic(err.Error())
@@ -234,10 +225,10 @@ func validate(sealedTicket []byte, protectionKey []byte) (pt pinningTicket, vali
 	if err != nil {
 		panic(err.Error())
 	}
-	nonce := sealedTicket[4 : 4+aesgcm.NonceSize()]
-	cipherText := sealedTicket[4+aesgcm.NonceSize():]
-	pkIDbytes := make([]byte, 4)
-	binary.BigEndian.PutUint32(pkIDbytes, pt.protectionKeyID)
+	nonce := sealedTicket[8 : 8 + aesgcm.NonceSize()]
+	cipherText := sealedTicket[8 + aesgcm.NonceSize():]
+	pkIDbytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(pkIDbytes, pt.protectionKeyID)
 	pt.ticketSecret, err = aesgcm.Open(nil, nonce, cipherText, pkIDbytes)
 	valid = (err == nil)
 	return
@@ -257,7 +248,7 @@ func newPinningProof(hash crypto.Hash, pinningSecret []byte, cRandom []byte, sRa
 	h := hash.New()
 	h.Write(der)
 	pkeyHash := h.Sum(nil)
-	rawProof := bytes.Join([][]byte{[]byte("pinning proof"), []byte{0}, cRandom, sRandom, pkeyHash}, nil)
+	rawProof := bytes.Join([][]byte{[]byte("pinning proof"), []byte{byte(len(cRandom))}, cRandom, []byte{byte(len(sRandom))}, sRandom, pkeyHash}, nil)
 	hm := hmac.New(hash.New, pinningSecret)
 	hm.Write(rawProof)
 	proof = hm.Sum(nil)

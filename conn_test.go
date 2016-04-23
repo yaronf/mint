@@ -286,12 +286,15 @@ func Test0xRTT(t *testing.T) {
 }
 
 func TestBasicFlowsWithPinning(t *testing.T) {
-	for _, conf := range []*Config{basicConfig, pskConfig, pskDHConfig, ffdhConfig} {
+	for _, conf := range []*Config{basicConfig,
+		/*pskConfig, pskDHConfig,*/
+		/*ffdhConfig*/} {
 		cConn, sConn := pipe()
 
 		conf.PinningEnabled = true
 		conf.PinningDB = "connTestDB"
 		InitPinningStore(conf)	// will be shared between client and server
+		ps.createValidProtectionKey() // server side
 
 		client := Client(cConn, conf)
 		server := Server(sConn, conf)

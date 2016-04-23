@@ -861,11 +861,13 @@ func (c *Conn) serverHandshake() error {
 	}
 
 	// Handle received ticket pinning extension, if any
+	var sendPinning bool
 	if c.config.PinningEnabled {
 		if gotPinning {
 			if gotPSK {
 				return fmt.Errorf("Pinning ticket: not supported with PSK")
 			}
+			sendPinning = true
 			if pinningTicketExt.pinningTicket != nil {
 				protectionKeyID, err := readProtectionKeyID(pinningTicketExt.pinningTicket)
 				if err != nil {
@@ -1101,7 +1103,7 @@ func (c *Conn) serverHandshake() error {
 		return err
 	}
 
-	// Need to move cert selection up so that the pinning ticket can use the correct public key in the proof
+	// Moved cert selection up so that the pinning ticket can use the correct public key in the proof
 	var privateKey crypto.Signer
 	var chain []*x509.Certificate
 	if !sendPSK {
@@ -1114,17 +1116,17 @@ func (c *Conn) serverHandshake() error {
 
 	// Ticket pinning: prepare returned ticket extension
 	var pExt extension
-	if c.config.PinningEnabled && gotPinning {
-		pinningProof, err := newPinningProof(c.context.params.hash, c.pinningSecret, ch.random[:], sh.random[:], privateKey.Public())
+	if sendPinning {
+		pinningProof, err := newPinningProof(ctx.params.hash, c.pinningSecret, ch.random[:], sh.random[:], privateKey.Public())
 		if err != nil {
 			return fmt.Errorf("Pinning ticket: failed to create proof")
 		}
-		newTicketSecret := newTicketSecret(c.context.params.hash, ctx.xES)
+		newTicketSecret := newTicketSecret(ctx.params.hash, ctx.xES)
 		protectionKey, keyID, found := ps.readCurrentProtectionKey()
 		if !found {
 			return fmt.Errorf("Pinning ticket: could not find a valid protection key")
 		}
-		newTicket := pinningTicket{protectionKeyID:uint32(keyID), ticketSecret:newTicketSecret}
+		newTicket := pinningTicket{protectionKeyID:keyID, ticketSecret:newTicketSecret}
 		sealedPinningTicket := newTicket.protect(protectionKey)
 		pinningTicketExt = &pinningTicketExtension{
 			roleIsServer:true,
