@@ -67,9 +67,9 @@ type Config struct {
 	SignatureAlgorithms []signatureAndHashAlgorithm
 
 	// Ticket pinning (shared)
-	PinningEnabled		bool
-	PinningDB 		string
-	PinningTicketLifetime 	int
+	PinningEnabled        bool
+	PinningDB             string
+	PinningTicketLifetime int
 
 	// Hidden fields (used for caching in convenient form)
 	enabledSuite map[cipherSuite]bool
@@ -227,7 +227,7 @@ type Conn struct {
 	context           cryptoContext
 
 	// pinning
-	pinningSecret, newPinningSecret	  []byte  // client and server
+	pinningSecret, newPinningSecret []byte // client and server
 }
 
 func newConn(conn net.Conn, config *Config, isClient bool) *Conn {
@@ -529,22 +529,6 @@ func (c *Conn) clientHandshake() error {
 	sa := signatureAlgorithmsExtension{algorithms: c.config.SignatureAlgorithms}
 	dv := draftVersionExtension{version: draftVersionImplemented}
 
-	var pt *pinningTicketExtension
-
-	if c.config.PinningEnabled {
-		origin := c.config.ServerName // TODO: add scheme (protocol) and port, RFC 6454 (or change the draft)
-		opaque, secret, _, found := ps.readTicket(origin)
-		if !found {
-			pt = &pinningTicketExtension{roleIsServer:false}
-		} else {
-			c.pinningSecret = secret
-			pt = &pinningTicketExtension{
-				roleIsServer:false,
-				pinningTicket:opaque,
-			}
-		}
-	}
-
 	var psk *preSharedKeyExtension
 	if key, ok := c.config.ClientPSKs[c.config.ServerName]; ok {
 		logf(logTypeHandshake, "Sending PSK")
@@ -554,6 +538,24 @@ func (c *Conn) clientHandshake() error {
 		}
 	} else {
 		logf(logTypeHandshake, "No PSK found for [%v] in %+v", c.config.ServerName, c.config.ClientPSKs)
+	}
+
+	var pt *pinningTicketExtension
+	var sendPinning bool
+
+	if c.config.PinningEnabled && (psk == nil) {
+		sendPinning = true
+		origin := c.config.ServerName // TODO: add scheme (protocol) and port, RFC 6454 (or change the draft)
+		opaque, secret, _, found := ps.readTicket(origin)
+		if !found {
+			pt = &pinningTicketExtension{roleIsServer: false}
+		} else {
+			c.pinningSecret = secret
+			pt = &pinningTicketExtension{
+				roleIsServer:  false,
+				pinningTicket: opaque,
+			}
+		}
 	}
 
 	var ed *earlyDataExtension
@@ -667,6 +669,16 @@ func (c *Conn) clientHandshake() error {
 	serverKeyShare := keyShareExtension{roleIsServer: true}
 	foundKeyShare := sh.extensions.Find(&serverKeyShare)
 
+	serverPinning := pinningTicketExtension{roleIsServer: true}
+	var foundPinning bool
+	ee := new(encryptedExtensionsBody)
+	_, err = hIn.ReadMessageBody(ee)
+	if err != nil { // Encrypted messages are optional
+		fmt.Println(err)
+		foundPinning = extensionList(*ee).Find(&serverPinning)
+	}
+	fmt.Printf("Sent pinning: %v. Found server pinning: %v\n", sendPinning, foundPinning)
+
 	var pskSecret, dhSecret []byte
 	if foundPSK && psk.HasIdentity(serverPSK.identities[0]) {
 		pskSecret = c.config.ClientPSKs[c.config.ServerName].Key
@@ -768,6 +780,8 @@ func (c *Conn) clientHandshake() error {
 		}
 	}
 
+	// validate the server's pinning proof
+
 	// Update the crypto context with all but the Finished
 	ctx.Update(transcript)
 
@@ -802,7 +816,7 @@ func (c *Conn) clientHandshake() error {
 	return nil
 }
 
-func (c *Conn) selectCertificate(serverName *serverNameExtension) (privateKey crypto.Signer, chain []*x509.Certificate, err error){
+func (c *Conn) selectCertificate(serverName *serverNameExtension) (privateKey crypto.Signer, chain []*x509.Certificate, err error) {
 	for _, cert := range c.config.Certificates {
 		for _, name := range cert.Chain[0].DNSNames {
 			if name == string(*serverName) {
@@ -1126,23 +1140,28 @@ func (c *Conn) serverHandshake() error {
 		if !found {
 			return fmt.Errorf("Pinning ticket: could not find a valid protection key")
 		}
-		newTicket := pinningTicket{protectionKeyID:keyID, ticketSecret:newTicketSecret}
+		newTicket := pinningTicket{protectionKeyID: keyID, ticketSecret: newTicketSecret}
 		sealedPinningTicket := newTicket.protect(protectionKey)
 		pinningTicketExt = &pinningTicketExtension{
-			roleIsServer:true,
-			pinningTicket:sealedPinningTicket,
-			pinningProof: pinningProof,
-			lifetime:uint32(c.config.PinningTicketLifetime),
+			roleIsServer:  true,
+			pinningTicket: sealedPinningTicket,
+			pinningProof:  pinningProof,
+			lifetime:      uint32(c.config.PinningTicketLifetime),
 		}
 		pExtBody, err := pinningTicketExt.Marshal()
 		if err != nil {
 			return fmt.Errorf("Pinning ticket: failed to marshal extension")
 		}
-		pExt = extension{extensionType:pinningTicketExt.Type(), extensionData:pExtBody}
+		pExt = extension{extensionType: pinningTicketExt.Type(), extensionData: pExtBody}
 	}
 
 	// Send an EncryptedExtensions message (even if it's empty)
-	eeb := encryptedExtensionsBody{pExt}
+	var eeb encryptedExtensionsBody
+	if !sendPinning {
+		eeb = encryptedExtensionsBody{}
+	} else {
+		eeb = encryptedExtensionsBody{pExt}
+	}
 
 	ee := &eeb
 	eem, err := hOut.WriteMessageBody(ee)
