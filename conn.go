@@ -669,16 +669,6 @@ func (c *Conn) clientHandshake() error {
 	serverKeyShare := keyShareExtension{roleIsServer: true}
 	foundKeyShare := sh.extensions.Find(&serverKeyShare)
 
-	serverPinning := pinningTicketExtension{roleIsServer: true}
-	var foundPinning bool
-	ee := new(encryptedExtensionsBody)
-	_, err = hIn.ReadMessageBody(ee)
-	if err != nil { // Encrypted messages are optional
-		fmt.Println(err)
-		foundPinning = extensionList(*ee).Find(&serverPinning)
-	}
-	fmt.Printf("Sent pinning: %v. Found server pinning: %v\n", sendPinning, foundPinning)
-
 	var pskSecret, dhSecret []byte
 	if foundPSK && psk.HasIdentity(serverPSK.identities[0]) {
 		pskSecret = c.config.ClientPSKs[c.config.ServerName].Key
@@ -724,6 +714,7 @@ func (c *Conn) clientHandshake() error {
 	transcript := []*handshakeMessage{}
 	var cert *certificateBody
 	var certVerify *certificateVerifyBody
+	var encryptedExtensions *encryptedExtensionsBody
 	var finishedMessage *handshakeMessage
 	for {
 		hm, err := hIn.ReadMessage()
@@ -743,6 +734,9 @@ func (c *Conn) clientHandshake() error {
 			} else if hm.msgType == handshakeTypeCertificateVerify {
 				certVerify = new(certificateVerifyBody)
 				_, err = certVerify.Unmarshal(hm.body)
+			} else if hm.msgType == handshakeTypeEncryptedExtensions {
+				encryptedExtensions = new(encryptedExtensionsBody)
+				_, err = encryptedExtensions.Unmarshal(hm.body)
 			}
 			transcript = append(transcript, hm)
 		}
@@ -753,6 +747,14 @@ func (c *Conn) clientHandshake() error {
 		}
 	}
 	logf(logTypeHandshake, "Done reading server's first flight")
+
+	// Verify server's pinning proof if required
+	var foundPinning bool
+	if c.config.PinningEnabled {
+		serverPinning := pinningTicketExtension{roleIsServer: true}
+		foundPinning = encryptedExtensions != nil && extensionList(*encryptedExtensions).Find(&serverPinning)
+	}
+	fmt.Printf("Sent pinning: %v. Found server pinning: %v\n", sendPinning, foundPinning)
 
 	// Verify the server's certificate if required
 	if ctx.params.mode != handshakeModePSK && ctx.params.mode != handshakeModePSKAndDH {
@@ -1156,14 +1158,13 @@ func (c *Conn) serverHandshake() error {
 	}
 
 	// Send an EncryptedExtensions message (even if it's empty)
-	var eeb encryptedExtensionsBody
+	var ee *encryptedExtensionsBody
 	if !sendPinning {
-		eeb = encryptedExtensionsBody{}
+		ee = &encryptedExtensionsBody{}
 	} else {
-		eeb = encryptedExtensionsBody{pExt}
+		ee = &encryptedExtensionsBody{pExt}
 	}
 
-	ee := &eeb
 	eem, err := hOut.WriteMessageBody(ee)
 	if err != nil {
 		return err

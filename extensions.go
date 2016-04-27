@@ -604,14 +604,11 @@ func (pt pinningTicketExtension) Type() helloExtensionType {
 func (pt pinningTicketExtension) Marshal() ([]byte, error) {
 	if pt.roleIsServer {
 		proofLen := len(pt.pinningProof)
-		proofLenHeader := []byte{byte(proofLen)}
+		proofLenHeader := make([]byte, 2)
+		binary.BigEndian.PutUint16(proofLenHeader, uint16(proofLen))
 		lifetimeBytes := make([]byte, 4)
 		binary.BigEndian.PutUint32(lifetimeBytes, pt.lifetime)
-		pte := make([]byte, 1 + proofLen + len(pt.pinningTicket) + 4)
-		pte = append(pte, proofLenHeader...)
-		pte = append(pte, pt.pinningProof...)
-		pte = append(pte, pt.pinningTicket...)
-		pte = append(pte, lifetimeBytes...)
+		pte := bytes.Join([][]byte{proofLenHeader, pt.pinningProof, pt.pinningTicket,lifetimeBytes}, nil)
 		return pte, nil
 	} else { // client
 		if pt.pinningTicket == nil || len(pt.pinningTicket) == 0 {
@@ -622,9 +619,17 @@ func (pt pinningTicketExtension) Marshal() ([]byte, error) {
 }
 
 func (pt pinningTicketExtension) Unmarshal(data []byte) (int, error) {
+	// fmt.Printf("Unmarshaling PTE: [%d] %v\n", len(data), data)
 	if pt.roleIsServer {
-		proofLen := (int(data[0]) << 8) + int(data[1]) // may be 0
-		pt.pinningProof = data[2:proofLen]
+		if len(data) < 2 {
+			return 0, fmt.Errorf("Pinning Ticket extension: too short")
+		}
+		proofLen := int(binary.BigEndian.Uint16(data[0:2])) // may be 0
+		if len(data) < 2 + proofLen + 4 {
+			return 0, fmt.Errorf("Pinning Ticket extension: too short")
+		}
+
+		pt.pinningProof = data[2:2 + proofLen]
 		pt.pinningTicket = data[2 + proofLen: len(data) - 4] // may be empty
 		pt.lifetime = binary.BigEndian.Uint32(data[len(data) - 4:])
 	} else {
