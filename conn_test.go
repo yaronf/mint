@@ -287,8 +287,8 @@ func Test0xRTT(t *testing.T) {
 
 func TestBasicFlowsWithPinning(t *testing.T) {
 	for _, conf := range []*Config{basicConfig,
-		/*pskConfig, pskDHConfig,*/
-		/*ffdhConfig*/} {
+		pskConfig, pskDHConfig,
+		ffdhConfig} {
 		cConn, sConn := pipe()
 
 		conf.PinningEnabled = true
@@ -312,6 +312,56 @@ func TestBasicFlowsWithPinning(t *testing.T) {
 		<-done
 
 		assertContextEquals(t, client.context, server.context)
+		ps.deleteDB()
 	}
 }
 
+func TestPinningWithState(t *testing.T) {
+	conf := basicConfig
+	cConn, sConn := pipe()
+
+	conf.PinningEnabled = true
+	conf.PinningDB = "connTestDB"
+	InitPinningStore(conf)	// will be shared between client and server
+	ps.createValidProtectionKey() // server side
+
+	client := Client(cConn, conf)
+	server := Server(sConn, conf)
+
+	done := make(chan bool)
+	go func(t *testing.T) {
+		err := server.Handshake()
+		assertNotError(t, err, "Server failed handshake")
+		done <- true
+	}(t)
+
+	err := client.Handshake()
+	assertNotError(t, err, "Client failed handshake")
+
+	<-done
+
+	assertContextEquals(t, client.context, server.context)
+
+	// Verify we have a ticket
+	origin := "example.com"
+	_, _, _, found := ps.readTicket(origin)
+	assertEquals(t, found, true)
+
+	// And no re-run the connection
+	client = Client(cConn, conf)
+	server = Server(sConn, conf)
+
+	done = make(chan bool)
+	go func(t *testing.T) {
+		err := server.Handshake()
+		assertNotError(t, err, "Server failed handshake")
+		done <- true
+	}(t)
+
+	err = client.Handshake()
+	assertNotError(t, err, "Client failed handshake")
+
+	<-done
+
+	assertContextEquals(t, client.context, server.context)
+}

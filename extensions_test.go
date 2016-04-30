@@ -641,4 +641,10 @@ func TestPinningMarshalUnmarshal(t *testing.T) {
 	read, err = pt.Unmarshal(out)
 	assertNotError(t, err, "Failed to unmarshal valid pinningTicketExtension")
 	assert(t, ptExtCE.pinningTicket == nil, "Empty ticket not nil")
+
+	// Test unsuccessful unmarshal
+	read, err = pt.Unmarshal(out[0:len(out)-1])
+	assertError(t, err, "Failed to detect invalid pinningTicketExtension")
+	read, err = pt.Unmarshal(out[0:2])
+	assertError(t, err, "Failed to detect invalid pinningTicketExtension")
 }

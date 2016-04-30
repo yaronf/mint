@@ -759,7 +759,7 @@ func (c *Conn) clientHandshake() error {
 	// Find server's pinning proof if it is expected
 	var foundPinning bool
 	var serverPinning pinningTicketExtension
-	var newTicket []byte
+	var serverTicket []byte
 
 	if sendPinning {
 		serverPinning = pinningTicketExtension{roleIsServer: true}
@@ -805,12 +805,10 @@ func (c *Conn) clientHandshake() error {
 				if bytes.Compare(serverPinning.pinningProof, pinningProof) != 0 {
 					return fmt.Errorf("Ticket pinning: server sent invalid proof")
 				}
-			} else {
-				newTicket = serverPinning.pinningTicket
-				if newTicket == nil {
-					return fmt.Errorf("Server did not send a ticket, and we don't do rampdown yet")
-				}
-				// But only store it after "finished" is verified
+			}
+			serverTicket = serverPinning.pinningTicket
+			if serverTicket == nil {
+				return fmt.Errorf("Server did not send a ticket, and we don't do rampdown yet")
 			}
 		}
 	}
@@ -829,9 +827,9 @@ func (c *Conn) clientHandshake() error {
 		return fmt.Errorf("tls.client: Server's Finished failed to verify")
 	}
 
-	if newTicket != nil {
+	if serverTicket != nil { // Now store the incoming ticket
 		newSecret := newTicketSecret(ctx.params.hash, ctx.xES)
-		ps.storeTicket(origin, newTicket, newSecret, int(serverPinning.lifetime))
+		ps.storeTicket(origin, serverTicket, newSecret, int(serverPinning.lifetime))
 		logf(logTypeTicketPinning, "Client: stored new ticket for %v", origin)
 	}
 
