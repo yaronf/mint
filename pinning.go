@@ -238,10 +238,11 @@ func validate(sealedTicket []byte, protectionKey []byte) (pt pinningTicket, err 
 	return
 }
 
-func newTicketSecret(hash crypto.Hash, xES []byte) []byte {
+func newTicketSecret(hash crypto.Hash, xSS []byte, xES []byte) []byte {
 	length := pinningTicketSecretLen
-	ext := hkdfExtract(hash, nil, xES)
-	return hkdfExpandLabel(hash, ext, "Ticket Pinning", nil, length)
+	dhSecrets := bytes.Join([][]byte{xSS, xES}, nil)
+	ext := hkdfExtract(hash, nil, dhSecrets)
+	return hkdfExpandLabel(hash, ext, "pinning secret", nil, length)
 }
 
 func newPinningProof(hash crypto.Hash, pinningSecret []byte, cRandom []byte, sRandom []byte, pubKey crypto.PublicKey) (proof []byte, err error) {

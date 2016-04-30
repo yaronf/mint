@@ -828,7 +828,7 @@ func (c *Conn) clientHandshake() error {
 	}
 
 	if serverTicket != nil { // Now store the incoming ticket
-		newSecret := newTicketSecret(ctx.params.hash, ctx.xES)
+		newSecret := newTicketSecret(ctx.params.hash, ctx.xSS, ctx.xES)
 		ps.storeTicket(origin, serverTicket, newSecret, int(serverPinning.lifetime))
 		logf(logTypeTicketPinning, "Client: stored new ticket for %v", origin)
 	}
@@ -931,6 +931,7 @@ func (c *Conn) serverHandshake() error {
 					}
 					receivedTicket, err := validate(pinningTicketExt.pinningTicket, protectionKey)
 					if err != nil {
+						logf(logTypeTicketPinning, "Server: got invalid ticket: %v", err)
 						return err
 					}
 					c.pinningSecret = receivedTicket.ticketSecret
@@ -1173,7 +1174,7 @@ func (c *Conn) serverHandshake() error {
 				return fmt.Errorf("Pinning ticket: failed to create proof")
 			}
 		}
-		newTicketSecret := newTicketSecret(ctx.params.hash, ctx.xES)
+		newTicketSecret := newTicketSecret(ctx.params.hash, ctx.xSS, ctx.xES)
 		protectionKey, keyID, found := ps.readCurrentProtectionKey()
 		if !found {
 			return fmt.Errorf("Pinning ticket: could not find a currently valid protection key")

@@ -364,4 +364,25 @@ func TestPinningWithState(t *testing.T) {
 	<-done
 
 	assertContextEquals(t, client.context, server.context)
+
+	// Now munge the ticket to cause a server-side failure
+	ticket, secret, _, found := ps.readTicket(origin)
+	ticket = ticket[0:len(ticket)-2]
+	ps.storeTicket(origin, ticket, secret, 10)
+	client = Client(cConn, conf)
+	server = Server(sConn, conf)
+
+	done = make(chan bool)
+	go func(t *testing.T) {
+		err := server.Handshake()
+		assertError(t, err, "Server should have failed handshake")
+		done <- true
+	}(t)
+
+	err = client.Handshake()
+	assertError(t, err, "Client should have failed handshake")
+
+	<-done
+
+	ps.deleteDB()
 }
