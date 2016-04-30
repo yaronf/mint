@@ -212,9 +212,9 @@ func readProtectionKeyID(sealedTicket []byte) (pkID uint64, err error) {
 	return binary.BigEndian.Uint64(sealedTicket[0:8]), nil
 }
 
-func validate(sealedTicket []byte, protectionKey []byte) (pt pinningTicket, valid bool) {
+func validate(sealedTicket []byte, protectionKey []byte) (pt pinningTicket, err error) {
 	if len(sealedTicket) < 8 {
-		valid = false
+		err = fmt.Errorf("Ticket pinning: sealed ticket too short")
 		return
 	}
 	pt.protectionKeyID = binary.BigEndian.Uint64(sealedTicket[0:8])
@@ -231,7 +231,10 @@ func validate(sealedTicket []byte, protectionKey []byte) (pt pinningTicket, vali
 	pkIDbytes := make([]byte, 8)
 	binary.BigEndian.PutUint64(pkIDbytes, pt.protectionKeyID)
 	pt.ticketSecret, err = aesgcm.Open(nil, nonce, cipherText, pkIDbytes)
-	valid = (err == nil)
+	if err != nil {
+		err = fmt.Errorf("Ticket pinning: failed to decrypt ticket")
+		return
+	}
 	return
 }
 

@@ -112,13 +112,13 @@ func TestProtectTicket(t *testing.T) {
 	id, err := readProtectionKeyID(protectedTicket)
 	assertEquals(t, id, keyID)
 	assertNotError(t, err, "read Protection Key?")
-	pt2, valid := validate(protectedTicket, protectionKey)
-	assertEquals(t, valid, true)
+	pt2, err := validate(protectedTicket, protectionKey)
+	assertNotError(t, err, "failed to validate ticket")
 	assertDeepEquals(t, pt2, pt)
 
 	badTicket := make([]byte, len(protectedTicket))
 	copy(badTicket, protectedTicket)
 	badTicket[0] = byte(10)
-	pt2, valid = validate(badTicket, protectionKey)
-	assertEquals(t, valid, false)
+	pt2, err = validate(badTicket, protectionKey)
+	assertError(t, err, "invalid ticket did not fail to validate")
 }

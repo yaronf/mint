@@ -543,10 +543,11 @@ func (c *Conn) clientHandshake() error {
 	var pt *pinningTicketExtension
 	var sendPinning bool // sent extension
 	var sendPinningTicket bool // sent a ticket for that server
+	var origin string
 
 	if c.config.PinningEnabled && (psk == nil) {
 		sendPinning = true
-		origin := c.config.ServerName // TODO: add scheme (protocol) and port, RFC 6454 (or change the draft)
+		origin = c.config.ServerName // TODO: add scheme (protocol) and port, RFC 6454 (or change the draft)
 		opaque, secret, _, found := ps.readTicket(origin)
 		if !found {
 			pt = &pinningTicketExtension{roleIsServer: false} // send empty extension
@@ -758,6 +759,8 @@ func (c *Conn) clientHandshake() error {
 	// Find server's pinning proof if it is expected
 	var foundPinning bool
 	var serverPinning pinningTicketExtension
+	var newTicket []byte
+
 	if sendPinning {
 		serverPinning = pinningTicketExtension{roleIsServer: true}
 		foundPinning = (encryptedExtensions != nil) && extensionList(*encryptedExtensions).Find(&serverPinning)
@@ -799,13 +802,15 @@ func (c *Conn) clientHandshake() error {
 				if err != nil {
 					return fmt.Errorf("Ticket pinning: failed to create proof")
 				}
-				logf(logTypeTicketPinning, "Computed proof: [%d] %v; received [%d] %v\n", len(pinningProof), pinningProof,
-					len(serverPinning.pinningProof), serverPinning.pinningProof)
 				if bytes.Compare(serverPinning.pinningProof, pinningProof) != 0 {
 					return fmt.Errorf("Ticket pinning: server sent invalid proof")
 				}
 			} else {
-				// TODO: handle the new ticket, if any
+				newTicket = serverPinning.pinningTicket
+				if newTicket == nil {
+					return fmt.Errorf("Server did not send a ticket, and we don't do rampdown yet")
+				}
+				// But only store it after "finished" is verified
 			}
 		}
 	}
@@ -822,6 +827,12 @@ func (c *Conn) clientHandshake() error {
 	}
 	if !bytes.Equal(sfin.verifyData, ctx.serverFinished.verifyData) {
 		return fmt.Errorf("tls.client: Server's Finished failed to verify")
+	}
+
+	if newTicket != nil {
+		newSecret := newTicketSecret(ctx.params.hash, ctx.xES)
+		ps.storeTicket(origin, newTicket, newSecret, int(serverPinning.lifetime))
+		logf(logTypeTicketPinning, "Client: stored new ticket for %v", origin)
 	}
 
 	// Send client Finished
@@ -920,9 +931,9 @@ func (c *Conn) serverHandshake() error {
 					if !found {
 						return fmt.Errorf("Ticket pinning: protection key not found")
 					}
-					receivedTicket, valid := validate(pinningTicketExt.pinningTicket, protectionKey)
-					if !valid {
-						return fmt.Errorf("Ticket pinning: client ticket failed to validate")
+					receivedTicket, err := validate(pinningTicketExt.pinningTicket, protectionKey)
+					if err != nil {
+						return err
 					}
 					c.pinningSecret = receivedTicket.ticketSecret
 				}
