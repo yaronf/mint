@@ -584,3 +584,61 @@ func TestDraftVersionMarshalUnmarshal(t *testing.T) {
 	read, err = dv.Unmarshal(draftVersion[:1])
 	assertError(t, err, "Unmarshaled a DraftVersion with the wrong length")
 }
+
+func TestPinningMarshalUnmarshal(t *testing.T) {
+	// Server-side
+	ptExtS := pinningTicketExtension{roleIsServer:true, pinningProof:[]byte("ABCDE"), pinningTicket:[]byte("0123456"), lifetime:33}
+
+	// Test extension type
+	assertEquals(t, ptExtS.Type(), extensionTypePinningTicket)
+
+	// Test successful marshal
+	out, err := ptExtS.Marshal()
+	assertNotError(t, err, "Failed to marshal valid pinningTicketExtension")
+
+	// Test successful unmarshal
+	pt := pinningTicketExtension{roleIsServer:true}
+	read, err := pt.Unmarshal(out)
+	assertNotError(t, err, "Failed to unmarshal valid pinningTicketExtension")
+	assertDeepEquals(t, ptExtS.pinningProof, pt.pinningProof)
+	assertDeepEquals(t, ptExtS.pinningTicket, pt.pinningTicket)
+	assertEquals(t, read, 2 + len(pt.pinningProof) + 2 + len(pt.pinningTicket) + 4)
+
+	// Test error on wrong length
+	bad := out[0: 7]
+	read, err = pt.Unmarshal(bad)
+	assertError(t, err, "Failed to detect invalid pinningTicketExtension")
+
+	// Client-side
+	ptExtC := pinningTicketExtension{roleIsServer:false, pinningTicket:[]byte("0123456")}
+
+	// Test extension type
+	assertEquals(t, ptExtC.Type(), extensionTypePinningTicket)
+
+	// Test successful marshal
+	out, err = ptExtC.Marshal()
+	assertNotError(t, err, "Failed to marshal valid pinningTicketExtension")
+
+	// Test successful unmarshal
+	pt = pinningTicketExtension{roleIsServer:false}
+	read, err = pt.Unmarshal(out)
+	assertNotError(t, err, "Failed to unmarshal valid pinningTicketExtension")
+	assertDeepEquals(t, ptExtC.pinningTicket, pt.pinningTicket)
+	assertEquals(t, read, 2 + len(pt.pinningTicket))
+
+	// Empty client-side ticket
+	ptExtCE := pinningTicketExtension{roleIsServer:false}
+
+	// Test extension type
+	assertEquals(t, ptExtCE.Type(), extensionTypePinningTicket)
+
+	// Test successful marshal
+	out, err = ptExtC.Marshal()
+	assertNotError(t, err, "Failed to marshal valid pinningTicketExtension")
+
+	// Test successful unmarshal
+	pt = pinningTicketExtension{roleIsServer:false}
+	read, err = pt.Unmarshal(out)
+	assertNotError(t, err, "Failed to unmarshal valid pinningTicketExtension")
+	assert(t, ptExtCE.pinningTicket == nil, "Empty ticket not nil")
+}

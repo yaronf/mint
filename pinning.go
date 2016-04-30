@@ -25,6 +25,7 @@ var ps pinningStore
 
 const (
 	pinningTicketSecretLen = 16 // bytes
+	logTypeTicketPinning = "pinning"
 )
 
 func InitPinningStore(config *Config) {

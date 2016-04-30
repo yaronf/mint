@@ -603,37 +603,62 @@ func (pt pinningTicketExtension) Type() helloExtensionType {
 
 func (pt pinningTicketExtension) Marshal() ([]byte, error) {
 	if pt.roleIsServer {
-		proofLen := len(pt.pinningProof)
 		proofLenHeader := make([]byte, 2)
-		binary.BigEndian.PutUint16(proofLenHeader, uint16(proofLen))
+		binary.BigEndian.PutUint16(proofLenHeader, uint16(len(pt.pinningProof)))
+		ticketLenHeader := make([]byte, 2)
+		binary.BigEndian.PutUint16(ticketLenHeader, uint16(len(pt.pinningTicket)))
 		lifetimeBytes := make([]byte, 4)
 		binary.BigEndian.PutUint32(lifetimeBytes, pt.lifetime)
-		pte := bytes.Join([][]byte{proofLenHeader, pt.pinningProof, pt.pinningTicket,lifetimeBytes}, nil)
+		pte := bytes.Join([][]byte{proofLenHeader, pt.pinningProof, ticketLenHeader, pt.pinningTicket, lifetimeBytes}, nil)
 		return pte, nil
 	} else { // client
-		if pt.pinningTicket == nil || len(pt.pinningTicket) == 0 {
-			return []byte{}, nil
+		var ticketLen int
+		if pt.pinningTicket == nil {
+			ticketLen = 0
+		} else {
+			ticketLen = len(pt.pinningTicket)
 		}
-		return pt.pinningTicket, nil
+		ticketLenHeader := make([]byte, 2)
+		binary.BigEndian.PutUint16(ticketLenHeader, uint16(ticketLen))
+		pte := bytes.Join([][]byte{ticketLenHeader, pt.pinningTicket}, nil)
+		return pte, nil
 	}
 }
 
-func (pt pinningTicketExtension) Unmarshal(data []byte) (int, error) {
-	// fmt.Printf("Unmarshaling PTE: [%d] %v\n", len(data), data)
+func (pt *pinningTicketExtension) Unmarshal(data []byte) (int, error) {
+	var extLen int
 	if pt.roleIsServer {
 		if len(data) < 2 {
 			return 0, fmt.Errorf("Pinning Ticket extension: too short")
 		}
 		proofLen := int(binary.BigEndian.Uint16(data[0:2])) // may be 0
-		if len(data) < 2 + proofLen + 4 {
+		if len(data) < 2 + proofLen + 2 + 4 {
 			return 0, fmt.Errorf("Pinning Ticket extension: too short")
 		}
-
 		pt.pinningProof = data[2:2 + proofLen]
-		pt.pinningTicket = data[2 + proofLen: len(data) - 4] // may be empty
-		pt.lifetime = binary.BigEndian.Uint32(data[len(data) - 4:])
-	} else {
-		pt.pinningTicket = data // may be empty
+		ticketLen := int(binary.BigEndian.Uint16(data[2 + proofLen:2 + proofLen + 2])) // may be 0
+		if len(data) < 2 + proofLen + 2 + ticketLen + 4 {
+			return 0, fmt.Errorf("Pinning Ticket extension: too short")
+		}
+		pt.pinningTicket = data[2 + proofLen + 2: 2 + proofLen + 2 + ticketLen] // may be empty
+		if len(pt.pinningTicket) == 0 {
+			pt.pinningTicket = nil
+		}
+		pt.lifetime = binary.BigEndian.Uint32(data[2 + proofLen + 2 + ticketLen: 2 + proofLen + 2 + ticketLen + 4])
+		extLen = 2 + proofLen + 2 + ticketLen + 4
+	} else { // client
+		if len(data) < 2 {
+			return 0, fmt.Errorf("Pinning Ticket extension: too short")
+		}
+		ticketLen := int(binary.BigEndian.Uint16(data[0: 2])) // may be 0
+		if len(data) < 2 + ticketLen {
+			return 0, fmt.Errorf("Pinning Ticket extension: too short")
+		}
+		pt.pinningTicket = data[2: 2 + ticketLen] // may be empty
+		if len(pt.pinningTicket) == 0 {
+			pt.pinningTicket = nil
+		}
+		extLen = 2 + ticketLen
 	}
-	return len(data), nil
+	return extLen, nil
 }

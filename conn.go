@@ -541,21 +541,27 @@ func (c *Conn) clientHandshake() error {
 	}
 
 	var pt *pinningTicketExtension
-	var sendPinning bool
+	var sendPinning bool // sent extension
+	var sendPinningTicket bool // sent a ticket for that server
 
 	if c.config.PinningEnabled && (psk == nil) {
 		sendPinning = true
 		origin := c.config.ServerName // TODO: add scheme (protocol) and port, RFC 6454 (or change the draft)
 		opaque, secret, _, found := ps.readTicket(origin)
 		if !found {
-			pt = &pinningTicketExtension{roleIsServer: false}
+			pt = &pinningTicketExtension{roleIsServer: false} // send empty extension
+			logf(logTypeTicketPinning, "Client: will send an empty PTE")
 		} else {
+			sendPinningTicket = true
 			c.pinningSecret = secret
 			pt = &pinningTicketExtension{
 				roleIsServer:  false,
 				pinningTicket: opaque,
 			}
+			logf(logTypeTicketPinning, "Client: found ticket for %v", origin)
 		}
+	} else {
+		logf(logTypeTicketPinning, "Client: will not send PTE")
 	}
 
 	var ed *earlyDataExtension
@@ -598,6 +604,7 @@ func (c *Conn) clientHandshake() error {
 
 	if pt != nil {
 		err := ch.extensions.Add(pt)
+		logf(logTypeTicketPinning, "Client sending PTE")
 		if err != nil {
 			return err
 		}
@@ -748,13 +755,16 @@ func (c *Conn) clientHandshake() error {
 	}
 	logf(logTypeHandshake, "Done reading server's first flight")
 
-	// Verify server's pinning proof if required
+	// Find server's pinning proof if it is expected
 	var foundPinning bool
-	if c.config.PinningEnabled {
-		serverPinning := pinningTicketExtension{roleIsServer: true}
-		foundPinning = encryptedExtensions != nil && extensionList(*encryptedExtensions).Find(&serverPinning)
+	var serverPinning pinningTicketExtension
+	if sendPinning {
+		serverPinning = pinningTicketExtension{roleIsServer: true}
+		foundPinning = (encryptedExtensions != nil) && extensionList(*encryptedExtensions).Find(&serverPinning)
+		if sendPinningTicket && !foundPinning {
+			return fmt.Errorf("Ticket pinning: server received its ticket and did not respond with extension")
+		}
 	}
-	fmt.Printf("Sent pinning: %v. Found server pinning: %v\n", sendPinning, foundPinning)
 
 	// Verify the server's certificate if required
 	if ctx.params.mode != handshakeModePSK && ctx.params.mode != handshakeModePSKAndDH {
@@ -780,9 +790,25 @@ func (c *Conn) clientHandshake() error {
 				return err
 			}
 		}
+		// validate the server's pinning proof
+		if foundPinning {
+			logf(logTypeTicketPinning, "Client received PTE")
+			if sendPinningTicket {
+				// sent a ticket, expect to get back a proof
+				pinningProof, err := newPinningProof(ctx.params.hash, c.pinningSecret, ch.random[:], sh.random[:], serverPublicKey)
+				if err != nil {
+					return fmt.Errorf("Ticket pinning: failed to create proof")
+				}
+				logf(logTypeTicketPinning, "Computed proof: [%d] %v; received [%d] %v\n", len(pinningProof), pinningProof,
+					len(serverPinning.pinningProof), serverPinning.pinningProof)
+				if bytes.Compare(serverPinning.pinningProof, pinningProof) != 0 {
+					return fmt.Errorf("Ticket pinning: server sent invalid proof")
+				}
+			} else {
+				// TODO: handle the new ticket, if any
+			}
+		}
 	}
-
-	// validate the server's pinning proof
 
 	// Update the crypto context with all but the Finished
 	ctx.Update(transcript)
@@ -870,6 +896,7 @@ func (c *Conn) serverHandshake() error {
 	gotPSK := ch.extensions.Find(clientPSK)
 	gotEarlyData := ch.extensions.Find(clientEarlyData)
 	gotPinning := ch.extensions.Find(pinningTicketExt)
+	logf(logTypeTicketPinning, "Server gotPinning: %v", gotPinning)
 	if !gotServerName || !gotSupportedGroups || !gotSignatureAlgorithms {
 		logf(logTypeHandshake, "Insufficient extensions")
 		return fmt.Errorf("tls.server: Missing extension in ClientHello (%v %v %v %v)",
@@ -881,28 +908,25 @@ func (c *Conn) serverHandshake() error {
 	if c.config.PinningEnabled {
 		if gotPinning {
 			if gotPSK {
-				return fmt.Errorf("Pinning ticket: not supported with PSK")
-			}
-			sendPinning = true
-			if pinningTicketExt.pinningTicket != nil {
-				protectionKeyID, err := readProtectionKeyID(pinningTicketExt.pinningTicket)
-				if err != nil {
-					return err
-				}
-				protectionKey, found := ps.readProtectionKey(protectionKeyID)
-				if !found {
-					return fmt.Errorf("Ticket pinning: protection key not found")
-				}
-				receivedTicket, valid := validate(pinningTicketExt.pinningTicket, protectionKey)
-				if !valid {
-					return fmt.Errorf("Ticket pinning: client ticket failed to validate")
-				}
-				c.pinningSecret = receivedTicket.ticketSecret
+				logf(logTypeTicketPinning, "Pinning ticket: not supported with PSK - ignored")
 			} else {
-				// Received an empty extension (initial connection)
+				sendPinning = true
+				if pinningTicketExt.pinningTicket != nil {
+					protectionKeyID, err := readProtectionKeyID(pinningTicketExt.pinningTicket)
+					if err != nil {
+						return err
+					}
+					protectionKey, found := ps.readProtectionKey(protectionKeyID)
+					if !found {
+						return fmt.Errorf("Ticket pinning: protection key not found")
+					}
+					receivedTicket, valid := validate(pinningTicketExt.pinningTicket, protectionKey)
+					if !valid {
+						return fmt.Errorf("Ticket pinning: client ticket failed to validate")
+					}
+					c.pinningSecret = receivedTicket.ticketSecret
+				}
 			}
-		} else {
-			// Did not receive an extension at all
 		}
 	}
 
@@ -1133,14 +1157,17 @@ func (c *Conn) serverHandshake() error {
 	// Ticket pinning: prepare returned ticket extension
 	var pExt extension
 	if sendPinning {
-		pinningProof, err := newPinningProof(ctx.params.hash, c.pinningSecret, ch.random[:], sh.random[:], privateKey.Public())
-		if err != nil {
-			return fmt.Errorf("Pinning ticket: failed to create proof")
+		var pinningProof []byte
+		if pinningTicketExt.pinningTicket != nil { // got a ticket, respond with proof
+			pinningProof, err = newPinningProof(ctx.params.hash, c.pinningSecret, ch.random[:], sh.random[:], privateKey.Public())
+			if err != nil {
+				return fmt.Errorf("Pinning ticket: failed to create proof")
+			}
 		}
 		newTicketSecret := newTicketSecret(ctx.params.hash, ctx.xES)
 		protectionKey, keyID, found := ps.readCurrentProtectionKey()
 		if !found {
-			return fmt.Errorf("Pinning ticket: could not find a valid protection key")
+			return fmt.Errorf("Pinning ticket: could not find a currently valid protection key")
 		}
 		newTicket := pinningTicket{protectionKeyID: keyID, ticketSecret: newTicketSecret}
 		sealedPinningTicket := newTicket.protect(protectionKey)
@@ -1155,6 +1182,7 @@ func (c *Conn) serverHandshake() error {
 			return fmt.Errorf("Pinning ticket: failed to marshal extension")
 		}
 		pExt = extension{extensionType: pinningTicketExt.Type(), extensionData: pExtBody}
+		logf(logTypeTicketPinning, "Server sending PTE")
 	}
 
 	// Send an EncryptedExtensions message (even if it's empty)

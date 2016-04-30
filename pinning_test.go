@@ -38,12 +38,21 @@ func TestStoreTicket(t *testing.T) {
 	tkt, psec, _, found = ps.readTicket("no such origin")
 	assertEquals(t, found, false)
 
+	// store an expired ticket
 	origin = "orig2.example.com"
 	ticket = []byte("1122334455aabbccddee")
 	pinningSecret = []byte("zzxxccvv!!@@##$$")
 	lifetime = -60 // negative to ensure expiry!
 	ps.storeTicket(origin, ticket, pinningSecret, lifetime)
 	_, _, _, found = ps.readTicket(origin)
+	assertEquals(t, found, false)
+
+	// test clientCleanup
+	origin = "orig1.example.com"
+	tkt, psec, _, found = ps.readTicket(origin)
+	assertEquals(t, found, true)
+	ps.clientCleanup()
+	tkt, psec, _, found = ps.readTicket(origin)
 	assertEquals(t, found, false)
 }
 
