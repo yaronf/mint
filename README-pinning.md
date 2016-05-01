@@ -1,8 +1,9 @@
-This is an implementation of https://datatracker.ietf.org/doc/draft-sheffer-tls-pinning-ticket/.
+
+This is an implementation of [draft-sheffer-tls-pinning-ticket](https://datatracker.ietf.org/doc/draft-sheffer-tls-pinning-ticket/) and a fork of the [Mint](https://github.com/bifurcation/mint) TLS 1.3 implementation.
 
 # Overview
 
-This proposed solution **pins** (fixes) the server's identity by only reconnecting a client to the server if the server can prove that it has access to a long-term key and therefore can decrypt a **ticket** stored on the client.
+This proposed solution **pins** (fixes) the server's identity by only reconnecting a client to the server if the server can prove that it has access to a long-term key and therefore can decrypt a **ticket** stored on the client. This is more secure than simply relying on the server's PKI certificate, and easier to use than [HPKP](https://tools.ietf.org/html/rfc7469).
 
 # This is Not Production-Ready
 
@@ -13,8 +14,8 @@ And second, because we use a database (SQLite) to store the client-side ticket a
 # Usage
 
 
-``
+```
 go run bin/mint-server/main.go -keyfile serverKey.pem -certfile serverCert.pem -pinning -pinningDB server.db -servername myserver &
 
 go run bin/mint-client/main.go -pinning -pinningDB client.db &
-``
+```
