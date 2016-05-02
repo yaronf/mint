@@ -20,7 +20,7 @@ go run bin/mint-server/main.go -keyfile serverKey.pem -certfile serverCert.pem -
 go run bin/mint-client/main.go -pinning -pinning-database client.db &
 ```
 
-Add the flag ``-pinning-ramdown`` on the server side to run the server in rampdown mode, where it does not return a new ticket to the client.
+Add the flag ``-pinning-rampdown`` on the server side to run the server in rampdown mode, where it does not return a new ticket to the client.
 
 # Administrative Commands
 
