@@ -16,6 +16,9 @@ var port string
 var serverName, serverKeyFile, serverCertFile string
 var pinningEnabled bool
 var pinningDB string
+var pinningCreateServerKey bool
+var pinningRotateServerKey bool
+var pinningRampdown bool
 
 func readServerKey(serverKeyFile string) *rsa.PrivateKey {
 	serverKeyBytes, err := ioutil.ReadFile(serverKeyFile)
@@ -45,6 +48,17 @@ func readServerCert(serverCertFile string) *x509.Certificate {
 	return serverCert
 }
 
+func initPS(db string) {
+	if db == "" {
+		log.Fatal("For ticket pinning, you must specify a pinning database file")
+	}
+	config := mint.Config{
+		PinningEnabled:true,
+		PinningDB:db,
+	}
+	mint.InitPinningStore(&config)
+}
+
 func main() {
 	var config mint.Config
 
@@ -52,12 +66,32 @@ func main() {
 	flag.StringVar(&serverName, "servername", "", "server name")
 	flag.StringVar(&serverKeyFile, "keyfile", "", "private key file")
 	flag.StringVar(&serverCertFile, "certfile", "", "certificate file")
+
 	flag.BoolVar(&pinningEnabled, "pinning", false, "ticket pinning enabled")
-	flag.StringVar(&pinningDB, "pinningDB", "", "pinning database file (will be created or opened)")
+	flag.BoolVar(&pinningRampdown, "pinning-rampdown", false, "ticket pinning rampdown mode")
+	flag.StringVar(&pinningDB, "pinning-database", "", "pinning database file (will be created or opened)")
+	flag.BoolVar(&pinningCreateServerKey, "pinning-create-server-key", false, "create initial server key")
+	flag.BoolVar(&pinningRotateServerKey, "pinning-rotate-server-key", false, "rotate server protection key")
 	flag.Parse()
+
+	if pinningCreateServerKey {
+		initPS(pinningDB)
+		mint.CreateServerPinningKey()
+		return
+	}
+
+	if pinningRotateServerKey {
+		initPS(pinningDB)
+		mint.RotateServerPinningKey()
+		return
+	}
 
 	if pinningEnabled && (pinningDB == "") {
 		log.Fatal("For ticket pinning, you must specify a pinning database file")
+	}
+
+	if pinningRampdown && !pinningEnabled {
+		log.Fatal("Pinning rampdown only applies if ticket pinning is enabled")
 	}
 
 	if serverKeyFile == "" || serverCertFile == "" {
@@ -78,6 +112,7 @@ func main() {
 		ServerName: serverName,
 		Certificates: certificates,
 		PinningEnabled:pinningEnabled,
+		PinningRampdown:pinningRampdown,
 		PinningDB:pinningDB,
 	}
 

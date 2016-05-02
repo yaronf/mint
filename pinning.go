@@ -30,10 +30,10 @@ const (
 
 func InitPinningStore(config *Config) {
 	ps = pinningStore{}
-	ps.initDB(*config)
+	ps.initDB(config)
 }
 
-func (ps *pinningStore) initDB(config Config) {
+func (ps *pinningStore) initDB(config *Config) {
 	db, err := sql.Open("sqlite3", config.PinningDB)
 	if err != nil {
 		log.Fatal(err)
@@ -115,6 +115,29 @@ func (ps *pinningStore) readTicket(origin string) (opaque []byte, pinningSecret 
 	return
 }
 
+func (ps *pinningStore) deleteTicket(origin string) (found bool) {
+	result, err := ps.db.Exec("delete from tickets where origin=?", origin)
+	if err != nil {
+		log.Fatal(err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		log.Fatal(err)
+	}
+	return (rows >= 1)
+}
+
+func (ps *pinningStore) deleteAllTickets() {
+	_, err := ps.db.Exec("delete from tickets")
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+func DeleteTicket(origin string) (found bool) {
+	return ps.deleteTicket(origin)
+}
+
 func (ps *pinningStore) storeProtectionKey(key []byte, validFrom time.Time, validUntil time.Time) uint64 {
 	result, err := ps.db.Exec("insert into protection_keys(key, valid_from, valid_until) values (?, ?, ?)", key, validFrom, validUntil)
 	if err != nil {
@@ -160,6 +183,14 @@ func (ps *pinningStore) readCurrentProtectionKey() (key []byte, keyID uint64, fo
 	return
 }
 
+func CreateServerPinningKey() {
+	ps.createValidProtectionKey()
+}
+
+func RotateServerPinningKey() {
+	ps.createValidProtectionKey()
+}
+
 // Create a protection key that's immediately valid
 func (ps *pinningStore) createValidProtectionKey() {
 	key := make([]byte, 16) // AES-256
@@ -172,11 +203,8 @@ func (ps *pinningStore) createValidProtectionKey() {
 }
 
 // Delete all tickets from client's store
-func (ps *pinningStore) clientCleanup() {
-	_, err := ps.db.Exec("delete from tickets")
-	if err != nil {
-		log.Fatal(err)
-	}
+func ClientCleanup() {
+	ps.deleteAllTickets()
 }
 
 // TODO Add server-create-first-key, server-rotate, client-cleanup, server-ramp-down ops

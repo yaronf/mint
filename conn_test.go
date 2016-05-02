@@ -365,6 +365,25 @@ func TestPinningWithState(t *testing.T) {
 
 	assertContextEquals(t, client.context, server.context)
 
+	// Move server into ramdown mode
+	conf.PinningRampdown = true
+	client = Client(cConn, conf)
+	server = Server(sConn, conf)
+
+	done = make(chan bool)
+	go func(t *testing.T) {
+		err := server.Handshake()
+		assertNotError(t, err, "Server failed handshake")
+		done <- true
+	}(t)
+
+	err = client.Handshake()
+	assertNotError(t, err, "Client failed handshake")
+
+	<-done
+
+	assertContextEquals(t, client.context, server.context)
+
 	// Now munge the ticket to cause a server-side failure
 	ticket, secret, _, found := ps.readTicket(origin)
 	ticket = ticket[0:len(ticket)-2]

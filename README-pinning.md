@@ -15,7 +15,34 @@ And second, because we use a database (SQLite) to store the client-side ticket a
 
 
 ```
-go run bin/mint-server/main.go -keyfile serverKey.pem -certfile serverCert.pem -pinning -pinningDB server.db -servername myserver &
+go run bin/mint-server/main.go -keyfile serverKey.pem -certfile serverCert.pem -pinning -pinning-database server.db -servername myserver &
 
-go run bin/mint-client/main.go -pinning -pinningDB client.db &
+go run bin/mint-client/main.go -pinning -pinning-database client.db &
+```
+
+Add the flag ``-pinning-ramdown`` on the server side to run the server in rampdown mode, where it does not return a new ticket to the client.
+
+# Administrative Commands
+
+## Server-Side
+Create initial protection key and rotate protection key (currently run the same code).
+
+```
+go run bin/mint-server/main.go -pinning -pinning-database server.db -pinning-create-server-key
+
+go run bin/mint-server/main.go -pinning -pinning-database server.db -pinning-rotate-server-key
+```
+
+## Client-Side
+Delete the ticket for ``localhost`` and delete all tickets.
+
+```
+go run bin/mint-client/main.go -pinning -pinning-database client.db -pinning-clear-ticket localhost
+
+go run bin/mint-client/main.go -pinning -pinning-database client.db -pinning-clear-all-tickets
+```
+
+# Debugging
+```
+export MINT_LOG='pinning'
 ```

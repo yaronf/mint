@@ -5,14 +5,14 @@ import (
 	"time"
 )
 
-func initTest() pinningStore {
+func initTest() *pinningStore {
 	config := Config{PinningDB: "testDB.db"}
 	ps := pinningStore{}
-	ps.initDB(config)
-	return ps
+	ps.initDB(&config)
+	return &ps
 }
 
-func finalizeTest(ps pinningStore) {
+func finalizeTest(ps *pinningStore) {
 	ps.deleteDB()
 	ps.closeDB()
 }
@@ -51,7 +51,7 @@ func TestStoreTicket(t *testing.T) {
 	origin = "orig1.example.com"
 	tkt, psec, _, found = ps.readTicket(origin)
 	assertEquals(t, found, true)
-	ps.clientCleanup()
+	ps.deleteAllTickets()
 	tkt, psec, _, found = ps.readTicket(origin)
 	assertEquals(t, found, false)
 }

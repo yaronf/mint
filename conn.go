@@ -70,6 +70,7 @@ type Config struct {
 	PinningEnabled        bool
 	PinningDB             string
 	PinningTicketLifetime int
+	PinningRampdown	      bool
 
 	// Hidden fields (used for caching in convenient form)
 	enabledSuite map[cipherSuite]bool
@@ -808,7 +809,7 @@ func (c *Conn) clientHandshake() error {
 			}
 			serverTicket = serverPinning.pinningTicket
 			if serverTicket == nil {
-				return fmt.Errorf("Server did not send a ticket, and we don't do rampdown yet")
+				logf(logTypeTicketPinning, "Server did not send a ticket, probably rampdown mode")
 			}
 		}
 	}
@@ -1174,13 +1175,18 @@ func (c *Conn) serverHandshake() error {
 				return fmt.Errorf("Pinning ticket: failed to create proof")
 			}
 		}
-		newTicketSecret := newTicketSecret(ctx.params.hash, ctx.xSS, ctx.xES)
-		protectionKey, keyID, found := ps.readCurrentProtectionKey()
-		if !found {
-			return fmt.Errorf("Pinning ticket: could not find a currently valid protection key")
+		var sealedPinningTicket []byte
+		if c.config.PinningRampdown {
+			sealedPinningTicket = nil
+		} else {
+			newTicketSecret := newTicketSecret(ctx.params.hash, ctx.xSS, ctx.xES)
+			protectionKey, keyID, found := ps.readCurrentProtectionKey()
+			if !found {
+				return fmt.Errorf("Pinning ticket: could not find a currently valid protection key")
+			}
+			newTicket := pinningTicket{protectionKeyID: keyID, ticketSecret: newTicketSecret}
+			sealedPinningTicket = newTicket.protect(protectionKey)
 		}
-		newTicket := pinningTicket{protectionKeyID: keyID, ticketSecret: newTicketSecret}
-		sealedPinningTicket := newTicket.protect(protectionKey)
 		pinningTicketExt = &pinningTicketExtension{
 			roleIsServer:  true,
 			pinningTicket: sealedPinningTicket,
