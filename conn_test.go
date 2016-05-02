@@ -293,7 +293,7 @@ func TestBasicFlowsWithPinning(t *testing.T) {
 
 		conf.PinningEnabled = true
 		conf.PinningDB = "connTestDB"
-		InitPinningStore(conf)	// will be shared between client and server
+		InitPinningStore(conf)        // will be shared between client and server
 		ps.createValidProtectionKey() // server side
 
 		client := Client(cConn, conf)
@@ -322,7 +322,7 @@ func TestPinningWithState(t *testing.T) {
 
 	conf.PinningEnabled = true
 	conf.PinningDB = "connTestDB"
-	InitPinningStore(conf)	// will be shared between client and server
+	InitPinningStore(conf)        // will be shared between client and server
 	ps.createValidProtectionKey() // server side
 
 	client := Client(cConn, conf)
@@ -386,7 +386,7 @@ func TestPinningWithState(t *testing.T) {
 
 	// Now munge the ticket to cause a server-side failure
 	ticket, secret, _, found := ps.readTicket(origin)
-	ticket = ticket[0:len(ticket)-2]
+	ticket = ticket[0 : len(ticket)-2]
 	ps.storeTicket(origin, ticket, secret, 10)
 	client = Client(cConn, conf)
 	server = Server(sConn, conf)

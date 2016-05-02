@@ -105,7 +105,7 @@ const (
 	extensionTypePreSharedKey        helloExtensionType = 41
 	extensionTypeEarlyData           helloExtensionType = 42
 	extensionTypeDraftVersion        helloExtensionType = 0xff02 // Required for NSS
-	extensionTypePinningTicket	 helloExtensionType = 0xffe0 // squatting
+	extensionTypePinningTicket       helloExtensionType = 0xffe0 // squatting
 )
 
 // enum {...} NamedGroup

@@ -2,19 +2,19 @@ package mint
 
 import (
 	"bytes"
+	"crypto"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/x509"
 	"database/sql"
 	"encoding/binary"
+	"fmt"
 	_ "github.com/mattn/go-sqlite3"
 	"io"
 	"log"
 	"time"
-	"fmt"
-	"crypto"
-	"crypto/x509"
-	"crypto/hmac"
 )
 
 type pinningStore struct {
@@ -25,7 +25,7 @@ var ps pinningStore
 
 const (
 	pinningTicketSecretLen = 16 // bytes
-	logTypeTicketPinning = "pinning"
+	logTypeTicketPinning   = "pinning"
 )
 
 func InitPinningStore(config *Config) {
@@ -254,8 +254,8 @@ func validate(sealedTicket []byte, protectionKey []byte) (pt pinningTicket, err 
 	if err != nil {
 		panic(err.Error())
 	}
-	nonce := sealedTicket[8 : 8 + aesgcm.NonceSize()]
-	cipherText := sealedTicket[8 + aesgcm.NonceSize():]
+	nonce := sealedTicket[8 : 8+aesgcm.NonceSize()]
+	cipherText := sealedTicket[8+aesgcm.NonceSize():]
 	pkIDbytes := make([]byte, 8)
 	binary.BigEndian.PutUint64(pkIDbytes, pt.protectionKeyID)
 	pt.ticketSecret, err = aesgcm.Open(nil, nonce, cipherText, pkIDbytes)

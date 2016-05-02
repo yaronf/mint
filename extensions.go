@@ -2,8 +2,8 @@ package mint
 
 import (
 	"bytes"
-	"fmt"
 	"encoding/binary"
+	"fmt"
 )
 
 type extensionBody interface {
@@ -591,10 +591,10 @@ func (dv *draftVersionExtension) Unmarshal(data []byte) (int, error) {
 }
 
 type pinningTicketExtension struct {
-	roleIsServer bool
+	roleIsServer  bool
 	pinningTicket []byte
-	pinningProof []byte
-	lifetime uint32
+	pinningProof  []byte
+	lifetime      uint32
 }
 
 func (pt pinningTicketExtension) Type() helloExtensionType {
@@ -632,29 +632,29 @@ func (pt *pinningTicketExtension) Unmarshal(data []byte) (int, error) {
 			return 0, fmt.Errorf("Pinning Ticket extension: too short")
 		}
 		proofLen := int(binary.BigEndian.Uint16(data[0:2])) // may be 0
-		if len(data) < 2 + proofLen + 2 + 4 {
+		if len(data) < 2+proofLen+2+4 {
 			return 0, fmt.Errorf("Pinning Ticket extension: too short")
 		}
-		pt.pinningProof = data[2:2 + proofLen]
-		ticketLen := int(binary.BigEndian.Uint16(data[2 + proofLen:2 + proofLen + 2])) // may be 0
-		if len(data) < 2 + proofLen + 2 + ticketLen + 4 {
+		pt.pinningProof = data[2 : 2+proofLen]
+		ticketLen := int(binary.BigEndian.Uint16(data[2+proofLen : 2+proofLen+2])) // may be 0
+		if len(data) < 2+proofLen+2+ticketLen+4 {
 			return 0, fmt.Errorf("Pinning Ticket extension: too short")
 		}
-		pt.pinningTicket = data[2 + proofLen + 2: 2 + proofLen + 2 + ticketLen] // may be empty
+		pt.pinningTicket = data[2+proofLen+2 : 2+proofLen+2+ticketLen] // may be empty
 		if len(pt.pinningTicket) == 0 {
 			pt.pinningTicket = nil
 		}
-		pt.lifetime = binary.BigEndian.Uint32(data[2 + proofLen + 2 + ticketLen: 2 + proofLen + 2 + ticketLen + 4])
+		pt.lifetime = binary.BigEndian.Uint32(data[2+proofLen+2+ticketLen : 2+proofLen+2+ticketLen+4])
 		extLen = 2 + proofLen + 2 + ticketLen + 4
 	} else { // client
 		if len(data) < 2 {
 			return 0, fmt.Errorf("Pinning Ticket extension: too short")
 		}
-		ticketLen := int(binary.BigEndian.Uint16(data[0: 2])) // may be 0
-		if len(data) < 2 + ticketLen {
+		ticketLen := int(binary.BigEndian.Uint16(data[0:2])) // may be 0
+		if len(data) < 2+ticketLen {
 			return 0, fmt.Errorf("Pinning Ticket extension: too short")
 		}
-		pt.pinningTicket = data[2: 2 + ticketLen] // may be empty
+		pt.pinningTicket = data[2 : 2+ticketLen] // may be empty
 		if len(pt.pinningTicket) == 0 {
 			pt.pinningTicket = nil
 		}

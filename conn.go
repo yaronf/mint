@@ -70,7 +70,7 @@ type Config struct {
 	PinningEnabled        bool
 	PinningDB             string
 	PinningTicketLifetime int
-	PinningRampdown	      bool
+	PinningRampdown       bool
 
 	// Hidden fields (used for caching in convenient form)
 	enabledSuite map[cipherSuite]bool
@@ -542,7 +542,7 @@ func (c *Conn) clientHandshake() error {
 	}
 
 	var pt *pinningTicketExtension
-	var sendPinning bool // sent extension
+	var sendPinning bool       // sent extension
 	var sendPinningTicket bool // sent a ticket for that server
 	var origin string
 
