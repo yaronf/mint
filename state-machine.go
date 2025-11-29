@@ -65,6 +65,13 @@ type ConnectionParameters struct {
 	CipherSuite CipherSuite
 	ServerName  string
 	NextProto   string
+
+	// Attestation negotiation results
+	ServerCanRequestEvidence bool // Server can request evidence from client
+	ServerRequestedEvidence  bool // Server requested evidence from client
+	ClientRequestedEvidence  bool // Client requested evidence from server
+	SelectedEvidenceType     EvidenceType
+	UsingAttestation         bool
 }
 
 // Working state for the handshake.

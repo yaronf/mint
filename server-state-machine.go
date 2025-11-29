@@ -122,6 +122,8 @@ func (state serverStateStart) Next(hr handshakeMessageReader) (HandshakeState, [
 	clientALPN := new(ALPNExtension)
 	clientPSKModes := new(PSKKeyExchangeModesExtension)
 	clientCookie := new(CookieExtension)
+	clientEvidenceProposal := &EvidenceProposalExtension{HandshakeType: HandshakeTypeClientHello}
+	clientEvidenceRequest := &EvidenceRequestExtension{HandshakeType: HandshakeTypeClientHello}
 
 	// Handle external extensions.
 	if state.Config.ExtensionHandler != nil {
@@ -144,6 +146,8 @@ func (state serverStateStart) Next(hr handshakeMessageReader) (HandshakeState, [
 			clientALPN,
 			clientPSKModes,
 			clientCookie,
+			clientEvidenceProposal,
+			clientEvidenceRequest,
 		})
 
 	if err != nil {
@@ -155,6 +159,50 @@ func (state serverStateStart) Next(hr handshakeMessageReader) (HandshakeState, [
 
 	if foundExts[ExtensionTypeServerName] {
 		connParams.ServerName = string(*serverName)
+	}
+
+	// Process attestation extensions
+	if state.Config.EnableAttestation {
+		// Check for evidence_proposal (client can provide evidence)
+		if foundExts[ExtensionTypeEvidenceProposal] {
+			// Find common evidence type (ContentFormat = 0)
+			hasCommonType := false
+			for _, et := range clientEvidenceProposal.SupportedTypes {
+				if et.TypeEncoding == EvidenceTypeEncodingContentFormat && et.ContentFormat == 0 {
+					hasCommonType = true
+					connParams.SelectedEvidenceType = et
+					break
+				}
+			}
+			if hasCommonType {
+				connParams.ServerCanRequestEvidence = true
+			} else {
+				// Server supports attestation but not this evidence type
+				logf(logTypeHandshake, "[ServerStateStart] No common evidence type found")
+				return nil, nil, AlertUnsupportedEvidence
+			}
+		}
+
+		// Check for evidence_request (client wants server evidence)
+		if foundExts[ExtensionTypeEvidenceRequest] {
+			// Check if server can provide requested type
+			hasCommonType := false
+			for _, et := range clientEvidenceRequest.SupportedTypes {
+				if et.TypeEncoding == EvidenceTypeEncodingContentFormat && et.ContentFormat == 0 {
+					hasCommonType = true
+					connParams.SelectedEvidenceType = et
+					break
+				}
+			}
+			if hasCommonType {
+				connParams.ClientRequestedEvidence = true
+				connParams.UsingAttestation = true
+			}
+			// If server can't provide, just continue (client policy decision)
+		}
+	} else {
+		// Server doesn't support attestation - ignore extensions, continue normally
+		logf(logTypeHandshake, "[ServerStateStart] Attestation not enabled, ignoring extensions")
 	}
 
 	// If the client didn't send supportedVersions or doesn't support 1.3,
@@ -570,6 +618,13 @@ func (state serverStateNegotiated) Next(_ handshakeMessageReader) (HandshakeStat
 	logf(logTypeCrypto, "server handshake traffic secret: [%d] %x", len(serverHandshakeTrafficSecret), serverHandshakeTrafficSecret)
 	logf(logTypeCrypto, "master secret: [%d] %x", len(masterSecret), masterSecret)
 
+	// Derive attestation main secret only if attestation was negotiated
+	var serverAttestationMainSecret []byte
+	if state.Params.UsingAttestation || state.Params.ServerCanRequestEvidence {
+		serverAttestationMainSecret = DeriveAttestationMainSecret(params, masterSecret, h2, false)
+		logf(logTypeCrypto, "server attestation main secret: [%d] %x", len(serverAttestationMainSecret), serverAttestationMainSecret)
+	}
+
 	clientHandshakeKeys := makeTrafficKeys(params, clientHandshakeTrafficSecret)
 	serverHandshakeKeys := makeTrafficKeys(params, serverHandshakeTrafficSecret)
 
@@ -591,6 +646,32 @@ func (state serverStateNegotiated) Next(_ handshakeMessageReader) (HandshakeStat
 			return nil, nil, AlertInternalError
 		}
 	}
+
+	// Add attestation extensions if negotiated
+	if state.Params.ServerCanRequestEvidence && state.Config.RequestClientAttestation {
+		evidenceProposal := &EvidenceProposalExtension{
+			HandshakeType: HandshakeTypeEncryptedExtensions,
+			SelectedType:  state.Params.SelectedEvidenceType,
+		}
+		err = eeList.Add(evidenceProposal)
+		if err != nil {
+			logf(logTypeHandshake, "[ServerStateNegotiated] Error adding evidence_proposal to EncryptedExtensions [%v]", err)
+			return nil, nil, AlertInternalError
+		}
+	}
+
+	if state.Params.ClientRequestedEvidence {
+		evidenceRequest := &EvidenceRequestExtension{
+			HandshakeType: HandshakeTypeEncryptedExtensions,
+			SelectedType:  state.Params.SelectedEvidenceType,
+		}
+		err = eeList.Add(evidenceRequest)
+		if err != nil {
+			logf(logTypeHandshake, "[ServerStateNegotiated] Error adding evidence_request to EncryptedExtensions [%v]", err)
+			return nil, nil, AlertInternalError
+		}
+	}
+
 	ee := &EncryptedExtensionsBody{eeList}
 
 	// Run the external extension handler.
@@ -614,6 +695,57 @@ func (state serverStateNegotiated) Next(_ handshakeMessageReader) (HandshakeStat
 		QueueHandshakeMessage{serverHello},
 		RekeyOut{epoch: EpochHandshakeData, KeySet: serverHandshakeKeys},
 		QueueHandshakeMessage{eem},
+	}
+
+	// Send Attestation message if client requested evidence
+	if state.Params.ClientRequestedEvidence {
+		// Get public key from certificate and marshal to DER
+		publicKeyDER, err := MarshalPublicKeyToDER(state.cert.PrivateKey.Public())
+		if err != nil {
+			logf(logTypeHandshake, "[ServerStateNegotiated] Error marshaling public key to DER: %v", err)
+			return nil, nil, AlertInternalError
+		}
+
+		// Use pre-derived attestation main secret (derived earlier in this function)
+		if len(serverAttestationMainSecret) == 0 {
+			logf(logTypeHandshake, "[ServerStateNegotiated] Missing server attestation main secret")
+			return nil, nil, AlertInternalError
+		}
+		attestationMainSecret := serverAttestationMainSecret
+
+		// Derive attestation secret (nonce)
+		attestationSecret := DeriveAttestationSecret(
+			params,
+			attestationMainSecret,
+			publicKeyDER,
+		)
+
+		// Create CMW
+		cmw := CMWPayload{
+			AttestationSecret: attestationSecret,
+			PublicKeyDER:      publicKeyDER,
+			EvidenceType:      0, // ContentFormat = 0
+		}
+
+		// Encode to CBOR and log
+		cmwBytes, err := EncodeCMWToCBOR(cmw)
+		if err != nil {
+			logf(logTypeHandshake, "[ServerStateNegotiated] Error encoding CMW: %v", err)
+			return nil, nil, AlertInternalError
+		}
+
+		LogCMWAsJSON(cmw, "[Server] Sending CMW")
+
+		attestation := &AttestationBody{
+			CMWPayload: cmwBytes,
+		}
+		attm, err := state.hsCtx.hOut.HandshakeMessageFromBody(attestation)
+		if err != nil {
+			logf(logTypeHandshake, "[ServerStateNegotiated] Error marshaling Attestation: %v", err)
+			return nil, nil, AlertInternalError
+		}
+		toSend = append(toSend, QueueHandshakeMessage{attm})
+		handshakeHash.Write(attm.Marshal())
 	}
 
 	// Authenticate with a certificate if required
@@ -974,6 +1106,35 @@ func (state serverStateWaitCert) Next(hr handshakeMessageReader) (HandshakeState
 	}
 
 	state.handshakeHash.Write(hm.Marshal())
+
+	// If server requested evidence, read Attestation message after Certificate
+	if state.Params.ServerRequestedEvidence {
+		attHm, alert := hr.ReadMessage()
+		if alert != AlertNoAlert {
+			return nil, nil, alert
+		}
+		if attHm == nil || attHm.msgType != HandshakeTypeAttestation {
+			logf(logTypeHandshake, "[ServerStateWaitCert] Expected Attestation message after Certificate")
+			return nil, nil, AlertUnexpectedMessage
+		}
+
+		att := &AttestationBody{}
+		if err := safeUnmarshal(att, attHm.body); err != nil {
+			logf(logTypeHandshake, "[ServerStateWaitCert] Error decoding Attestation message: %v", err)
+			return nil, nil, AlertDecodeError
+		}
+
+		// Decode and log CMW (structured JSON)
+		cmw, err := DecodeCMWFromCBOR(att.CMWPayload)
+		if err != nil {
+			logf(logTypeHandshake, "[Server] Failed to decode CMW: %v", err)
+			return nil, nil, AlertDecodeError
+		}
+		LogCMWAsJSON(cmw, "[Server] Received CMW")
+
+		// Accept mock evidence (no validation)
+		state.handshakeHash.Write(attHm.Marshal())
+	}
 
 	if len(cert.CertificateList) == 0 {
 		logf(logTypeHandshake, "[ServerStateWaitCert] WARNING client did not provide a certificate")

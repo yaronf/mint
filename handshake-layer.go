@@ -12,22 +12,21 @@ const (
 	maxHandshakeMessageLen = 1 << 24 // max handshake message length
 )
 
-// struct {
-//     HandshakeType msg_type;    /* handshake type */
-//     uint24 length;             /* bytes in message */
-//     select (HandshakeType) {
-//       ...
-//     } body;
-// } Handshake;
+//	struct {
+//	    HandshakeType msg_type;    /* handshake type */
+//	    uint24 length;             /* bytes in message */
+//	    select (HandshakeType) {
+//	      ...
+//	    } body;
+//	} Handshake;
 //
 // We do the select{...} part in a different layer, so we treat the
 // actual message body as opaque:
 //
-// struct {
-//     HandshakeType msg_type;
-//     opaque msg<0..2^24-1>
-// } Handshake;
-//
+//	struct {
+//	    HandshakeType msg_type;
+//	    opaque msg<0..2^24-1>
+//	} Handshake;
 type HandshakeMessage struct {
 	msgType  HandshakeType
 	seq      uint32
@@ -92,6 +91,8 @@ func (hm HandshakeMessage) ToBody() (HandshakeMessageBody, error) {
 		body = new(KeyUpdateBody)
 	case HandshakeTypeEndOfEarlyData:
 		body = new(EndOfEarlyDataBody)
+	case HandshakeTypeAttestation:
+		body = new(AttestationBody)
 	default:
 		return body, fmt.Errorf("tls.handshakemessage: Unsupported body type")
 	}

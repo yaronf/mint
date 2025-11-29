@@ -46,6 +46,7 @@ const (
 	AlertBadCertificateHashValue     Alert = 114
 	AlertUnknownPSKIdentity          Alert = 115
 	AlertNoApplicationProtocol       Alert = 120
+	AlertUnsupportedEvidence         Alert = AlertUnsupportedEvidenceValue
 	AlertStatelessRetry              Alert = 253
 	AlertWouldBlock                  Alert = 254
 	AlertNoAlert                     Alert = 255
@@ -82,6 +83,7 @@ var alertText = map[Alert]string{
 	AlertBadCertificateHashValue:     "bad certificate hash value",
 	AlertUnknownPSKIdentity:          "unknown PSK identity",
 	AlertNoApplicationProtocol:       "no application protocol",
+	AlertUnsupportedEvidence:         "unsupported evidence",
 	AlertNoRenegotiation:             "no renegotiation",
 	AlertStatelessRetry:              "stateless retry",
 	AlertWouldBlock:                  "would have blocked",

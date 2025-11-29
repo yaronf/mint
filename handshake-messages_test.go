@@ -666,7 +666,7 @@ func TestEndOfEarlyDataMarshalUnmarshal(t *testing.T) {
 	assertDeepEquals(t, eoed, endOfEarlyDataValidIn)
 }
 
-func TestsafeUnmarshal(t *testing.T) {
+func TestSafeUnmarshal(t *testing.T) {
 	chValid := unhex(chValidHex)
 	tooLong := append(chValid, 0)
 	var ch ClientHelloBody

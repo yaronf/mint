@@ -16,14 +16,14 @@ type HandshakeMessageBody interface {
 	Unmarshal(data []byte) (int, error)
 }
 
-// struct {
-//     ProtocolVersion legacy_version = 0x0303; /* TLS v1.2 */
-//     Random random;
-//     opaque legacy_session_id<0..32>;
-//     CipherSuite cipher_suites<2..2^16-2>;
-//     opaque legacy_compression_methods<1..2^8-1>;
-//     Extension extensions<0..2^16-1>;
-// } ClientHello;
+//	struct {
+//	    ProtocolVersion legacy_version = 0x0303; /* TLS v1.2 */
+//	    Random random;
+//	    opaque legacy_session_id<0..32>;
+//	    CipherSuite cipher_suites<2..2^16-2>;
+//	    opaque legacy_compression_methods<1..2^8-1>;
+//	    Extension extensions<0..2^16-1>;
+//	} ClientHello;
 type ClientHelloBody struct {
 	LegacyVersion   uint16
 	Random          [32]byte
@@ -165,14 +165,14 @@ func (ch ClientHelloBody) Truncated() ([]byte, error) {
 	return chData[:chLen-binderLen], nil
 }
 
-// struct {
-//     ProtocolVersion legacy_version = 0x0303;    /* TLS v1.2 */
-//     Random random;
-//     opaque legacy_session_id_echo<0..32>;
-//     CipherSuite cipher_suite;
-//     uint8 legacy_compression_method = 0;
-//     Extension extensions<6..2^16-1>;
-// } ServerHello;
+//	struct {
+//	    ProtocolVersion legacy_version = 0x0303;    /* TLS v1.2 */
+//	    Random random;
+//	    opaque legacy_session_id_echo<0..32>;
+//	    CipherSuite cipher_suite;
+//	    uint8 legacy_compression_method = 0;
+//	    Extension extensions<6..2^16-1>;
+//	} ServerHello;
 type ServerHelloBody struct {
 	Version                 uint16
 	Random                  [32]byte
@@ -194,9 +194,9 @@ func (sh *ServerHelloBody) Unmarshal(data []byte) (int, error) {
 	return syntax.Unmarshal(data, sh)
 }
 
-// struct {
-//     opaque verify_data[verify_data_length];
-// } Finished;
+//	struct {
+//	    opaque verify_data[verify_data_length];
+//	} Finished;
 //
 // verifyDataLen is not a field in the TLS struct, but we add it here so
 // that calling code can tell us how much data to expect when we marshal /
@@ -236,9 +236,9 @@ func (fin *FinishedBody) Unmarshal(data []byte) (int, error) {
 	return fin.VerifyDataLen, nil
 }
 
-// struct {
-//     Extension extensions<0..2^16-1>;
-// } EncryptedExtensions;
+//	struct {
+//	    Extension extensions<0..2^16-1>;
+//	} EncryptedExtensions;
 //
 // Marshal() and Unmarshal() are handled by ExtensionList
 type EncryptedExtensionsBody struct {
@@ -259,15 +259,15 @@ func (ee *EncryptedExtensionsBody) Unmarshal(data []byte) (int, error) {
 
 // opaque ASN1Cert<1..2^24-1>;
 //
-// struct {
-//     ASN1Cert cert_data;
-//     Extension extensions<0..2^16-1>
-// } CertificateEntry;
+//	struct {
+//	    ASN1Cert cert_data;
+//	    Extension extensions<0..2^16-1>
+//	} CertificateEntry;
 //
-// struct {
-//     opaque certificate_request_context<0..2^8-1>;
-//     CertificateEntry certificate_list<0..2^24-1>;
-// } Certificate;
+//	struct {
+//	    opaque certificate_request_context<0..2^8-1>;
+//	    CertificateEntry certificate_list<0..2^24-1>;
+//	} Certificate;
 type CertificateEntry struct {
 	CertData   *x509.Certificate
 	Extensions ExtensionList
@@ -330,10 +330,10 @@ func (c *CertificateBody) Unmarshal(data []byte) (int, error) {
 	return read, nil
 }
 
-// struct {
-//     SignatureScheme algorithm;
-//     opaque signature<0..2^16-1>;
-// } CertificateVerify;
+//	struct {
+//	    SignatureScheme algorithm;
+//	    opaque signature<0..2^16-1>;
+//	} CertificateVerify;
 type CertificateVerifyBody struct {
 	Algorithm SignatureScheme
 	Signature []byte `tls:"head=2"`
@@ -375,10 +375,10 @@ func (cv *CertificateVerifyBody) Verify(publicKey crypto.PublicKey, handshakeHas
 	return verify(cv.Algorithm, publicKey, sigInput, cv.Signature)
 }
 
-// struct {
-//     opaque certificate_request_context<0..2^8-1>;
-//     Extension extensions<2..2^16-1>;
-// } CertificateRequest;
+//	struct {
+//	    opaque certificate_request_context<0..2^8-1>;
+//	    Extension extensions<2..2^16-1>;
+//	} CertificateRequest;
 type CertificateRequestBody struct {
 	CertificateRequestContext []byte        `tls:"head=1"`
 	Extensions                ExtensionList `tls:"head=2"`
@@ -396,13 +396,13 @@ func (cr *CertificateRequestBody) Unmarshal(data []byte) (int, error) {
 	return syntax.Unmarshal(data, cr)
 }
 
-// struct {
-//     uint32 ticket_lifetime;
-//     uint32 ticket_age_add;
-//		 opaque ticket_nonce<1..255>;
-//     opaque ticket<1..2^16-1>;
-//     Extension extensions<0..2^16-2>;
-// } NewSessionTicket;
+//	struct {
+//	    uint32 ticket_lifetime;
+//	    uint32 ticket_age_add;
+//			 opaque ticket_nonce<1..255>;
+//	    opaque ticket<1..2^16-1>;
+//	    Extension extensions<0..2^16-2>;
+//	} NewSessionTicket;
 type NewSessionTicketBody struct {
 	TicketLifetime uint32
 	TicketAgeAdd   uint32
@@ -442,13 +442,13 @@ func (tkt *NewSessionTicketBody) Unmarshal(data []byte) (int, error) {
 	return syntax.Unmarshal(data, tkt)
 }
 
-// enum {
-//     update_not_requested(0), update_requested(1), (255)
-// } KeyUpdateRequest;
+//	enum {
+//	    update_not_requested(0), update_requested(1), (255)
+//	} KeyUpdateRequest;
 //
-// struct {
-//     KeyUpdateRequest request_update;
-// } KeyUpdate;
+//	struct {
+//	    KeyUpdateRequest request_update;
+//	} KeyUpdate;
 type KeyUpdateBody struct {
 	KeyUpdateRequest KeyUpdateRequest
 }
@@ -478,4 +478,23 @@ func (eoed EndOfEarlyDataBody) Marshal() ([]byte, error) {
 
 func (eoed *EndOfEarlyDataBody) Unmarshal(data []byte) (int, error) {
 	return 0, nil
+}
+
+//	struct {
+//	    opaque cmw_payload<1..2^24-1>;
+//	} Attestation;
+type AttestationBody struct {
+	CMWPayload []byte `tls:"head=3,min=1"`
+}
+
+func (a AttestationBody) Type() HandshakeType {
+	return HandshakeTypeAttestation
+}
+
+func (a AttestationBody) Marshal() ([]byte, error) {
+	return syntax.Marshal(a)
+}
+
+func (a *AttestationBody) Unmarshal(data []byte) (int, error) {
+	return syntax.Unmarshal(data, a)
 }

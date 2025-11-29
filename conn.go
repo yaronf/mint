@@ -131,6 +131,16 @@ type Config struct {
 
 	RecordLayer RecordLayerFactory
 
+	// Attestation support
+	EnableAttestation bool
+	// Request attestation from peer
+	RequestClientAttestation bool // Server: request evidence from client
+	RequestServerAttestation bool // Client: request evidence from server
+	// Client policy: require attestation from server
+	RequireServerAttestation bool // If true, abort handshake if server doesn't provide evidence
+	// Evidence types supported (for future use)
+	SupportedEvidenceTypes []EvidenceType
+
 	// The same config object can be shared among different connections, so it
 	// needs its own mutex
 	mutex sync.RWMutex
@@ -169,6 +179,12 @@ func (c *Config) Clone() *Config {
 		PSKModes:              c.PSKModes,
 		NonBlocking:           c.NonBlocking,
 		UseDTLS:               c.UseDTLS,
+
+		EnableAttestation:        c.EnableAttestation,
+		RequestClientAttestation: c.RequestClientAttestation,
+		RequestServerAttestation: c.RequestServerAttestation,
+		RequireServerAttestation: c.RequireServerAttestation,
+		SupportedEvidenceTypes:   c.SupportedEvidenceTypes,
 	}
 }
 
@@ -777,6 +793,7 @@ func (c *Conn) Handshake() Alert {
 		}
 		if alert != AlertNoAlert && alert != AlertStatelessRetry {
 			logf(logTypeHandshake, "Error in state transition: %v", alert)
+			c.sendAlert(alert)
 			return alert
 		}
 
