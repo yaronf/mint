@@ -18,6 +18,19 @@ type Certificate struct {
 	PrivateKey crypto.Signer
 }
 
+// AttestationConfig holds attestation-related configuration
+type AttestationConfig struct {
+	Enabled  bool
+	Provider interface {
+		GenerateEvidence(attestationMainSecret []byte, publicKeyDER []byte, evidenceType EvidenceType) ([]byte, error)
+		VerifyEvidence(evidence []byte, attestationMainSecret []byte, publicKeyDER []byte, evidenceType EvidenceType) error
+	}
+	RequestClient          bool // Server: request evidence from client
+	RequestServer          bool // Client: request evidence from server
+	RequireServer          bool // Client: abort handshake if server doesn't provide evidence
+	SupportedEvidenceTypes []EvidenceType
+}
+
 type PreSharedKey struct {
 	CipherSuite  CipherSuite
 	IsResumption bool
@@ -132,14 +145,7 @@ type Config struct {
 	RecordLayer RecordLayerFactory
 
 	// Attestation support
-	EnableAttestation bool
-	// Request attestation from peer
-	RequestClientAttestation bool // Server: request evidence from client
-	RequestServerAttestation bool // Client: request evidence from server
-	// Client policy: require attestation from server
-	RequireServerAttestation bool // If true, abort handshake if server doesn't provide evidence
-	// Evidence types supported (for future use)
-	SupportedEvidenceTypes []EvidenceType
+	Attestation AttestationConfig
 
 	// The same config object can be shared among different connections, so it
 	// needs its own mutex
@@ -180,11 +186,7 @@ func (c *Config) Clone() *Config {
 		NonBlocking:           c.NonBlocking,
 		UseDTLS:               c.UseDTLS,
 
-		EnableAttestation:        c.EnableAttestation,
-		RequestClientAttestation: c.RequestClientAttestation,
-		RequestServerAttestation: c.RequestServerAttestation,
-		RequireServerAttestation: c.RequireServerAttestation,
-		SupportedEvidenceTypes:   c.SupportedEvidenceTypes,
+		Attestation: c.Attestation,
 	}
 }
 
@@ -793,6 +795,10 @@ func (c *Conn) Handshake() Alert {
 		}
 		if alert != AlertNoAlert && alert != AlertStatelessRetry {
 			logf(logTypeHandshake, "Error in state transition: %v", alert)
+			// Send alert to peer per RFC 8446 Section 6.1 (fatal alerts must be sent before closing).
+			// This ensures the peer is notified of handshake failures and prevents hangs.
+			// Consistent with existing patterns (lines 791, 804, 828) and safe: sendAlert()
+			// acquires handshakeMutex internally, and there's no lock ordering issue with c.out.Mutex.
 			c.sendAlert(alert)
 			return alert
 		}

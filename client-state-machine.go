@@ -146,7 +146,7 @@ func (state clientStateStart) Next(hr handshakeMessageReader) (HandshakeState, [
 	}
 
 	// Add attestation extensions if enabled
-	if state.Config.EnableAttestation {
+	if state.Config.Attestation.Enabled {
 		// Add evidence_proposal with ContentFormat = 0
 		evidenceProposal := &EvidenceProposalExtension{
 			HandshakeType: HandshakeTypeClientHello,
@@ -161,7 +161,7 @@ func (state clientStateStart) Next(hr handshakeMessageReader) (HandshakeState, [
 		}
 
 		// Optionally add evidence_request if client wants server attestation
-		if state.Config.RequestServerAttestation {
+		if state.Config.Attestation.RequestServer {
 			evidenceRequest := &EvidenceRequestExtension{
 				HandshakeType: HandshakeTypeClientHello,
 				SupportedTypes: []EvidenceType{
@@ -557,7 +557,7 @@ func (state clientStateWaitSH) Next(hr handshakeMessageReader) (HandshakeState, 
 	// but we sent attestation extensions in ClientHello if EnableAttestation is true.
 	// We'll derive it optimistically here and use it only if negotiation succeeds.
 	var clientAttestationMainSecret []byte
-	if state.Config.EnableAttestation {
+	if state.Config.Attestation.Enabled {
 		clientAttestationMainSecret = DeriveAttestationMainSecret(params, masterSecret, h2, true)
 		logf(logTypeCrypto, "client attestation main secret: [%d] %x", len(clientAttestationMainSecret), clientAttestationMainSecret)
 	}
@@ -598,6 +598,8 @@ type clientStateWaitEE struct {
 	clientHandshakeTrafficSecret []byte
 	serverHandshakeTrafficSecret []byte
 	clientAttestationMainSecret  []byte // c_attestation_main (only passed through, not used here)
+	serverAttestationMainSecret  []byte // s_attestation_main (derived when server provides evidence)
+	serverAttestationEvidence    []byte // Server attestation evidence (to be verified after certificate is received)
 }
 
 var _ HandshakeState = &clientStateWaitEE{}
@@ -672,15 +674,23 @@ func (state clientStateWaitEE) Next(hr handshakeMessageReader) (HandshakeState, 
 	}
 
 	// Client policy check: require server attestation
-	if state.Config.RequireServerAttestation && !foundExts[ExtensionTypeEvidenceRequest] {
+	if state.Config.Attestation.RequireServer && !foundExts[ExtensionTypeEvidenceRequest] {
 		logf(logTypeHandshake, "[Client] RequireServerAttestation is true but server did not provide evidence_request")
 		return nil, nil, AlertHandshakeFailure
 	}
 
+	// Compute h2 (transcript hash up to ServerHello) before writing EncryptedExtensions
+	// This is needed to derive server attestation main secret if server provides evidence
+	h2 := state.handshakeHash.Sum(nil)
+
 	state.handshakeHash.Write(hm.Marshal())
 
-	// If server is providing evidence, read Attestation message after EncryptedExtensions
+	// If server is providing evidence, derive server attestation main secret and read Attestation message
 	if state.Params.ClientRequestedEvidence {
+		// Derive server attestation main secret using h2 (transcript hash up to ServerHello)
+		state.serverAttestationMainSecret = DeriveAttestationMainSecret(state.cryptoParams, state.masterSecret, h2, false)
+		logf(logTypeCrypto, "server attestation main secret: [%d] %x", len(state.serverAttestationMainSecret), state.serverAttestationMainSecret)
+
 		attHm, alert := hr.ReadMessage()
 		if alert != AlertNoAlert {
 			return nil, nil, alert
@@ -696,15 +706,10 @@ func (state clientStateWaitEE) Next(hr handshakeMessageReader) (HandshakeState, 
 			return nil, nil, AlertDecodeError
 		}
 
-		// Decode and log CMW (structured JSON)
-		cmw, err := DecodeCMWFromCBOR(att.CMWPayload)
-		if err != nil {
-			logf(logTypeHandshake, "[Client] Failed to decode CMW: %v", err)
-			return nil, nil, AlertDecodeError
-		}
-		LogCMWAsJSON(cmw, "[Client] Received CMW")
+		// Store attestation evidence for verification after server certificate is received
+		// We can't verify yet because we need the server's public key from the Certificate message
+		state.serverAttestationEvidence = att.CMWPayload
 
-		// Accept mock evidence (no validation)
 		state.handshakeHash.Write(attHm.Marshal())
 	}
 
@@ -719,6 +724,7 @@ func (state clientStateWaitEE) Next(hr handshakeMessageReader) (HandshakeState, 
 	if state.Params.UsingPSK {
 		logf(logTypeHandshake, "[ClientStateWaitEE] -> [ClientStateWaitFinished]")
 		nextState := clientStateWaitFinished{
+			Config:                       state.Config,
 			Params:                       state.Params,
 			hsCtx:                        state.hsCtx,
 			cryptoParams:                 state.cryptoParams,
@@ -743,6 +749,8 @@ func (state clientStateWaitEE) Next(hr handshakeMessageReader) (HandshakeState, 
 		clientHandshakeTrafficSecret: state.clientHandshakeTrafficSecret,
 		serverHandshakeTrafficSecret: state.serverHandshakeTrafficSecret,
 		clientAttestationMainSecret:  state.clientAttestationMainSecret,
+		serverAttestationMainSecret:  state.serverAttestationMainSecret,
+		serverAttestationEvidence:    state.serverAttestationEvidence,
 	}
 	return nextState, toSend, AlertNoAlert
 }
@@ -757,6 +765,8 @@ type clientStateWaitCertCR struct {
 	clientHandshakeTrafficSecret []byte
 	serverHandshakeTrafficSecret []byte
 	clientAttestationMainSecret  []byte // c_attestation_main (only passed through, not used here)
+	serverAttestationMainSecret  []byte // s_attestation_main (for server attestation verification)
+	serverAttestationEvidence    []byte // Server attestation evidence (to be verified after certificate is received)
 }
 
 var _ HandshakeState = &clientStateWaitCertCR{}
@@ -797,6 +807,8 @@ func (state clientStateWaitCertCR) Next(hr handshakeMessageReader) (HandshakeSta
 			clientHandshakeTrafficSecret: state.clientHandshakeTrafficSecret,
 			serverHandshakeTrafficSecret: state.serverHandshakeTrafficSecret,
 			clientAttestationMainSecret:  state.clientAttestationMainSecret,
+			serverAttestationMainSecret:  state.serverAttestationMainSecret,
+			serverAttestationEvidence:    state.serverAttestationEvidence,
 		}
 		return nextState, nil, AlertNoAlert
 
@@ -821,6 +833,8 @@ func (state clientStateWaitCertCR) Next(hr handshakeMessageReader) (HandshakeSta
 			clientHandshakeTrafficSecret: state.clientHandshakeTrafficSecret,
 			serverHandshakeTrafficSecret: state.serverHandshakeTrafficSecret,
 			clientAttestationMainSecret:  state.clientAttestationMainSecret,
+			serverAttestationMainSecret:  state.serverAttestationMainSecret,
+			serverAttestationEvidence:    state.serverAttestationEvidence,
 		}
 		return nextState, nil, AlertNoAlert
 	}
@@ -841,6 +855,8 @@ type clientStateWaitCert struct {
 	clientHandshakeTrafficSecret []byte
 	serverHandshakeTrafficSecret []byte
 	clientAttestationMainSecret  []byte // c_attestation_main (only passed through, not used here)
+	serverAttestationMainSecret  []byte // s_attestation_main (for server attestation verification)
+	serverAttestationEvidence    []byte // Server attestation evidence (to be verified after certificate is received)
 }
 
 var _ HandshakeState = &clientStateWaitCert{}
@@ -880,6 +896,8 @@ func (state clientStateWaitCert) Next(hr handshakeMessageReader) (HandshakeState
 		clientHandshakeTrafficSecret: state.clientHandshakeTrafficSecret,
 		serverHandshakeTrafficSecret: state.serverHandshakeTrafficSecret,
 		clientAttestationMainSecret:  state.clientAttestationMainSecret,
+		serverAttestationMainSecret:  state.serverAttestationMainSecret,
+		serverAttestationEvidence:    state.serverAttestationEvidence,
 	}
 	return nextState, nil, AlertNoAlert
 }
@@ -898,6 +916,8 @@ type clientStateWaitCV struct {
 	clientHandshakeTrafficSecret []byte
 	serverHandshakeTrafficSecret []byte
 	clientAttestationMainSecret  []byte // c_attestation_main (only passed through, not used here)
+	serverAttestationMainSecret  []byte // s_attestation_main (for server attestation verification)
+	serverAttestationEvidence    []byte // Server attestation evidence (to be verified after certificate is received)
 }
 
 var _ HandshakeState = &clientStateWaitCV{}
@@ -968,10 +988,46 @@ func (state clientStateWaitCV) Next(hr handshakeMessageReader) (HandshakeState, 
 		}
 	}
 
+	// Verify server attestation evidence if it was received
+	if len(state.serverAttestationEvidence) > 0 {
+		if state.Config.Attestation.Provider == nil {
+			logf(logTypeHandshake, "[ClientStateWaitCV] AttestationProvider is nil but attestation evidence was received")
+			return nil, nil, AlertInternalError
+		}
+
+		// Get server public key from certificate
+		serverPublicKey := state.serverCertificate.CertificateList[0].CertData.PublicKey
+		publicKeyDER, err := MarshalPublicKeyToDER(serverPublicKey)
+		if err != nil {
+			logf(logTypeHandshake, "[ClientStateWaitCV] Error marshaling server public key to DER: %v", err)
+			return nil, nil, AlertInternalError
+		}
+
+		// Use pre-derived server attestation main secret
+		if len(state.serverAttestationMainSecret) == 0 {
+			logf(logTypeHandshake, "[ClientStateWaitCV] Missing server attestation main secret for verification")
+			return nil, nil, AlertInternalError
+		}
+
+		// Verify evidence
+		err = state.Config.Attestation.Provider.VerifyEvidence(
+			state.serverAttestationEvidence,
+			state.serverAttestationMainSecret,
+			publicKeyDER,
+			state.Params.SelectedEvidenceType,
+		)
+		if err != nil {
+			logf(logTypeHandshake, "[ClientStateWaitCV] Server attestation verification failed: %v", err)
+			return nil, nil, AlertUnsupportedEvidence
+		}
+		logf(logTypeHandshake, "[ClientStateWaitCV] Server attestation verified successfully")
+	}
+
 	state.handshakeHash.Write(hm.Marshal())
 
 	logf(logTypeHandshake, "[ClientStateWaitCV] -> [ClientStateWaitFinished]")
 	nextState := clientStateWaitFinished{
+		Config:                       state.Config,
 		Params:                       state.Params,
 		hsCtx:                        state.hsCtx,
 		cryptoParams:                 state.cryptoParams,
@@ -989,6 +1045,7 @@ func (state clientStateWaitCV) Next(hr handshakeMessageReader) (HandshakeState, 
 }
 
 type clientStateWaitFinished struct {
+	Config        *Config
 	Params        ConnectionParameters
 	hsCtx         *HandshakeContext
 	cryptoParams  CipherSuiteParams
@@ -1144,32 +1201,19 @@ func (state clientStateWaitFinished) Next(hr handshakeMessageReader) (HandshakeS
 					return nil, nil, AlertInternalError
 				}
 
-				// Derive attestation secret (nonce)
-				attestationSecret := DeriveAttestationSecret(
-					state.cryptoParams,
+				// Generate evidence using attestation provider
+				evidenceBytes, err := state.Config.Attestation.Provider.GenerateEvidence(
 					attestationMainSecret,
 					publicKeyDER,
+					state.Params.SelectedEvidenceType,
 				)
-
-				// Create CMW
-				cmw := CMWPayload{
-					AttestationSecret: attestationSecret,
-					PublicKeyDER:      publicKeyDER,
-					EvidenceType:      0, // ContentFormat = 0
-				}
-
-				// Encode to CBOR
-				cmwBytes, err := EncodeCMWToCBOR(cmw)
 				if err != nil {
-					logf(logTypeHandshake, "[ClientStateWaitFinished] Error encoding CMW: %v", err)
+					logf(logTypeHandshake, "[ClientStateWaitFinished] Error generating evidence: %v", err)
 					return nil, nil, AlertInternalError
 				}
 
-				// Log CMW contents as structured JSON
-				LogCMWAsJSON(cmw, "[Client] Sending CMW")
-
 				attestation := &AttestationBody{
-					CMWPayload: cmwBytes,
+					CMWPayload: evidenceBytes,
 				}
 				attm, err := state.hsCtx.hOut.HandshakeMessageFromBody(attestation)
 				if err != nil {

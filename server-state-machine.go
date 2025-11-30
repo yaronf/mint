@@ -162,7 +162,7 @@ func (state serverStateStart) Next(hr handshakeMessageReader) (HandshakeState, [
 	}
 
 	// Process attestation extensions
-	if state.Config.EnableAttestation {
+	if state.Config.Attestation.Enabled {
 		// Check for evidence_proposal (client can provide evidence)
 		if foundExts[ExtensionTypeEvidenceProposal] {
 			// Find common evidence type (ContentFormat = 0)
@@ -618,11 +618,18 @@ func (state serverStateNegotiated) Next(_ handshakeMessageReader) (HandshakeStat
 	logf(logTypeCrypto, "server handshake traffic secret: [%d] %x", len(serverHandshakeTrafficSecret), serverHandshakeTrafficSecret)
 	logf(logTypeCrypto, "master secret: [%d] %x", len(masterSecret), masterSecret)
 
-	// Derive attestation main secret only if attestation was negotiated
+	// Derive attestation main secrets only if attestation was negotiated
 	var serverAttestationMainSecret []byte
+	var clientAttestationMainSecret []byte
 	if state.Params.UsingAttestation || state.Params.ServerCanRequestEvidence {
+		// Derive server attestation main secret (used when server provides evidence)
 		serverAttestationMainSecret = DeriveAttestationMainSecret(params, masterSecret, h2, false)
 		logf(logTypeCrypto, "server attestation main secret: [%d] %x", len(serverAttestationMainSecret), serverAttestationMainSecret)
+	}
+	if state.Params.ServerCanRequestEvidence && state.Config.Attestation.RequestClient {
+		// Derive client attestation main secret (used when verifying client evidence)
+		clientAttestationMainSecret = DeriveAttestationMainSecret(params, masterSecret, h2, true)
+		logf(logTypeCrypto, "client attestation main secret: [%d] %x", len(clientAttestationMainSecret), clientAttestationMainSecret)
 	}
 
 	clientHandshakeKeys := makeTrafficKeys(params, clientHandshakeTrafficSecret)
@@ -648,7 +655,7 @@ func (state serverStateNegotiated) Next(_ handshakeMessageReader) (HandshakeStat
 	}
 
 	// Add attestation extensions if negotiated
-	if state.Params.ServerCanRequestEvidence && state.Config.RequestClientAttestation {
+	if state.Params.ServerCanRequestEvidence && state.Config.Attestation.RequestClient {
 		evidenceProposal := &EvidenceProposalExtension{
 			HandshakeType: HandshakeTypeEncryptedExtensions,
 			SelectedType:  state.Params.SelectedEvidenceType,
@@ -699,6 +706,11 @@ func (state serverStateNegotiated) Next(_ handshakeMessageReader) (HandshakeStat
 
 	// Send Attestation message if client requested evidence
 	if state.Params.ClientRequestedEvidence {
+		if state.Config.Attestation.Provider == nil {
+			logf(logTypeHandshake, "[ServerStateNegotiated] AttestationProvider is nil but attestation was requested")
+			return nil, nil, AlertInternalError
+		}
+
 		// Get public key from certificate and marshal to DER
 		publicKeyDER, err := MarshalPublicKeyToDER(state.cert.PrivateKey.Public())
 		if err != nil {
@@ -713,31 +725,19 @@ func (state serverStateNegotiated) Next(_ handshakeMessageReader) (HandshakeStat
 		}
 		attestationMainSecret := serverAttestationMainSecret
 
-		// Derive attestation secret (nonce)
-		attestationSecret := DeriveAttestationSecret(
-			params,
+		// Generate evidence using attestation provider
+		evidenceBytes, err := state.Config.Attestation.Provider.GenerateEvidence(
 			attestationMainSecret,
 			publicKeyDER,
+			state.Params.SelectedEvidenceType,
 		)
-
-		// Create CMW
-		cmw := CMWPayload{
-			AttestationSecret: attestationSecret,
-			PublicKeyDER:      publicKeyDER,
-			EvidenceType:      0, // ContentFormat = 0
-		}
-
-		// Encode to CBOR and log
-		cmwBytes, err := EncodeCMWToCBOR(cmw)
 		if err != nil {
-			logf(logTypeHandshake, "[ServerStateNegotiated] Error encoding CMW: %v", err)
+			logf(logTypeHandshake, "[ServerStateNegotiated] Error generating evidence: %v", err)
 			return nil, nil, AlertInternalError
 		}
 
-		LogCMWAsJSON(cmw, "[Server] Sending CMW")
-
 		attestation := &AttestationBody{
-			CMWPayload: cmwBytes,
+			CMWPayload: evidenceBytes,
 		}
 		attm, err := state.hsCtx.hOut.HandshakeMessageFromBody(attestation)
 		if err != nil {
@@ -862,6 +862,7 @@ func (state serverStateNegotiated) Next(_ handshakeMessageReader) (HandshakeStat
 			clientTrafficSecret:          clientTrafficSecret,
 			serverTrafficSecret:          serverTrafficSecret,
 			exporterSecret:               exporterSecret,
+			clientAttestationMainSecret:  clientAttestationMainSecret,
 		}
 		toSend = append(toSend, []HandshakeAction{
 			RekeyIn{epoch: EpochEarlyData, KeySet: clientEarlyTrafficKeys},
@@ -885,6 +886,7 @@ func (state serverStateNegotiated) Next(_ handshakeMessageReader) (HandshakeStat
 		clientTrafficSecret:          clientTrafficSecret,
 		serverTrafficSecret:          serverTrafficSecret,
 		exporterSecret:               exporterSecret,
+		clientAttestationMainSecret:  clientAttestationMainSecret,
 	}
 	if state.Params.RejectedEarlyData {
 		nextState = serverStateReadPastEarlyData{
@@ -906,6 +908,7 @@ type serverStateWaitEOED struct {
 	clientTrafficSecret          []byte
 	serverTrafficSecret          []byte
 	exporterSecret               []byte
+	clientAttestationMainSecret  []byte // c_attestation_main (for client attestation verification)
 }
 
 var _ HandshakeState = &serverStateWaitEOED{}
@@ -980,6 +983,7 @@ func (state serverStateWaitEOED) Next(hr handshakeMessageReader) (HandshakeState
 		clientTrafficSecret:          state.clientTrafficSecret,
 		serverTrafficSecret:          state.serverTrafficSecret,
 		exporterSecret:               state.exporterSecret,
+		clientAttestationMainSecret:  state.clientAttestationMainSecret,
 	}
 	return waitFlight2, toSend, AlertNoAlert
 }
@@ -1029,6 +1033,7 @@ type serverStateWaitFlight2 struct {
 	clientTrafficSecret          []byte
 	serverTrafficSecret          []byte
 	exporterSecret               []byte
+	clientAttestationMainSecret  []byte // c_attestation_main (for client attestation verification)
 }
 
 var _ HandshakeState = &serverStateWaitFlight2{}
@@ -1051,6 +1056,7 @@ func (state serverStateWaitFlight2) Next(_ handshakeMessageReader) (HandshakeSta
 			clientTrafficSecret:          state.clientTrafficSecret,
 			serverTrafficSecret:          state.serverTrafficSecret,
 			exporterSecret:               state.exporterSecret,
+			clientAttestationMainSecret:  state.clientAttestationMainSecret,
 		}
 		return nextState, nil, AlertNoAlert
 	}
@@ -1081,6 +1087,7 @@ type serverStateWaitCert struct {
 	clientTrafficSecret          []byte
 	serverTrafficSecret          []byte
 	exporterSecret               []byte
+	clientAttestationMainSecret  []byte // c_attestation_main (for client attestation verification)
 }
 
 var _ HandshakeState = &serverStateWaitCert{}
@@ -1124,15 +1131,52 @@ func (state serverStateWaitCert) Next(hr handshakeMessageReader) (HandshakeState
 			return nil, nil, AlertDecodeError
 		}
 
-		// Decode and log CMW (structured JSON)
-		cmw, err := DecodeCMWFromCBOR(att.CMWPayload)
-		if err != nil {
-			logf(logTypeHandshake, "[Server] Failed to decode CMW: %v", err)
-			return nil, nil, AlertDecodeError
+		// Verify evidence using attestation provider
+		if state.Config.Attestation.Provider == nil {
+			logf(logTypeHandshake, "[ServerStateWaitCert] AttestationProvider is nil but attestation was received")
+			return nil, nil, AlertInternalError
 		}
-		LogCMWAsJSON(cmw, "[Server] Received CMW")
 
-		// Accept mock evidence (no validation)
+		// Get public key from client certificate for verification
+		// Note: This assumes client certificate is available - may need to adjust based on actual flow
+		var publicKeyDER []byte
+		if len(cert.CertificateList) > 0 {
+			// CertData is already a parsed certificate
+			certEntry := cert.CertificateList[0]
+			if certEntry.CertData == nil {
+				logf(logTypeHandshake, "[ServerStateWaitCert] Client certificate data is nil")
+				return nil, nil, AlertDecodeError
+			}
+			var err error
+			publicKeyDER, err = MarshalPublicKeyToDER(certEntry.CertData.PublicKey)
+			if err != nil {
+				logf(logTypeHandshake, "[ServerStateWaitCert] Error marshaling client public key to DER: %v", err)
+				return nil, nil, AlertInternalError
+			}
+		} else {
+			// If no certificate, we can't verify - this is an error for attestation
+			logf(logTypeHandshake, "[ServerStateWaitCert] No client certificate available for attestation verification")
+			return nil, nil, AlertInternalError
+		}
+
+		// Use pre-derived client attestation main secret
+		if len(state.clientAttestationMainSecret) == 0 {
+			logf(logTypeHandshake, "[ServerStateWaitCert] Missing client attestation main secret for verification")
+			return nil, nil, AlertInternalError
+		}
+
+		// Verify evidence
+		err := state.Config.Attestation.Provider.VerifyEvidence(
+			att.CMWPayload,
+			state.clientAttestationMainSecret,
+			publicKeyDER,
+			state.Params.SelectedEvidenceType,
+		)
+		if err != nil {
+			logf(logTypeHandshake, "[ServerStateWaitCert] Evidence verification failed: %v", err)
+			return nil, nil, AlertUnsupportedEvidence
+		}
+
 		state.handshakeHash.Write(attHm.Marshal())
 	}
 

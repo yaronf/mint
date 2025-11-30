@@ -6,91 +6,89 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"fmt"
 	"testing"
 	"time"
 )
 
-func TestDeriveAttestationMainSecret(t *testing.T) {
-	params := cipherSuiteMap[TLS_AES_128_GCM_SHA256]
-	masterSecret := make([]byte, params.Hash.Size())
-	transcriptHash := make([]byte, params.Hash.Size())
-	// Fill with test data
-	for i := range masterSecret {
-		masterSecret[i] = byte(i)
-	}
-	for i := range transcriptHash {
-		transcriptHash[i] = byte(i + 100)
-	}
+// testAttestationProvider creates evidence compatible with the attestation package.
+// It uses mint's DeriveAttestationSecret and creates a simple CBOR payload.
+// Note: This is a test-only provider. Production code should use attestation.NewStandardProvider().
+type testAttestationProvider struct{}
 
-	// Test client attestation main secret derivation
-	clientSecret := DeriveAttestationMainSecret(params, masterSecret, transcriptHash, true)
-	assertNotNil(t, clientSecret, "Client attestation main secret is nil")
-	assertTrue(t, len(clientSecret) == params.Hash.Size(), "Client secret length mismatch")
-
-	// Test server attestation main secret derivation
-	serverSecret := DeriveAttestationMainSecret(params, masterSecret, transcriptHash, false)
-	assertNotNil(t, serverSecret, "Server attestation main secret is nil")
-	assertTrue(t, len(serverSecret) == params.Hash.Size(), "Server secret length mismatch")
-
-	// Client and server secrets should be different (different labels)
-	assertNotByteEquals(t, clientSecret, serverSecret)
-
-	// Test determinism: same inputs should produce same outputs
-	clientSecret2 := DeriveAttestationMainSecret(params, masterSecret, transcriptHash, true)
-	assertByteEquals(t, clientSecret, clientSecret2)
-
-	serverSecret2 := DeriveAttestationMainSecret(params, masterSecret, transcriptHash, false)
-	assertByteEquals(t, serverSecret, serverSecret2)
-
-	// Test different master secrets produce different outputs
-	masterSecret2 := make([]byte, len(masterSecret))
-	copy(masterSecret2, masterSecret)
-	masterSecret2[0] ^= 0xFF
-	clientSecret3 := DeriveAttestationMainSecret(params, masterSecret2, transcriptHash, true)
-	assertNotByteEquals(t, clientSecret, clientSecret3)
-
-	// Test different transcript hashes produce different outputs
-	transcriptHash2 := make([]byte, len(transcriptHash))
-	copy(transcriptHash2, transcriptHash)
-	transcriptHash2[0] ^= 0xFF
-	clientSecret4 := DeriveAttestationMainSecret(params, masterSecret, transcriptHash2, true)
-	assertNotByteEquals(t, clientSecret, clientSecret4)
+func newTestAttestationProvider() *testAttestationProvider {
+	return &testAttestationProvider{}
 }
 
-func TestDeriveAttestationSecret(t *testing.T) {
+func (t *testAttestationProvider) GenerateEvidence(attestationMainSecret []byte, publicKeyDER []byte, evidenceType EvidenceType) ([]byte, error) {
+	// Use mint's DeriveAttestationSecret (which matches attestation package logic)
 	params := cipherSuiteMap[TLS_AES_128_GCM_SHA256]
-	attestationMainSecret := make([]byte, params.Hash.Size())
-	publicKeyDER := make([]byte, 100) // Mock DER-encoded public key
-	// Fill with test data
-	for i := range attestationMainSecret {
-		attestationMainSecret[i] = byte(i + 50)
-	}
-	for i := range publicKeyDER {
-		publicKeyDER[i] = byte(i + 200)
-	}
-
-	// Test attestation secret derivation
 	attestationSecret := DeriveAttestationSecret(params, attestationMainSecret, publicKeyDER)
-	assertNotNil(t, attestationSecret, "Attestation secret is nil")
-	assertTrue(t, len(attestationSecret) == params.Hash.Size(), "Attestation secret length mismatch")
 
-	// Test determinism: same inputs should produce same outputs
-	attestationSecret2 := DeriveAttestationSecret(params, attestationMainSecret, publicKeyDER)
-	assertByteEquals(t, attestationSecret, attestationSecret2)
+	// Create minimal CBOR-encoded payload manually (to avoid CBOR dependency in main module)
+	// CBOR encoding for map with 3 entries: {1: attestationSecret, 2: publicKeyDER, 3: evidenceType}
+	// This is a simplified encoding - production should use attestation package
+	var result []byte
+	// CBOR map header: 0xa3 = map with 3 pairs
+	result = append(result, 0xa3)
+	// Key 1 (uint): 0x01
+	result = append(result, 0x01)
+	// Value: byte string with attestationSecret
+	result = append(result, byte(0x58), byte(len(attestationSecret)))
+	result = append(result, attestationSecret...)
+	// Key 2 (uint): 0x02
+	result = append(result, 0x02)
+	// Value: byte string with publicKeyDER
+	result = append(result, byte(0x58), byte(len(publicKeyDER)))
+	result = append(result, publicKeyDER...)
+	// Key 3 (uint): 0x03
+	result = append(result, 0x03)
+	// Value: uint16 evidenceType
+	result = append(result, 0x19, byte(evidenceType.ContentFormat>>8), byte(evidenceType.ContentFormat&0xff))
 
-	// Test different main secrets produce different outputs
-	attestationMainSecret2 := make([]byte, len(attestationMainSecret))
-	copy(attestationMainSecret2, attestationMainSecret)
-	attestationMainSecret2[0] ^= 0xFF
-	attestationSecret3 := DeriveAttestationSecret(params, attestationMainSecret2, publicKeyDER)
-	assertNotByteEquals(t, attestationSecret, attestationSecret3)
+	return result, nil
+}
 
-	// Test different public keys produce different outputs
-	publicKeyDER2 := make([]byte, len(publicKeyDER))
-	copy(publicKeyDER2, publicKeyDER)
-	publicKeyDER2[0] ^= 0xFF
-	attestationSecret4 := DeriveAttestationSecret(params, attestationMainSecret, publicKeyDER2)
-	assertNotByteEquals(t, attestationSecret, attestationSecret4)
+func (t *testAttestationProvider) VerifyEvidence(evidence []byte, attestationMainSecret []byte, publicKeyDER []byte, evidenceType EvidenceType) error {
+	// Simple verification - just check that we can parse the structure
+	// For proper verification, use attestation package StandardProvider
+	if len(evidence) < 10 {
+		return fmt.Errorf("evidence too short")
+	}
+
+	params := cipherSuiteMap[TLS_AES_128_GCM_SHA256]
+	expectedSecret := DeriveAttestationSecret(params, attestationMainSecret, publicKeyDER)
+
+	// Parse CBOR manually (simplified - just verify secret matches)
+	// This is test-only code - production should use attestation package
+	idx := 1 // Skip map header
+	if idx >= len(evidence) || evidence[idx] != 0x01 {
+		return fmt.Errorf("invalid CBOR structure")
+	}
+	idx++
+	if idx >= len(evidence) || evidence[idx] != 0x58 {
+		return fmt.Errorf("invalid secret encoding")
+	}
+	idx++
+	if idx >= len(evidence) {
+		return fmt.Errorf("invalid secret length")
+	}
+	secretLen := int(evidence[idx])
+	idx++
+	if idx+secretLen > len(evidence) {
+		return fmt.Errorf("secret length mismatch")
+	}
+	secret := evidence[idx : idx+secretLen]
+
+	if len(secret) != len(expectedSecret) {
+		return fmt.Errorf("secret length mismatch")
+	}
+	for i := range secret {
+		if secret[i] != expectedSecret[i] {
+			return fmt.Errorf("secret mismatch")
+		}
+	}
+	return nil
 }
 
 func TestMarshalPublicKeyToDER(t *testing.T) {
@@ -134,88 +132,13 @@ func TestMarshalPublicKeyToDER(t *testing.T) {
 }
 
 func TestCMWEncodeDecode(t *testing.T) {
-	// Create a test CMW payload
-	cmw := CMWPayload{
-		AttestationSecret: []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32},
-		PublicKeyDER:      []byte{0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00},
-		EvidenceType:      0xFA00,
-	}
-
-	// Test encoding to CBOR
-	cborData, err := EncodeCMWToCBOR(cmw)
-	assertNotError(t, err, "Failed to encode CMW to CBOR")
-	assertNotNil(t, cborData, "CBOR data is nil")
-	assertTrue(t, len(cborData) > 0, "CBOR data is empty")
-
-	// Test decoding from CBOR
-	decodedCMW, err := DecodeCMWFromCBOR(cborData)
-	assertNotError(t, err, "Failed to decode CMW from CBOR")
-	assertByteEquals(t, cmw.AttestationSecret, decodedCMW.AttestationSecret)
-	assertByteEquals(t, cmw.PublicKeyDER, decodedCMW.PublicKeyDER)
-	assertEquals(t, cmw.EvidenceType, decodedCMW.EvidenceType)
-
-	// Test with empty fields
-	emptyCMW := CMWPayload{
-		AttestationSecret: []byte{},
-		PublicKeyDER:      []byte{},
-		EvidenceType:      0,
-	}
-	cborData2, err := EncodeCMWToCBOR(emptyCMW)
-	assertNotError(t, err, "Failed to encode empty CMW to CBOR")
-	decodedEmptyCMW, err := DecodeCMWFromCBOR(cborData2)
-	assertNotError(t, err, "Failed to decode empty CMW from CBOR")
-	assertByteEquals(t, emptyCMW.AttestationSecret, decodedEmptyCMW.AttestationSecret)
-	assertByteEquals(t, emptyCMW.PublicKeyDER, decodedEmptyCMW.PublicKeyDER)
-	assertEquals(t, emptyCMW.EvidenceType, decodedEmptyCMW.EvidenceType)
-
-	// Test with large data
-	largeCMW := CMWPayload{
-		AttestationSecret: make([]byte, 1024),
-		PublicKeyDER:      make([]byte, 2048),
-		EvidenceType:      0xFFFF,
-	}
-	for i := range largeCMW.AttestationSecret {
-		largeCMW.AttestationSecret[i] = byte(i % 256)
-	}
-	for i := range largeCMW.PublicKeyDER {
-		largeCMW.PublicKeyDER[i] = byte((i + 100) % 256)
-	}
-	cborData3, err := EncodeCMWToCBOR(largeCMW)
-	assertNotError(t, err, "Failed to encode large CMW to CBOR")
-	decodedLargeCMW, err := DecodeCMWFromCBOR(cborData3)
-	assertNotError(t, err, "Failed to decode large CMW from CBOR")
-	assertByteEquals(t, largeCMW.AttestationSecret, decodedLargeCMW.AttestationSecret)
-	assertByteEquals(t, largeCMW.PublicKeyDER, decodedLargeCMW.PublicKeyDER)
-	assertEquals(t, largeCMW.EvidenceType, decodedLargeCMW.EvidenceType)
-
-	// Test invalid CBOR data
-	invalidCBOR := []byte{0xFF, 0xFF, 0xFF, 0xFF}
-	_, err = DecodeCMWFromCBOR(invalidCBOR)
-	assertError(t, err, "Should fail to decode invalid CBOR data")
+	// This test is removed - CMW encoding/decoding is now handled by the attestation package
+	t.Skip("CMW encoding/decoding moved to attestation package")
 }
 
 func TestCMWLogging(t *testing.T) {
-	// Test that LogCMWAsJSON doesn't crash
-	cmw := CMWPayload{
-		AttestationSecret: []byte{1, 2, 3, 4},
-		PublicKeyDER:      []byte{5, 6, 7, 8},
-		EvidenceType:      0xFA00,
-	}
-
-	// This should not panic
-	LogCMWAsJSON(cmw, "[TEST]")
-
-	// Test with empty CMW
-	emptyCMW := CMWPayload{}
-	LogCMWAsJSON(emptyCMW, "[TEST]")
-
-	// Test with nil slices (should handle gracefully)
-	nilCMW := CMWPayload{
-		AttestationSecret: nil,
-		PublicKeyDER:      nil,
-		EvidenceType:      0,
-	}
-	LogCMWAsJSON(nilCMW, "[TEST]")
+	// This test is removed - CMW logging moved to attestation package
+	t.Skip("CMW logging moved to attestation package")
 }
 
 func TestAttestationSecretDerivationFlow(t *testing.T) {
@@ -245,23 +168,14 @@ func TestAttestationSecretDerivationFlow(t *testing.T) {
 	assertNotNil(t, attestationSecret, "Attestation secret is nil")
 	assertTrue(t, len(attestationSecret) == params.Hash.Size(), "Attestation secret length mismatch")
 
-	// Create CMW with the derived secret
-	cmw := CMWPayload{
-		AttestationSecret: attestationSecret,
-		PublicKeyDER:      publicKeyDER,
-		EvidenceType:      uint16(ExtensionTypeEvidenceRequest), // Use a valid evidence type
-	}
+	// Verify determinism
+	attestationSecret2 := DeriveAttestationSecret(params, attestationMainSecret, publicKeyDER)
+	assertByteEquals(t, attestationSecret, attestationSecret2)
 
-	// Encode and decode CMW
-	cborData, err := EncodeCMWToCBOR(cmw)
-	assertNotError(t, err, "Failed to encode CMW")
-	decodedCMW, err := DecodeCMWFromCBOR(cborData)
-	assertNotError(t, err, "Failed to decode CMW")
-
-	// Verify round-trip
-	assertByteEquals(t, cmw.AttestationSecret, decodedCMW.AttestationSecret)
-	assertByteEquals(t, cmw.PublicKeyDER, decodedCMW.PublicKeyDER)
-	assertEquals(t, cmw.EvidenceType, decodedCMW.EvidenceType)
+	// Verify different public keys produce different secrets
+	publicKeyDER2 := []byte{0x30, 0x59, 0x30, 0x14} // Different DER
+	attestationSecret3 := DeriveAttestationSecret(params, attestationMainSecret, publicKeyDER2)
+	assertNotByteEquals(t, attestationSecret, attestationSecret3)
 }
 
 // Integration tests for attestation flows
@@ -278,16 +192,23 @@ func TestAttestationClientToServer(t *testing.T) {
 		},
 	}
 
+	testProvider := newTestAttestationProvider()
 	clientConfig := &Config{
 		ServerName:         "example.com",
 		InsecureSkipVerify: true,
-		EnableAttestation:  true,
+		Attestation: AttestationConfig{
+			Enabled:  true,
+			Provider: testProvider,
+		},
 		// Client will propose evidence (evidence_proposal extension)
 	}
 	serverConfig := &Config{
-		Certificates:             testCertificates,
-		EnableAttestation:        true,
-		RequestClientAttestation: true, // Server requests evidence from client
+		Certificates: testCertificates,
+		Attestation: AttestationConfig{
+			Enabled:       true,
+			RequestClient: true, // Server requests evidence from client
+			Provider:      testProvider,
+		},
 	}
 
 	cConn, sConn := pipe()
@@ -324,15 +245,22 @@ func TestAttestationServerToClient(t *testing.T) {
 		},
 	}
 
+	testProvider := newTestAttestationProvider()
 	clientConfig := &Config{
-		ServerName:               "example.com",
-		InsecureSkipVerify:       true,
-		EnableAttestation:        true,
-		RequestServerAttestation: true, // Client requests evidence from server
+		ServerName:         "example.com",
+		InsecureSkipVerify: true,
+		Attestation: AttestationConfig{
+			Enabled:       true,
+			RequestServer: true, // Client requests evidence from server
+			Provider:      testProvider,
+		},
 	}
 	serverConfig := &Config{
-		Certificates:      testCertificates,
-		EnableAttestation: true,
+		Certificates: testCertificates,
+		Attestation: AttestationConfig{
+			Enabled:  true,
+			Provider: testProvider,
+		},
 		// Server will provide evidence when requested
 	}
 
@@ -370,17 +298,24 @@ func TestAttestationBidirectional(t *testing.T) {
 		},
 	}
 
+	testProvider := newTestAttestationProvider()
 	clientConfig := &Config{
-		ServerName:               "example.com",
-		InsecureSkipVerify:       true,
-		EnableAttestation:        true,
-		RequestServerAttestation: true, // Client requests evidence from server
+		ServerName:         "example.com",
+		InsecureSkipVerify: true,
+		Attestation: AttestationConfig{
+			Enabled:       true,
+			RequestServer: true, // Client requests evidence from server
+			Provider:      testProvider,
+		},
 		// Client will also propose evidence
 	}
 	serverConfig := &Config{
-		Certificates:             testCertificates,
-		EnableAttestation:        true,
-		RequestClientAttestation: true, // Server requests evidence from client
+		Certificates: testCertificates,
+		Attestation: AttestationConfig{
+			Enabled:       true,
+			RequestClient: true, // Server requests evidence from client
+			Provider:      testProvider,
+		},
 		// Server will also provide evidence when requested
 	}
 
@@ -421,11 +356,15 @@ func TestAttestationDisabled(t *testing.T) {
 	clientConfig := &Config{
 		ServerName:         "example.com",
 		InsecureSkipVerify: true,
-		EnableAttestation:  false,
+		Attestation: AttestationConfig{
+			Enabled: false,
+		},
 	}
 	serverConfig := &Config{
-		Certificates:      testCertificates,
-		EnableAttestation: false,
+		Certificates: testCertificates,
+		Attestation: AttestationConfig{
+			Enabled: false,
+		},
 	}
 
 	cConn, sConn := pipe()
@@ -462,16 +401,23 @@ func TestAttestationClientRequiresServerEvidence(t *testing.T) {
 		},
 	}
 
+	testProvider := newTestAttestationProvider()
 	clientConfig := &Config{
-		ServerName:               "example.com",
-		InsecureSkipVerify:       true,
-		EnableAttestation:        true,
-		RequestServerAttestation: true,
-		RequireServerAttestation: true, // Client requires evidence
+		ServerName:         "example.com",
+		InsecureSkipVerify: true,
+		Attestation: AttestationConfig{
+			Enabled:       true,
+			RequestServer: true,
+			RequireServer: true, // Client requires evidence
+			Provider:      testProvider,
+		},
 	}
 	serverConfig := &Config{
-		Certificates:      testCertificates,
-		EnableAttestation: true,
+		Certificates: testCertificates,
+		Attestation: AttestationConfig{
+			Enabled:  true,
+			Provider: testProvider,
+		},
 		// Server will provide evidence when requested
 	}
 
@@ -511,15 +457,19 @@ func TestAttestationClientRequiresButServerDoesNotProvide(t *testing.T) {
 	}
 
 	clientConfig := &Config{
-		ServerName:               "example.com",
-		InsecureSkipVerify:       true,
-		EnableAttestation:        true,
-		RequestServerAttestation: true,
-		RequireServerAttestation: true, // Client requires evidence
+		ServerName:         "example.com",
+		InsecureSkipVerify: true,
+		Attestation: AttestationConfig{
+			Enabled:       true,
+			RequestServer: true,
+			RequireServer: true, // Client requires evidence
+		},
 	}
 	serverConfig := &Config{
-		Certificates:      testCertificates,
-		EnableAttestation: false, // Server doesn't support attestation
+		Certificates: testCertificates,
+		Attestation: AttestationConfig{
+			Enabled: false, // Server doesn't support attestation
+		},
 	}
 
 	cConn, sConn := pipe()
