@@ -25,9 +25,8 @@ type AttestationConfig struct {
 		GenerateEvidence(attestationMainSecret []byte, publicKeyDER []byte, evidenceType EvidenceType) ([]byte, error)
 		VerifyEvidence(evidence []byte, attestationMainSecret []byte, publicKeyDER []byte, evidenceType EvidenceType) error
 	}
-	RequestClient          bool // Server: request evidence from client
-	RequestServer          bool // Client: request evidence from server
-	RequireServer          bool // Client: abort handshake if server doesn't provide evidence
+	RequestPeer            bool // Request evidence from peer (client requests from server, server requests from client)
+	RequirePeer            bool // Require evidence from peer (abort handshake if peer doesn't provide evidence)
 	SupportedEvidenceTypes []EvidenceType
 }
 

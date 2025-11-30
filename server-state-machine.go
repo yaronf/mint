@@ -181,6 +181,12 @@ func (state serverStateStart) Next(hr handshakeMessageReader) (HandshakeState, [
 				logf(logTypeHandshake, "[ServerStateStart] No common evidence type found")
 				return nil, nil, AlertUnsupportedEvidence
 			}
+		} else {
+			// Server requires client evidence but client didn't propose it
+			if state.Config.Attestation.RequirePeer {
+				logf(logTypeHandshake, "[ServerStateStart] RequirePeer is true but client did not provide evidence_proposal")
+				return nil, nil, AlertHandshakeFailure
+			}
 		}
 
 		// Check for evidence_request (client wants server evidence)
@@ -626,7 +632,7 @@ func (state serverStateNegotiated) Next(_ handshakeMessageReader) (HandshakeStat
 		serverAttestationMainSecret = DeriveAttestationMainSecret(params, masterSecret, h2, false)
 		logf(logTypeCrypto, "server attestation main secret: [%d] %x", len(serverAttestationMainSecret), serverAttestationMainSecret)
 	}
-	if state.Params.ServerCanRequestEvidence && state.Config.Attestation.RequestClient {
+	if state.Params.ServerCanRequestEvidence && state.Config.Attestation.RequestPeer {
 		// Derive client attestation main secret (used when verifying client evidence)
 		clientAttestationMainSecret = DeriveAttestationMainSecret(params, masterSecret, h2, true)
 		logf(logTypeCrypto, "client attestation main secret: [%d] %x", len(clientAttestationMainSecret), clientAttestationMainSecret)
@@ -655,7 +661,7 @@ func (state serverStateNegotiated) Next(_ handshakeMessageReader) (HandshakeStat
 	}
 
 	// Add attestation extensions if negotiated
-	if state.Params.ServerCanRequestEvidence && state.Config.Attestation.RequestClient {
+	if state.Params.ServerCanRequestEvidence && state.Config.Attestation.RequestPeer {
 		evidenceProposal := &EvidenceProposalExtension{
 			HandshakeType: HandshakeTypeEncryptedExtensions,
 			SelectedType:  state.Params.SelectedEvidenceType,
@@ -1121,6 +1127,11 @@ func (state serverStateWaitCert) Next(hr handshakeMessageReader) (HandshakeState
 			return nil, nil, alert
 		}
 		if attHm == nil || attHm.msgType != HandshakeTypeAttestation {
+			// Server requires evidence but client didn't provide it
+			if state.Config.Attestation.RequirePeer {
+				logf(logTypeHandshake, "[ServerStateWaitCert] RequirePeer is true but client did not provide evidence")
+				return nil, nil, AlertHandshakeFailure
+			}
 			logf(logTypeHandshake, "[ServerStateWaitCert] Expected Attestation message after Certificate")
 			return nil, nil, AlertUnexpectedMessage
 		}

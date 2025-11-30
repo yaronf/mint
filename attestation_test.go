@@ -297,9 +297,9 @@ func TestAttestationClientToServer(t *testing.T) {
 	serverConfig := &Config{
 		Certificates: testCertificates,
 		Attestation: AttestationConfig{
-			Enabled:       true,
-			RequestClient: true, // Server requests evidence from client
-			Provider:      testProvider,
+			Enabled:     true,
+			RequestPeer: true, // Server requests evidence from client
+			Provider:    testProvider,
 		},
 	}
 
@@ -342,9 +342,9 @@ func TestAttestationServerToClient(t *testing.T) {
 		ServerName:         "example.com",
 		InsecureSkipVerify: true,
 		Attestation: AttestationConfig{
-			Enabled:       true,
-			RequestServer: true, // Client requests evidence from server
-			Provider:      testProvider,
+			Enabled:     true,
+			RequestPeer: true, // Client requests evidence from server
+			Provider:    testProvider,
 		},
 	}
 	serverConfig := &Config{
@@ -395,18 +395,18 @@ func TestAttestationBidirectional(t *testing.T) {
 		ServerName:         "example.com",
 		InsecureSkipVerify: true,
 		Attestation: AttestationConfig{
-			Enabled:       true,
-			RequestServer: true, // Client requests evidence from server
-			Provider:      testProvider,
+			Enabled:     true,
+			RequestPeer: true, // Client requests evidence from server
+			Provider:    testProvider,
 		},
 		// Client will also propose evidence
 	}
 	serverConfig := &Config{
 		Certificates: testCertificates,
 		Attestation: AttestationConfig{
-			Enabled:       true,
-			RequestClient: true, // Server requests evidence from client
-			Provider:      testProvider,
+			Enabled:     true,
+			RequestPeer: true, // Server requests evidence from client
+			Provider:    testProvider,
 		},
 		// Server will also provide evidence when requested
 	}
@@ -498,10 +498,10 @@ func TestAttestationClientRequiresServerEvidence(t *testing.T) {
 		ServerName:         "example.com",
 		InsecureSkipVerify: true,
 		Attestation: AttestationConfig{
-			Enabled:       true,
-			RequestServer: true,
-			RequireServer: true, // Client requires evidence
-			Provider:      testProvider,
+			Enabled:     true,
+			RequestPeer: true,
+			RequirePeer: true, // Client requires evidence
+			Provider:    testProvider,
 		},
 	}
 	serverConfig := &Config{
@@ -552,9 +552,9 @@ func TestAttestationClientRequiresButServerDoesNotProvide(t *testing.T) {
 		ServerName:         "example.com",
 		InsecureSkipVerify: true,
 		Attestation: AttestationConfig{
-			Enabled:       true,
-			RequestServer: true,
-			RequireServer: true, // Client requires evidence
+			Enabled:     true,
+			RequestPeer: true,
+			RequirePeer: true, // Client requires evidence
 		},
 	}
 	serverConfig := &Config{
@@ -626,9 +626,9 @@ func TestAttestationClientInvalidEvidence(t *testing.T) {
 		RequireClientAuth:  true, // Require client certificate
 		InsecureSkipVerify: true, // Skip client cert verification for test
 		Attestation: AttestationConfig{
-			Enabled:       true,
-			RequestClient: true, // Server requests evidence from client
-			Provider:      serverProvider,
+			Enabled:     true,
+			RequestPeer: true, // Server requests evidence from client
+			Provider:    serverProvider,
 		},
 	}
 
@@ -695,9 +695,9 @@ func TestAttestationServerInvalidEvidence(t *testing.T) {
 		ServerName:         "example.com",
 		InsecureSkipVerify: true,
 		Attestation: AttestationConfig{
-			Enabled:       true,
-			RequestServer: true, // Client requests evidence from server
-			Provider:      clientProvider,
+			Enabled:     true,
+			RequestPeer: true, // Client requests evidence from server
+			Provider:    clientProvider,
 		},
 	}
 
@@ -750,9 +750,9 @@ func TestAttestationClientWrongPublicKey(t *testing.T) {
 		RequireClientAuth:  true,
 		InsecureSkipVerify: true,
 		Attestation: AttestationConfig{
-			Enabled:       true,
-			RequestClient: true,
-			Provider:      serverProvider,
+			Enabled:     true,
+			RequestPeer: true,
+			Provider:    serverProvider,
 		},
 	}
 
@@ -816,9 +816,9 @@ func TestAttestationClientInvalidCBOR(t *testing.T) {
 		RequireClientAuth:  true,
 		InsecureSkipVerify: true,
 		Attestation: AttestationConfig{
-			Enabled:       true,
-			RequestClient: true,
-			Provider:      serverProvider,
+			Enabled:     true,
+			RequestPeer: true,
+			Provider:    serverProvider,
 		},
 	}
 
@@ -881,9 +881,9 @@ func TestAttestationServerWrongSecret(t *testing.T) {
 		ServerName:         "example.com",
 		InsecureSkipVerify: true,
 		Attestation: AttestationConfig{
-			Enabled:       true,
-			RequestServer: true,
-			Provider:      clientProvider,
+			Enabled:     true,
+			RequestPeer: true,
+			Provider:    clientProvider,
 		},
 	}
 

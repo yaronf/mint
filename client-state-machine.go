@@ -161,7 +161,7 @@ func (state clientStateStart) Next(hr handshakeMessageReader) (HandshakeState, [
 		}
 
 		// Optionally add evidence_request if client wants server attestation
-		if state.Config.Attestation.RequestServer {
+		if state.Config.Attestation.RequestPeer {
 			evidenceRequest := &EvidenceRequestExtension{
 				HandshakeType: HandshakeTypeClientHello,
 				SupportedTypes: []EvidenceType{
@@ -674,8 +674,8 @@ func (state clientStateWaitEE) Next(hr handshakeMessageReader) (HandshakeState, 
 	}
 
 	// Client policy check: require server attestation
-	if state.Config.Attestation.RequireServer && !foundExts[ExtensionTypeEvidenceRequest] {
-		logf(logTypeHandshake, "[Client] RequireServerAttestation is true but server did not provide evidence_request")
+	if state.Config.Attestation.RequirePeer && !foundExts[ExtensionTypeEvidenceRequest] {
+		logf(logTypeHandshake, "[Client] RequirePeer is true but server did not provide evidence_request")
 		return nil, nil, AlertHandshakeFailure
 	}
 
