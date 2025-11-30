@@ -10,6 +10,7 @@ type AttestationProvider interface {
 		attestationMainSecret []byte, // Derived from TLS master secret
 		publicKeyDER []byte, // TLS Identity Key in DER format
 		evidenceType mint.EvidenceType, // Selected evidence type
+		rotName string, // Root of Trust name that signs this evidence
 	) ([]byte, error)
 
 	// VerifyEvidence verifies attestation evidence received from peer
@@ -19,5 +20,6 @@ type AttestationProvider interface {
 		attestationMainSecret []byte, // Derived from TLS master secret
 		publicKeyDER []byte, // TLS Identity Key in DER format
 		evidenceType mint.EvidenceType, // Selected evidence type
+		trustedROTs []string, // List of trusted Root of Trust names
 	) error
 }

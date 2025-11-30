@@ -31,6 +31,7 @@ func (s *StandardProvider) GenerateEvidence(
 	attestationMainSecret []byte,
 	publicKeyDER []byte,
 	evidenceType mint.EvidenceType,
+	rotName string,
 ) ([]byte, error) {
 	// 1. Derive attestation secret (nonce)
 	attestationSecret := DeriveAttestationSecret(s.hash, attestationMainSecret, publicKeyDER)
@@ -40,6 +41,7 @@ func (s *StandardProvider) GenerateEvidence(
 		AttestationSecret: attestationSecret,
 		PublicKeyDER:      publicKeyDER,
 		EvidenceType:      evidenceType.ContentFormat,
+		ROTName:           rotName,
 	}
 
 	// 3. CBOR-encode the payload
@@ -70,6 +72,7 @@ func (s *StandardProvider) VerifyEvidence(
 	attestationMainSecret []byte,
 	publicKeyDER []byte,
 	evidenceType mint.EvidenceType,
+	trustedROTs []string,
 ) error {
 	// 1. Decode CMW from CBOR
 	var cmwWrapper cmw.CMW
@@ -114,6 +117,21 @@ func (s *StandardProvider) VerifyEvidence(
 	// 8. Verify evidence type matches (optional, but good to check)
 	if payload.EvidenceType != evidenceType.ContentFormat {
 		return fmt.Errorf("evidence type mismatch: got %d, want %d", payload.EvidenceType, evidenceType.ContentFormat)
+	}
+
+	// 9. Verify ROT name is in trusted list
+	if len(trustedROTs) == 0 {
+		return fmt.Errorf("no trusted ROTs configured")
+	}
+	rotTrusted := false
+	for _, trustedROT := range trustedROTs {
+		if payload.ROTName == trustedROT {
+			rotTrusted = true
+			break
+		}
+	}
+	if !rotTrusted {
+		return fmt.Errorf("ROT %q not in trusted list (trusted: %v)", payload.ROTName, trustedROTs)
 	}
 
 	return nil

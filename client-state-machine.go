@@ -156,7 +156,7 @@ func (state clientStateStart) Next(hr handshakeMessageReader) (HandshakeState, [
 		}
 		err := ch.Extensions.Add(evidenceProposal)
 		if err != nil {
-			logf(logTypeHandshake, "[ClientStateStart] Error adding evidence_proposal extension [%v]", err)
+			logf(logTypeAttestation, "[ClientStateStart] Error adding evidence_proposal extension [%v]", err)
 			return nil, nil, AlertInternalError
 		}
 
@@ -170,7 +170,7 @@ func (state clientStateStart) Next(hr handshakeMessageReader) (HandshakeState, [
 			}
 			err := ch.Extensions.Add(evidenceRequest)
 			if err != nil {
-				logf(logTypeHandshake, "[ClientStateStart] Error adding evidence_request extension [%v]", err)
+				logf(logTypeAttestation, "[ClientStateStart] Error adding evidence_request extension [%v]", err)
 				return nil, nil, AlertInternalError
 			}
 		}
@@ -661,7 +661,7 @@ func (state clientStateWaitEE) Next(hr handshakeMessageReader) (HandshakeState, 
 		state.Params.ServerRequestedEvidence = true
 		state.Params.SelectedEvidenceType = evidenceProposal.SelectedType
 		state.Params.UsingAttestation = true
-		logf(logTypeHandshake, "[Client] Server requested evidence type: ContentFormat=%d",
+		logf(logTypeAttestation, "[Client] Server requested evidence type: ContentFormat=%d",
 			evidenceProposal.SelectedType.ContentFormat)
 	}
 
@@ -669,13 +669,13 @@ func (state clientStateWaitEE) Next(hr handshakeMessageReader) (HandshakeState, 
 		state.Params.ClientRequestedEvidence = true
 		state.Params.SelectedEvidenceType = evidenceRequest.SelectedType
 		state.Params.UsingAttestation = true
-		logf(logTypeHandshake, "[Client] Server will provide evidence type: ContentFormat=%d",
+		logf(logTypeAttestation, "[Client] Server will provide evidence type: ContentFormat=%d",
 			evidenceRequest.SelectedType.ContentFormat)
 	}
 
 	// Client policy check: require server attestation
 	if state.Config.Attestation.RequirePeer && !foundExts[ExtensionTypeEvidenceRequest] {
-		logf(logTypeHandshake, "[Client] RequirePeer is true but server did not provide evidence_request")
+		logf(logTypeAttestation, "[Client] RequirePeer is true but server did not provide evidence_request (sending alert: handshake failure)")
 		return nil, nil, AlertHandshakeFailure
 	}
 
@@ -696,15 +696,17 @@ func (state clientStateWaitEE) Next(hr handshakeMessageReader) (HandshakeState, 
 			return nil, nil, alert
 		}
 		if attHm == nil || attHm.msgType != HandshakeTypeAttestation {
-			logf(logTypeHandshake, "[ClientStateWaitEE] Expected Attestation message after EncryptedExtensions")
+			logf(logTypeAttestation, "[ClientStateWaitEE] Expected Attestation message after EncryptedExtensions (sending alert: unexpected message)")
 			return nil, nil, AlertUnexpectedMessage
 		}
 
 		att := &AttestationBody{}
 		if err := safeUnmarshal(att, attHm.body); err != nil {
-			logf(logTypeHandshake, "[ClientStateWaitEE] Error decoding Attestation message: %v", err)
+			logf(logTypeAttestation, "[ClientStateWaitEE] Error decoding Attestation message: %v", err)
 			return nil, nil, AlertDecodeError
 		}
+
+		logf(logTypeAttestation, "[ClientStateWaitEE] Received server attestation evidence, will verify after certificate")
 
 		// Store attestation evidence for verification after server certificate is received
 		// We can't verify yet because we need the server's public key from the Certificate message
@@ -991,7 +993,7 @@ func (state clientStateWaitCV) Next(hr handshakeMessageReader) (HandshakeState, 
 	// Verify server attestation evidence if it was received
 	if len(state.serverAttestationEvidence) > 0 {
 		if state.Config.Attestation.Provider == nil {
-			logf(logTypeHandshake, "[ClientStateWaitCV] AttestationProvider is nil but attestation evidence was received")
+			logf(logTypeAttestation, "[ClientStateWaitCV] AttestationProvider is nil but attestation evidence was received (sending alert: internal error)")
 			return nil, nil, AlertInternalError
 		}
 
@@ -999,13 +1001,13 @@ func (state clientStateWaitCV) Next(hr handshakeMessageReader) (HandshakeState, 
 		serverPublicKey := state.serverCertificate.CertificateList[0].CertData.PublicKey
 		publicKeyDER, err := MarshalPublicKeyToDER(serverPublicKey)
 		if err != nil {
-			logf(logTypeHandshake, "[ClientStateWaitCV] Error marshaling server public key to DER: %v", err)
+			logf(logTypeAttestation, "[ClientStateWaitCV] Error marshaling server public key to DER: %v", err)
 			return nil, nil, AlertInternalError
 		}
 
 		// Use pre-derived server attestation main secret
 		if len(state.serverAttestationMainSecret) == 0 {
-			logf(logTypeHandshake, "[ClientStateWaitCV] Missing server attestation main secret for verification")
+			logf(logTypeAttestation, "[ClientStateWaitCV] Missing server attestation main secret for verification")
 			return nil, nil, AlertInternalError
 		}
 
@@ -1015,12 +1017,13 @@ func (state clientStateWaitCV) Next(hr handshakeMessageReader) (HandshakeState, 
 			state.serverAttestationMainSecret,
 			publicKeyDER,
 			state.Params.SelectedEvidenceType,
+			state.Config.Attestation.TrustedROTs,
 		)
 		if err != nil {
-			logf(logTypeHandshake, "[ClientStateWaitCV] Server attestation verification failed: %v", err)
+			logf(logTypeAttestation, "[ClientStateWaitCV] Server attestation verification failed: %v (sending alert: unsupported evidence)", err)
 			return nil, nil, AlertUnsupportedEvidence
 		}
-		logf(logTypeHandshake, "[ClientStateWaitCV] Server attestation verified successfully")
+		logf(logTypeAttestation, "[ClientStateWaitCV] Server attestation verified successfully")
 	}
 
 	state.handshakeHash.Write(hm.Marshal())
@@ -1197,7 +1200,7 @@ func (state clientStateWaitFinished) Next(hr handshakeMessageReader) (HandshakeS
 				// Use pre-derived attestation main secret (derived earlier in clientStateWaitSH)
 				attestationMainSecret := state.clientAttestationMainSecret
 				if len(attestationMainSecret) == 0 {
-					logf(logTypeHandshake, "[ClientStateWaitFinished] Missing client attestation main secret")
+					logf(logTypeAttestation, "[ClientStateWaitFinished] Missing client attestation main secret")
 					return nil, nil, AlertInternalError
 				}
 
@@ -1206,9 +1209,10 @@ func (state clientStateWaitFinished) Next(hr handshakeMessageReader) (HandshakeS
 					attestationMainSecret,
 					publicKeyDER,
 					state.Params.SelectedEvidenceType,
+					state.Config.Attestation.MyROT,
 				)
 				if err != nil {
-					logf(logTypeHandshake, "[ClientStateWaitFinished] Error generating evidence: %v", err)
+					logf(logTypeAttestation, "[ClientStateWaitFinished] Error generating evidence: %v", err)
 					return nil, nil, AlertInternalError
 				}
 
@@ -1217,9 +1221,10 @@ func (state clientStateWaitFinished) Next(hr handshakeMessageReader) (HandshakeS
 				}
 				attm, err := state.hsCtx.hOut.HandshakeMessageFromBody(attestation)
 				if err != nil {
-					logf(logTypeHandshake, "[ClientStateWaitFinished] Error marshaling Attestation: %v", err)
+					logf(logTypeAttestation, "[ClientStateWaitFinished] Error marshaling Attestation: %v", err)
 					return nil, nil, AlertInternalError
 				}
+				logf(logTypeAttestation, "[ClientStateWaitFinished] Sending client attestation evidence (ROT: %s)", state.Config.Attestation.MyROT)
 				toSend = append(toSend, QueueHandshakeMessage{attm})
 				state.handshakeHash.Write(attm.Marshal())
 			}

@@ -199,6 +199,7 @@ func TestCMWEncodeDecode(t *testing.T) {
 		AttestationSecret: attestationSecret,
 		PublicKeyDER:      publicKeyDER,
 		EvidenceType:      evidenceType,
+		ROTName:           "test-rot",
 	}
 
 	// Encode payload to CBOR
@@ -241,12 +242,14 @@ func TestCMWEncodeDecode(t *testing.T) {
 	assertByteEquals(t, payload.AttestationSecret, payload2.AttestationSecret)
 	assertByteEquals(t, payload.PublicKeyDER, payload2.PublicKeyDER)
 	assertEquals(t, payload.EvidenceType, payload2.EvidenceType)
+	assertEquals(t, payload.ROTName, payload2.ROTName)
 
 	// Test with empty fields
 	emptyPayload := CMWPayload{
 		AttestationSecret: []byte{},
 		PublicKeyDER:      []byte{},
 		EvidenceType:      0,
+		ROTName:           "",
 	}
 	emptyPayloadBytes, err := encodePayload(emptyPayload)
 	assertNotError(t, err, "Failed to encode empty payload")
@@ -269,6 +272,7 @@ func TestCMWEncodeDecode(t *testing.T) {
 		AttestationSecret: largeSecret,
 		PublicKeyDER:      largeKey,
 		EvidenceType:      0x5678,
+		ROTName:           "large-test-rot",
 	}
 	largePayloadBytes, err := encodePayload(largePayload)
 	assertNotError(t, err, "Failed to encode large payload")
@@ -277,6 +281,7 @@ func TestCMWEncodeDecode(t *testing.T) {
 	assertByteEquals(t, largePayload.AttestationSecret, largePayload2.AttestationSecret)
 	assertByteEquals(t, largePayload.PublicKeyDER, largePayload2.PublicKeyDER)
 	assertEquals(t, largePayload.EvidenceType, largePayload2.EvidenceType)
+	assertEquals(t, largePayload.ROTName, largePayload2.ROTName)
 
 	// Test invalid CBOR data
 	invalidCBOR := []byte{0xff, 0xff, 0xff}
@@ -324,13 +329,15 @@ func TestAttestationSecretDerivationFlow(t *testing.T) {
 	// Create CMW using StandardProvider
 	provider := NewStandardProvider(hash)
 	evidenceType := mint.EvidenceType{ContentFormat: 0x1234}
-	evidence, err := provider.GenerateEvidence(attestationMainSecret, publicKeyDER, evidenceType)
+	rotName := "test-rot"
+	evidence, err := provider.GenerateEvidence(attestationMainSecret, publicKeyDER, evidenceType, rotName)
 	assertNotError(t, err, "Failed to generate evidence")
 	assertNotNil(t, evidence, "Evidence is nil")
 	assertTrue(t, len(evidence) > 0, "Evidence is empty")
 
 	// Verify evidence can be decoded and verified
-	err = provider.VerifyEvidence(evidence, attestationMainSecret, publicKeyDER, evidenceType)
+	trustedROTs := []string{"test-rot"}
+	err = provider.VerifyEvidence(evidence, attestationMainSecret, publicKeyDER, evidenceType, trustedROTs)
 	assertNotError(t, err, "Failed to verify evidence")
 }
 
@@ -360,37 +367,39 @@ func TestStandardProvider(t *testing.T) {
 
 	// Test GenerateEvidence
 	evidenceType := mint.EvidenceType{ContentFormat: 0x1234}
-	evidence, err := provider.GenerateEvidence(attestationMainSecret, publicKeyDER, evidenceType)
+	rotName := "test-rot"
+	trustedROTs := []string{"test-rot"}
+	evidence, err := provider.GenerateEvidence(attestationMainSecret, publicKeyDER, evidenceType, rotName)
 	assertNotError(t, err, "Failed to generate evidence")
 	assertNotNil(t, evidence, "Evidence is nil")
 	assertTrue(t, len(evidence) > 0, "Evidence is empty")
 
 	// Test VerifyEvidence with correct parameters
-	err = provider.VerifyEvidence(evidence, attestationMainSecret, publicKeyDER, evidenceType)
+	err = provider.VerifyEvidence(evidence, attestationMainSecret, publicKeyDER, evidenceType, trustedROTs)
 	assertNotError(t, err, "Failed to verify evidence")
 
 	// Test VerifyEvidence with wrong attestation main secret
 	wrongMainSecret := make([]byte, hash.Size())
 	copy(wrongMainSecret, attestationMainSecret)
 	wrongMainSecret[0]++
-	err = provider.VerifyEvidence(evidence, wrongMainSecret, publicKeyDER, evidenceType)
+	err = provider.VerifyEvidence(evidence, wrongMainSecret, publicKeyDER, evidenceType, trustedROTs)
 	assertError(t, err, "Should fail with wrong attestation main secret")
 
 	// Test VerifyEvidence with wrong public key
 	wrongPublicKeyDER := make([]byte, len(publicKeyDER))
 	copy(wrongPublicKeyDER, publicKeyDER)
 	wrongPublicKeyDER[0]++
-	err = provider.VerifyEvidence(evidence, attestationMainSecret, wrongPublicKeyDER, evidenceType)
+	err = provider.VerifyEvidence(evidence, attestationMainSecret, wrongPublicKeyDER, evidenceType, trustedROTs)
 	assertError(t, err, "Should fail with wrong public key")
 
 	// Test VerifyEvidence with wrong evidence type
 	wrongEvidenceType := mint.EvidenceType{ContentFormat: 0x5678}
-	err = provider.VerifyEvidence(evidence, attestationMainSecret, publicKeyDER, wrongEvidenceType)
+	err = provider.VerifyEvidence(evidence, attestationMainSecret, publicKeyDER, wrongEvidenceType, trustedROTs)
 	assertError(t, err, "Should fail with wrong evidence type")
 
 	// Test VerifyEvidence with invalid CMW data
 	invalidEvidence := []byte{0xff, 0xff, 0xff}
-	err = provider.VerifyEvidence(invalidEvidence, attestationMainSecret, publicKeyDER, evidenceType)
+	err = provider.VerifyEvidence(invalidEvidence, attestationMainSecret, publicKeyDER, evidenceType, trustedROTs)
 	assertError(t, err, "Should fail with invalid CMW data")
 
 	// Test VerifyEvidence with wrong media type (create CMW with different media type)
@@ -398,6 +407,7 @@ func TestStandardProvider(t *testing.T) {
 		AttestationSecret: DeriveAttestationSecret(hash, attestationMainSecret, publicKeyDER),
 		PublicKeyDER:      publicKeyDER,
 		EvidenceType:      evidenceType.ContentFormat,
+		ROTName:           rotName,
 	}
 	wrongPayloadBytes, err := encodePayload(wrongMediaTypePayload)
 	assertNotError(t, err, "Failed to encode payload")
@@ -405,8 +415,13 @@ func TestStandardProvider(t *testing.T) {
 	assertNotError(t, err, "Failed to create CMW with wrong media type")
 	wrongEvidenceBytes, err := wrongCMW.MarshalCBOR()
 	assertNotError(t, err, "Failed to marshal wrong CMW")
-	err = provider.VerifyEvidence(wrongEvidenceBytes, attestationMainSecret, publicKeyDER, evidenceType)
+	err = provider.VerifyEvidence(wrongEvidenceBytes, attestationMainSecret, publicKeyDER, evidenceType, trustedROTs)
 	assertError(t, err, "Should fail with wrong media type")
+
+	// Test VerifyEvidence with untrusted ROT
+	untrustedROTs := []string{"other-rot"}
+	err = provider.VerifyEvidence(evidence, attestationMainSecret, publicKeyDER, evidenceType, untrustedROTs)
+	assertError(t, err, "Should fail with untrusted ROT")
 }
 
 // TestStandardProviderRoundTrip tests complete round-trip: generate -> verify
@@ -435,19 +450,21 @@ func TestStandardProviderRoundTrip(t *testing.T) {
 
 	// Generate evidence
 	evidenceType := mint.EvidenceType{ContentFormat: 0x1234}
-	evidence, err := provider.GenerateEvidence(attestationMainSecret, publicKeyDER, evidenceType)
+	rotName := "test-rot"
+	trustedROTs := []string{"test-rot"}
+	evidence, err := provider.GenerateEvidence(attestationMainSecret, publicKeyDER, evidenceType, rotName)
 	assertNotError(t, err, "Failed to generate evidence")
 
 	// Verify evidence
-	err = provider.VerifyEvidence(evidence, attestationMainSecret, publicKeyDER, evidenceType)
+	err = provider.VerifyEvidence(evidence, attestationMainSecret, publicKeyDER, evidenceType, trustedROTs)
 	assertNotError(t, err, "Failed to verify evidence")
 
 	// Test with different evidence types
 	for _, et := range []uint16{0x0001, 0x1234, 0x5678, 0xFFFF} {
 		evType := mint.EvidenceType{ContentFormat: et}
-		ev, err := provider.GenerateEvidence(attestationMainSecret, publicKeyDER, evType)
+		ev, err := provider.GenerateEvidence(attestationMainSecret, publicKeyDER, evType, rotName)
 		assertNotError(t, err, fmt.Sprintf("Failed to generate evidence for type %d", et))
-		err = provider.VerifyEvidence(ev, attestationMainSecret, publicKeyDER, evType)
+		err = provider.VerifyEvidence(ev, attestationMainSecret, publicKeyDER, evType, trustedROTs)
 		assertNotError(t, err, fmt.Sprintf("Failed to verify evidence for type %d", et))
 	}
 }

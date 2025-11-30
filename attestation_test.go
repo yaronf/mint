@@ -1,6 +1,7 @@
 package mint
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -20,17 +21,17 @@ func newTestAttestationProvider() *testAttestationProvider {
 	return &testAttestationProvider{}
 }
 
-func (t *testAttestationProvider) GenerateEvidence(attestationMainSecret []byte, publicKeyDER []byte, evidenceType EvidenceType) ([]byte, error) {
+func (t *testAttestationProvider) GenerateEvidence(attestationMainSecret []byte, publicKeyDER []byte, evidenceType EvidenceType, rotName string) ([]byte, error) {
 	// Use mint's DeriveAttestationSecret (which matches attestation package logic)
 	params := cipherSuiteMap[TLS_AES_128_GCM_SHA256]
 	attestationSecret := DeriveAttestationSecret(params, attestationMainSecret, publicKeyDER)
 
 	// Create minimal CBOR-encoded payload manually (to avoid CBOR dependency in main module)
-	// CBOR encoding for map with 3 entries: {1: attestationSecret, 2: publicKeyDER, 3: evidenceType}
+	// CBOR encoding for map with 4 entries: {1: attestationSecret, 2: publicKeyDER, 3: evidenceType, 4: rotName}
 	// This is a simplified encoding - production should use attestation package
 	var result []byte
-	// CBOR map header: 0xa3 = map with 3 pairs
-	result = append(result, 0xa3)
+	// CBOR map header: 0xa4 = map with 4 pairs
+	result = append(result, 0xa4)
 	// Key 1 (uint): 0x01
 	result = append(result, 0x01)
 	// Value: byte string with attestationSecret
@@ -45,11 +46,17 @@ func (t *testAttestationProvider) GenerateEvidence(attestationMainSecret []byte,
 	result = append(result, 0x03)
 	// Value: uint16 evidenceType
 	result = append(result, 0x19, byte(evidenceType.ContentFormat>>8), byte(evidenceType.ContentFormat&0xff))
+	// Key 4 (uint): 0x04
+	result = append(result, 0x04)
+	// Value: text string with rotName
+	rotNameBytes := []byte(rotName)
+	result = append(result, byte(0x78), byte(len(rotNameBytes)>>8), byte(len(rotNameBytes)&0xff))
+	result = append(result, rotNameBytes...)
 
 	return result, nil
 }
 
-func (t *testAttestationProvider) VerifyEvidence(evidence []byte, attestationMainSecret []byte, publicKeyDER []byte, evidenceType EvidenceType) error {
+func (t *testAttestationProvider) VerifyEvidence(evidence []byte, attestationMainSecret []byte, publicKeyDER []byte, evidenceType EvidenceType, trustedROTs []string) error {
 	// Simple verification - just check that we can parse the structure
 	// For proper verification, use attestation package StandardProvider
 	if len(evidence) < 10 {
@@ -59,7 +66,7 @@ func (t *testAttestationProvider) VerifyEvidence(evidence []byte, attestationMai
 	params := cipherSuiteMap[TLS_AES_128_GCM_SHA256]
 	expectedSecret := DeriveAttestationSecret(params, attestationMainSecret, publicKeyDER)
 
-	// Parse CBOR manually (simplified - just verify secret matches)
+	// Parse CBOR manually (simplified - just verify secret matches and ROT is trusted)
 	// This is test-only code - production should use attestation package
 	idx := 1 // Skip map header
 	if idx >= len(evidence) || evidence[idx] != 0x01 {
@@ -88,6 +95,73 @@ func (t *testAttestationProvider) VerifyEvidence(evidence []byte, attestationMai
 			return fmt.Errorf("secret mismatch")
 		}
 	}
+
+	// Parse and verify public key (key 2)
+	idx += secretLen
+	if idx >= len(evidence) || evidence[idx] != 0x02 {
+		return fmt.Errorf("invalid CBOR structure (key 2)")
+	}
+	idx++
+	if idx >= len(evidence) || evidence[idx] != 0x58 {
+		return fmt.Errorf("invalid public key encoding")
+	}
+	idx++
+	if idx >= len(evidence) {
+		return fmt.Errorf("invalid public key length")
+	}
+	publicKeyLen := int(evidence[idx])
+	idx++
+	if idx+publicKeyLen > len(evidence) {
+		return fmt.Errorf("public key length mismatch")
+	}
+	publicKeyFromEvidence := evidence[idx : idx+publicKeyLen]
+	// Verify public key matches
+	if !bytes.Equal(publicKeyFromEvidence, publicKeyDER) {
+		return fmt.Errorf("public key mismatch")
+	}
+	idx += publicKeyLen
+	// Skip key 3
+	if idx >= len(evidence) || evidence[idx] != 0x03 {
+		return fmt.Errorf("invalid CBOR structure (key 3)")
+	}
+	idx++
+	// Skip evidence type (uint16 = 3 bytes: 0x19 + 2 bytes)
+	idx += 3
+	// Now at key 4
+	if idx >= len(evidence) || evidence[idx] != 0x04 {
+		return fmt.Errorf("invalid CBOR structure (key 4)")
+	}
+	idx++
+	// Parse text string (0x78 = text string with 2-byte length)
+	if idx >= len(evidence) || evidence[idx] != 0x78 {
+		return fmt.Errorf("invalid ROT name encoding")
+	}
+	idx++
+	if idx+2 > len(evidence) {
+		return fmt.Errorf("invalid ROT name length")
+	}
+	rotNameLen := int(evidence[idx])<<8 | int(evidence[idx+1])
+	idx += 2
+	if idx+rotNameLen > len(evidence) {
+		return fmt.Errorf("ROT name length mismatch")
+	}
+	rotName := string(evidence[idx : idx+rotNameLen])
+
+	// Verify ROT is trusted
+	if len(trustedROTs) == 0 {
+		return fmt.Errorf("no trusted ROTs configured")
+	}
+	rotTrusted := false
+	for _, trustedROT := range trustedROTs {
+		if rotName == trustedROT {
+			rotTrusted = true
+			break
+		}
+	}
+	if !rotTrusted {
+		return fmt.Errorf("ROT %q not in trusted list", rotName)
+	}
+
 	return nil
 }
 
@@ -104,9 +178,9 @@ func newBadAttestationProvider(corruption string) *badAttestationProvider {
 	}
 }
 
-func (b *badAttestationProvider) GenerateEvidence(attestationMainSecret []byte, publicKeyDER []byte, evidenceType EvidenceType) ([]byte, error) {
+func (b *badAttestationProvider) GenerateEvidence(attestationMainSecret []byte, publicKeyDER []byte, evidenceType EvidenceType, rotName string) ([]byte, error) {
 	// Generate valid evidence first
-	evidence, err := b.goodProvider.GenerateEvidence(attestationMainSecret, publicKeyDER, evidenceType)
+	evidence, err := b.goodProvider.GenerateEvidence(attestationMainSecret, publicKeyDER, evidenceType, rotName)
 	if err != nil {
 		return nil, err
 	}
@@ -178,9 +252,9 @@ func (b *badAttestationProvider) GenerateEvidence(attestationMainSecret []byte, 
 	return evidence, nil
 }
 
-func (b *badAttestationProvider) VerifyEvidence(evidence []byte, attestationMainSecret []byte, publicKeyDER []byte, evidenceType EvidenceType) error {
+func (b *badAttestationProvider) VerifyEvidence(evidence []byte, attestationMainSecret []byte, publicKeyDER []byte, evidenceType EvidenceType, trustedROTs []string) error {
 	// Always use the good provider for verification (we want it to fail)
-	return b.goodProvider.VerifyEvidence(evidence, attestationMainSecret, publicKeyDER, evidenceType)
+	return b.goodProvider.VerifyEvidence(evidence, attestationMainSecret, publicKeyDER, evidenceType, trustedROTs)
 }
 
 func TestMarshalPublicKeyToDER(t *testing.T) {
@@ -284,22 +358,39 @@ func TestAttestationClientToServer(t *testing.T) {
 		},
 	}
 
+	// Create client certificate for attestation
+	clientKey, clientCert, err := MakeNewSelfSignedCert("client.example.com", ECDSA_P256_SHA256)
+	assertNotError(t, err, "Failed to create client certificate")
+	clientCertificates := []*Certificate{
+		{
+			Chain:      []*x509.Certificate{clientCert},
+			PrivateKey: clientKey,
+		},
+	}
+
 	testProvider := newTestAttestationProvider()
 	clientConfig := &Config{
 		ServerName:         "example.com",
+		Certificates:       clientCertificates,
 		InsecureSkipVerify: true,
 		Attestation: AttestationConfig{
-			Enabled:  true,
-			Provider: testProvider,
+			Enabled:     true,
+			Provider:    testProvider,
+			MyROT:       "client-rot",
+			TrustedROTs: []string{"server-rot"},
 		},
 		// Client will propose evidence (evidence_proposal extension)
 	}
 	serverConfig := &Config{
-		Certificates: testCertificates,
+		Certificates:       testCertificates,
+		RequireClientAuth:  true, // Server requires client certificate (needed for client attestation)
+		InsecureSkipVerify: true,
 		Attestation: AttestationConfig{
 			Enabled:     true,
 			RequestPeer: true, // Server requests evidence from client
 			Provider:    testProvider,
+			MyROT:       "server-rot",
+			TrustedROTs: []string{"client-rot"},
 		},
 	}
 
@@ -345,13 +436,17 @@ func TestAttestationServerToClient(t *testing.T) {
 			Enabled:     true,
 			RequestPeer: true, // Client requests evidence from server
 			Provider:    testProvider,
+			MyROT:       "client-rot",
+			TrustedROTs: []string{"server-rot"},
 		},
 	}
 	serverConfig := &Config{
 		Certificates: testCertificates,
 		Attestation: AttestationConfig{
-			Enabled:  true,
-			Provider: testProvider,
+			Enabled:     true,
+			Provider:    testProvider,
+			MyROT:       "server-rot",
+			TrustedROTs: []string{"client-rot"},
 		},
 		// Server will provide evidence when requested
 	}
@@ -390,23 +485,40 @@ func TestAttestationBidirectional(t *testing.T) {
 		},
 	}
 
+	// Create client certificate for client attestation
+	clientKey, clientCert, err := MakeNewSelfSignedCert("client.example.com", ECDSA_P256_SHA256)
+	assertNotError(t, err, "Failed to create client certificate")
+	clientCertificates := []*Certificate{
+		{
+			Chain:      []*x509.Certificate{clientCert},
+			PrivateKey: clientKey,
+		},
+	}
+
 	testProvider := newTestAttestationProvider()
 	clientConfig := &Config{
 		ServerName:         "example.com",
+		Certificates:       clientCertificates,
 		InsecureSkipVerify: true,
 		Attestation: AttestationConfig{
 			Enabled:     true,
 			RequestPeer: true, // Client requests evidence from server
 			Provider:    testProvider,
+			MyROT:       "client-rot",
+			TrustedROTs: []string{"server-rot"},
 		},
 		// Client will also propose evidence
 	}
 	serverConfig := &Config{
-		Certificates: testCertificates,
+		Certificates:       testCertificates,
+		RequireClientAuth:  true, // Server requires client certificate (needed for client attestation)
+		InsecureSkipVerify: true,
 		Attestation: AttestationConfig{
 			Enabled:     true,
 			RequestPeer: true, // Server requests evidence from client
 			Provider:    testProvider,
+			MyROT:       "server-rot",
+			TrustedROTs: []string{"client-rot"},
 		},
 		// Server will also provide evidence when requested
 	}
@@ -502,13 +614,17 @@ func TestAttestationClientRequiresServerEvidence(t *testing.T) {
 			RequestPeer: true,
 			RequirePeer: true, // Client requires evidence
 			Provider:    testProvider,
+			MyROT:       "client-rot",
+			TrustedROTs: []string{"server-rot"},
 		},
 	}
 	serverConfig := &Config{
 		Certificates: testCertificates,
 		Attestation: AttestationConfig{
-			Enabled:  true,
-			Provider: testProvider,
+			Enabled:     true,
+			Provider:    testProvider,
+			MyROT:       "server-rot",
+			TrustedROTs: []string{"client-rot"},
 		},
 		// Server will provide evidence when requested
 	}
@@ -684,8 +800,10 @@ func TestAttestationServerInvalidEvidence(t *testing.T) {
 	serverConfig := &Config{
 		Certificates: testCertificates,
 		Attestation: AttestationConfig{
-			Enabled:  true,
-			Provider: serverProvider,
+			Enabled:     true,
+			Provider:    serverProvider,
+			MyROT:       "server-rot",
+			TrustedROTs: []string{"client-rot"},
 		},
 	}
 
@@ -698,6 +816,8 @@ func TestAttestationServerInvalidEvidence(t *testing.T) {
 			Enabled:     true,
 			RequestPeer: true, // Client requests evidence from server
 			Provider:    clientProvider,
+			MyROT:       "client-rot",
+			TrustedROTs: []string{"server-rot"},
 		},
 	}
 
@@ -753,6 +873,8 @@ func TestAttestationClientWrongPublicKey(t *testing.T) {
 			Enabled:     true,
 			RequestPeer: true,
 			Provider:    serverProvider,
+			MyROT:       "server-rot",
+			TrustedROTs: []string{"client-rot"},
 		},
 	}
 
@@ -763,8 +885,10 @@ func TestAttestationClientWrongPublicKey(t *testing.T) {
 		Certificates:       clientCertificates,
 		InsecureSkipVerify: true,
 		Attestation: AttestationConfig{
-			Enabled:  true,
-			Provider: clientProvider,
+			Enabled:     true,
+			Provider:    clientProvider,
+			MyROT:       "client-rot",
+			TrustedROTs: []string{"server-rot"},
 		},
 	}
 
@@ -819,6 +943,8 @@ func TestAttestationClientInvalidCBOR(t *testing.T) {
 			Enabled:     true,
 			RequestPeer: true,
 			Provider:    serverProvider,
+			MyROT:       "server-rot",
+			TrustedROTs: []string{"client-rot"},
 		},
 	}
 
@@ -829,8 +955,10 @@ func TestAttestationClientInvalidCBOR(t *testing.T) {
 		Certificates:       clientCertificates,
 		InsecureSkipVerify: true,
 		Attestation: AttestationConfig{
-			Enabled:  true,
-			Provider: clientProvider,
+			Enabled:     true,
+			Provider:    clientProvider,
+			MyROT:       "client-rot",
+			TrustedROTs: []string{"server-rot"},
 		},
 	}
 
@@ -871,8 +999,10 @@ func TestAttestationServerWrongSecret(t *testing.T) {
 	serverConfig := &Config{
 		Certificates: testCertificates,
 		Attestation: AttestationConfig{
-			Enabled:  true,
-			Provider: serverProvider,
+			Enabled:     true,
+			Provider:    serverProvider,
+			MyROT:       "server-rot",
+			TrustedROTs: []string{"client-rot"},
 		},
 	}
 
@@ -884,6 +1014,8 @@ func TestAttestationServerWrongSecret(t *testing.T) {
 			Enabled:     true,
 			RequestPeer: true,
 			Provider:    clientProvider,
+			MyROT:       "client-rot",
+			TrustedROTs: []string{"server-rot"},
 		},
 	}
 

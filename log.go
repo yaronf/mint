@@ -15,6 +15,7 @@ const logConfigVar = "MINT_LOG"
 const (
 	logTypeCrypto      = "crypto"
 	logTypeHandshake   = "handshake"
+	logTypeAttestation = "attestation"
 	logTypeNegotiation = "negotiation"
 	logTypeIO          = "io"
 	logTypeFrameReader = "frame"

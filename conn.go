@@ -22,11 +22,14 @@ type Certificate struct {
 type AttestationConfig struct {
 	Enabled  bool
 	Provider interface {
-		GenerateEvidence(attestationMainSecret []byte, publicKeyDER []byte, evidenceType EvidenceType) ([]byte, error)
-		VerifyEvidence(evidence []byte, attestationMainSecret []byte, publicKeyDER []byte, evidenceType EvidenceType) error
+		GenerateEvidence(attestationMainSecret []byte, publicKeyDER []byte, evidenceType EvidenceType, rotName string) ([]byte, error)
+		VerifyEvidence(evidence []byte, attestationMainSecret []byte, publicKeyDER []byte, evidenceType EvidenceType, trustedROTs []string) error
 	}
-	RequestPeer            bool // Request evidence from peer (client requests from server, server requests from client)
-	RequirePeer            bool // Require evidence from peer (abort handshake if peer doesn't provide evidence)
+	// Root of Trust configuration - simulation - eventually will be replaced with a real ROT (trust store)
+	MyROT                  string   // Root of Trust name this peer uses to sign evidence
+	TrustedROTs            []string // List of Root of Trust names we trust from peers
+	RequestPeer            bool     // Request evidence from peer (client requests from server, server requests from client)
+	RequirePeer            bool     // Require evidence from peer (abort handshake if peer doesn't provide evidence)
 	SupportedEvidenceTypes []EvidenceType
 }
 

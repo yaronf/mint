@@ -14,6 +14,9 @@ type CMWPayload struct {
 
 	// Evidence type content format
 	EvidenceType uint16 `cbor:"3,keyasint" json:"evidence_type"`
+
+	// Root of Trust name that signed this evidence
+	ROTName string `cbor:"4,keyasint" json:"rot_name"`
 }
 
 // encodePayload encodes the CMWPayload to CBOR format
