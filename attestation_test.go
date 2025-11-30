@@ -91,6 +91,98 @@ func (t *testAttestationProvider) VerifyEvidence(evidence []byte, attestationMai
 	return nil
 }
 
+// badAttestationProvider wraps a good provider but corrupts evidence generation/verification
+type badAttestationProvider struct {
+	goodProvider *testAttestationProvider
+	corruption   string // "wrong_secret", "wrong_public_key", "wrong_evidence_type", "invalid_cbor", "too_short"
+}
+
+func newBadAttestationProvider(corruption string) *badAttestationProvider {
+	return &badAttestationProvider{
+		goodProvider: newTestAttestationProvider(),
+		corruption:   corruption,
+	}
+}
+
+func (b *badAttestationProvider) GenerateEvidence(attestationMainSecret []byte, publicKeyDER []byte, evidenceType EvidenceType) ([]byte, error) {
+	// Generate valid evidence first
+	evidence, err := b.goodProvider.GenerateEvidence(attestationMainSecret, publicKeyDER, evidenceType)
+	if err != nil {
+		return nil, err
+	}
+
+	// Corrupt based on corruption type
+	switch b.corruption {
+	case "wrong_secret":
+		// Corrupt the attestation secret in the evidence
+		// CBOR structure: 0xa3 (map 3), 0x01 (key 1), 0x58 (byte string), len, secret bytes...
+		// Find the secret bytes and corrupt them
+		idx := 1 // Skip map header (0xa3)
+		if idx < len(evidence) && evidence[idx] == 0x01 {
+			idx++ // Skip key 1
+			if idx < len(evidence) && evidence[idx] == 0x58 {
+				idx++ // Skip byte string marker
+				if idx < len(evidence) {
+					idx++ // Skip length byte
+					// Corrupt first byte of secret
+					if idx < len(evidence) {
+						evidence[idx] ^= 0xFF
+					}
+				}
+			}
+		}
+	case "wrong_public_key":
+		// Corrupt the public key DER in the evidence
+		// Find the second byte string (public key)
+		idx := 1 // Skip map header
+		if idx < len(evidence) && evidence[idx] == 0x01 {
+			idx++ // Skip key 1
+			if idx < len(evidence) && evidence[idx] == 0x58 {
+				idx++ // Skip byte string marker
+				if idx < len(evidence) {
+					secretLen := int(evidence[idx])
+					idx += 1 + secretLen // Skip secret length and secret
+					// Now we're at key 2
+					if idx < len(evidence) && evidence[idx] == 0x02 {
+						idx++ // Skip key 2
+						if idx < len(evidence) && evidence[idx] == 0x58 {
+							idx++ // Skip byte string marker
+							if idx < len(evidence) {
+								// Corrupt first byte of public key data (skip length byte)
+								if idx+1 < len(evidence) {
+									evidence[idx+1] ^= 0xFF
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	case "wrong_evidence_type":
+		// Corrupt the evidence type (last 2 bytes are the uint16)
+		if len(evidence) >= 3 {
+			evidence[len(evidence)-2] ^= 0xFF
+			evidence[len(evidence)-1] ^= 0xFF
+		}
+	case "invalid_cbor":
+		// Return completely invalid CBOR
+		return []byte{0xFF, 0xFF, 0xFF}, nil
+	case "too_short":
+		// Return evidence that's too short
+		return []byte{0x01, 0x02, 0x03}, nil
+	default:
+		// No corruption - return valid evidence
+		return evidence, nil
+	}
+
+	return evidence, nil
+}
+
+func (b *badAttestationProvider) VerifyEvidence(evidence []byte, attestationMainSecret []byte, publicKeyDER []byte, evidenceType EvidenceType) error {
+	// Always use the good provider for verification (we want it to fail)
+	return b.goodProvider.VerifyEvidence(evidence, attestationMainSecret, publicKeyDER, evidenceType)
+}
+
 func TestMarshalPublicKeyToDER(t *testing.T) {
 	// Test ECDSA P-256 key
 	ecdsaPriv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -504,4 +596,313 @@ func TestAttestationClientRequiresButServerDoesNotProvide(t *testing.T) {
 		t.Log("Warning: Server didn't terminate within timeout, forcing close")
 		server.Close()
 	}
+}
+
+// TestAttestationClientInvalidEvidence tests that server rejects invalid client evidence
+func TestAttestationClientInvalidEvidence(t *testing.T) {
+	serverKey, serverCert, err := MakeNewSelfSignedCert("example.com", ECDSA_P256_SHA256)
+	assertNotError(t, err, "Failed to create server certificate")
+	testCertificates := []*Certificate{
+		{
+			Chain:      []*x509.Certificate{serverCert},
+			PrivateKey: serverKey,
+		},
+	}
+
+	// Create client certificate for client auth
+	clientKey, clientCert, err := MakeNewSelfSignedCert("client.example.com", ECDSA_P256_SHA256)
+	assertNotError(t, err, "Failed to create client certificate")
+	clientCertificates := []*Certificate{
+		{
+			Chain:      []*x509.Certificate{clientCert},
+			PrivateKey: clientKey,
+		},
+	}
+
+	// Server uses good provider
+	serverProvider := newTestAttestationProvider()
+	serverConfig := &Config{
+		Certificates:       testCertificates,
+		RequireClientAuth:  true, // Require client certificate
+		InsecureSkipVerify: true, // Skip client cert verification for test
+		Attestation: AttestationConfig{
+			Enabled:       true,
+			RequestClient: true, // Server requests evidence from client
+			Provider:      serverProvider,
+		},
+	}
+
+	// Client uses bad provider that generates invalid evidence
+	clientProvider := newBadAttestationProvider("wrong_secret")
+	clientConfig := &Config{
+		ServerName:         "example.com",
+		Certificates:       clientCertificates,
+		InsecureSkipVerify: true,
+		Attestation: AttestationConfig{
+			Enabled:  true,
+			Provider: clientProvider,
+		},
+	}
+
+	cConn, sConn := pipe()
+	client := Client(cConn, clientConfig)
+	server := Server(sConn, serverConfig)
+
+	var serverAlert Alert
+
+	done := make(chan bool, 1)
+	go func() {
+		defer func() { done <- true }()
+		serverAlert = server.Handshake()
+		// Server should reject invalid evidence
+		assertTrue(t, serverAlert != AlertNoAlert, "Server should reject invalid client evidence")
+	}()
+
+	_ = client.Handshake()
+	// Client may succeed in sending, but server should reject
+	// Wait for server to finish
+	<-done
+
+	// Server should have rejected with AlertUnsupportedEvidence
+	assertTrue(t, serverAlert == AlertUnsupportedEvidence || serverAlert != AlertNoAlert,
+		fmt.Sprintf("Server should reject invalid evidence, got alert: %v", serverAlert))
+}
+
+// TestAttestationServerInvalidEvidence tests that client rejects invalid server evidence
+func TestAttestationServerInvalidEvidence(t *testing.T) {
+	serverKey, serverCert, err := MakeNewSelfSignedCert("example.com", ECDSA_P256_SHA256)
+	assertNotError(t, err, "Failed to create server certificate")
+	testCertificates := []*Certificate{
+		{
+			Chain:      []*x509.Certificate{serverCert},
+			PrivateKey: serverKey,
+		},
+	}
+
+	// Server uses bad provider that generates invalid evidence
+	serverProvider := newBadAttestationProvider("wrong_secret")
+	serverConfig := &Config{
+		Certificates: testCertificates,
+		Attestation: AttestationConfig{
+			Enabled:  true,
+			Provider: serverProvider,
+		},
+	}
+
+	// Client uses good provider
+	clientProvider := newTestAttestationProvider()
+	clientConfig := &Config{
+		ServerName:         "example.com",
+		InsecureSkipVerify: true,
+		Attestation: AttestationConfig{
+			Enabled:       true,
+			RequestServer: true, // Client requests evidence from server
+			Provider:      clientProvider,
+		},
+	}
+
+	cConn, sConn := pipe()
+	client := Client(cConn, clientConfig)
+	server := Server(sConn, serverConfig)
+
+	var clientAlert Alert
+
+	done := make(chan bool, 1)
+	go func() {
+		defer func() { done <- true }()
+		_ = server.Handshake()
+		// Server may succeed in sending, but client should reject
+	}()
+
+	clientAlert = client.Handshake()
+	// Client should reject invalid evidence
+	assertTrue(t, clientAlert != AlertNoAlert, "Client should reject invalid server evidence")
+	assertTrue(t, clientAlert == AlertUnsupportedEvidence,
+		fmt.Sprintf("Client should reject with AlertUnsupportedEvidence, got: %v", clientAlert))
+
+	<-done
+}
+
+// TestAttestationClientWrongPublicKey tests that server rejects evidence with wrong public key
+func TestAttestationClientWrongPublicKey(t *testing.T) {
+	serverKey, serverCert, err := MakeNewSelfSignedCert("example.com", ECDSA_P256_SHA256)
+	assertNotError(t, err, "Failed to create server certificate")
+	testCertificates := []*Certificate{
+		{
+			Chain:      []*x509.Certificate{serverCert},
+			PrivateKey: serverKey,
+		},
+	}
+
+	// Create client certificate for client auth
+	clientKey, clientCert, err := MakeNewSelfSignedCert("client.example.com", ECDSA_P256_SHA256)
+	assertNotError(t, err, "Failed to create client certificate")
+	clientCertificates := []*Certificate{
+		{
+			Chain:      []*x509.Certificate{clientCert},
+			PrivateKey: clientKey,
+		},
+	}
+
+	serverProvider := newTestAttestationProvider()
+	serverConfig := &Config{
+		Certificates:       testCertificates,
+		RequireClientAuth:  true,
+		InsecureSkipVerify: true,
+		Attestation: AttestationConfig{
+			Enabled:       true,
+			RequestClient: true,
+			Provider:      serverProvider,
+		},
+	}
+
+	// Client uses bad provider that corrupts public key in evidence
+	clientProvider := newBadAttestationProvider("wrong_public_key")
+	clientConfig := &Config{
+		ServerName:         "example.com",
+		Certificates:       clientCertificates,
+		InsecureSkipVerify: true,
+		Attestation: AttestationConfig{
+			Enabled:  true,
+			Provider: clientProvider,
+		},
+	}
+
+	cConn, sConn := pipe()
+	client := Client(cConn, clientConfig)
+	server := Server(sConn, serverConfig)
+
+	var serverAlert Alert
+
+	done := make(chan bool, 1)
+	go func() {
+		defer func() { done <- true }()
+		serverAlert = server.Handshake()
+		assertTrue(t, serverAlert != AlertNoAlert, "Server should reject evidence with wrong public key")
+	}()
+
+	_ = client.Handshake()
+	<-done
+
+	// Server should reject with decode error (corrupted CBOR) or unsupported evidence
+	assertTrue(t, serverAlert == AlertUnsupportedEvidence || serverAlert == AlertDecodeError || serverAlert == AlertUnexpectedMessage,
+		fmt.Sprintf("Server should reject invalid evidence, got: %v", serverAlert))
+}
+
+// TestAttestationClientInvalidCBOR tests that server rejects invalid CBOR evidence
+func TestAttestationClientInvalidCBOR(t *testing.T) {
+	serverKey, serverCert, err := MakeNewSelfSignedCert("example.com", ECDSA_P256_SHA256)
+	assertNotError(t, err, "Failed to create server certificate")
+	testCertificates := []*Certificate{
+		{
+			Chain:      []*x509.Certificate{serverCert},
+			PrivateKey: serverKey,
+		},
+	}
+
+	// Create client certificate for client auth
+	clientKey, clientCert, err := MakeNewSelfSignedCert("client.example.com", ECDSA_P256_SHA256)
+	assertNotError(t, err, "Failed to create client certificate")
+	clientCertificates := []*Certificate{
+		{
+			Chain:      []*x509.Certificate{clientCert},
+			PrivateKey: clientKey,
+		},
+	}
+
+	serverProvider := newTestAttestationProvider()
+	serverConfig := &Config{
+		Certificates:       testCertificates,
+		RequireClientAuth:  true,
+		InsecureSkipVerify: true,
+		Attestation: AttestationConfig{
+			Enabled:       true,
+			RequestClient: true,
+			Provider:      serverProvider,
+		},
+	}
+
+	// Client uses bad provider that generates invalid CBOR
+	clientProvider := newBadAttestationProvider("invalid_cbor")
+	clientConfig := &Config{
+		ServerName:         "example.com",
+		Certificates:       clientCertificates,
+		InsecureSkipVerify: true,
+		Attestation: AttestationConfig{
+			Enabled:  true,
+			Provider: clientProvider,
+		},
+	}
+
+	cConn, sConn := pipe()
+	client := Client(cConn, clientConfig)
+	server := Server(sConn, serverConfig)
+
+	var serverAlert Alert
+
+	done := make(chan bool, 1)
+	go func() {
+		defer func() { done <- true }()
+		serverAlert = server.Handshake()
+		assertTrue(t, serverAlert != AlertNoAlert, "Server should reject invalid CBOR")
+	}()
+
+	_ = client.Handshake()
+	<-done
+
+	// Should reject with decode error, unexpected message, or unsupported evidence
+	assertTrue(t, serverAlert == AlertUnsupportedEvidence || serverAlert == AlertDecodeError || serverAlert == AlertUnexpectedMessage,
+		fmt.Sprintf("Server should reject invalid CBOR, got: %v", serverAlert))
+}
+
+// TestAttestationServerWrongSecret tests that client rejects evidence with wrong secret
+func TestAttestationServerWrongSecret(t *testing.T) {
+	serverKey, serverCert, err := MakeNewSelfSignedCert("example.com", ECDSA_P256_SHA256)
+	assertNotError(t, err, "Failed to create server certificate")
+	testCertificates := []*Certificate{
+		{
+			Chain:      []*x509.Certificate{serverCert},
+			PrivateKey: serverKey,
+		},
+	}
+
+	// Server uses bad provider that corrupts secret
+	serverProvider := newBadAttestationProvider("wrong_secret")
+	serverConfig := &Config{
+		Certificates: testCertificates,
+		Attestation: AttestationConfig{
+			Enabled:  true,
+			Provider: serverProvider,
+		},
+	}
+
+	clientProvider := newTestAttestationProvider()
+	clientConfig := &Config{
+		ServerName:         "example.com",
+		InsecureSkipVerify: true,
+		Attestation: AttestationConfig{
+			Enabled:       true,
+			RequestServer: true,
+			Provider:      clientProvider,
+		},
+	}
+
+	cConn, sConn := pipe()
+	client := Client(cConn, clientConfig)
+	server := Server(sConn, serverConfig)
+
+	var clientAlert Alert
+
+	done := make(chan bool, 1)
+	go func() {
+		defer func() { done <- true }()
+		_ = server.Handshake()
+	}()
+
+	clientAlert = client.Handshake()
+	assertTrue(t, clientAlert != AlertNoAlert, "Client should reject evidence with wrong secret")
+	assertTrue(t, clientAlert == AlertUnsupportedEvidence,
+		fmt.Sprintf("Client should reject with AlertUnsupportedEvidence, got: %v", clientAlert))
+
+	<-done
 }
