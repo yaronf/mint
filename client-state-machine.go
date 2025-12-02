@@ -685,34 +685,13 @@ func (state clientStateWaitEE) Next(hr handshakeMessageReader) (HandshakeState, 
 
 	state.handshakeHash.Write(hm.Marshal())
 
-	// If server is providing evidence, derive server attestation main secret and read Attestation message
+	// If server is providing evidence, derive server attestation main secret
+	// Attestation will come after CertVerify (not after EncryptedExtensions)
 	if state.Params.ClientRequestedEvidence {
 		// Derive server attestation main secret using h2 (transcript hash up to ServerHello)
 		state.serverAttestationMainSecret = DeriveAttestationMainSecret(state.cryptoParams, state.masterSecret, h2, false)
 		logf(logTypeCrypto, "server attestation main secret: [%d] %x", len(state.serverAttestationMainSecret), state.serverAttestationMainSecret)
-
-		attHm, alert := hr.ReadMessage()
-		if alert != AlertNoAlert {
-			return nil, nil, alert
-		}
-		if attHm == nil || attHm.msgType != HandshakeTypeAttestation {
-			logf(logTypeAttestation, "[ClientStateWaitEE] Expected Attestation message after EncryptedExtensions (sending alert: unexpected message)")
-			return nil, nil, AlertUnexpectedMessage
-		}
-
-		att := &AttestationBody{}
-		if err := safeUnmarshal(att, attHm.body); err != nil {
-			logf(logTypeAttestation, "[ClientStateWaitEE] Error decoding Attestation message: %v", err)
-			return nil, nil, AlertDecodeError
-		}
-
-		logf(logTypeAttestation, "[ClientStateWaitEE] Received server attestation evidence, will verify after certificate")
-
-		// Store attestation evidence for verification after server certificate is received
-		// We can't verify yet because we need the server's public key from the Certificate message
-		state.serverAttestationEvidence = att.CMWPayload
-
-		state.handshakeHash.Write(attHm.Marshal())
+		// Attestation will be read after CertVerify
 	}
 
 	toSend := []HandshakeAction{}
@@ -990,6 +969,32 @@ func (state clientStateWaitCV) Next(hr handshakeMessageReader) (HandshakeState, 
 		}
 	}
 
+	// Record CertVerify in transcript hash
+	state.handshakeHash.Write(hm.Marshal())
+
+	// If server is providing evidence, read Attestation message after CertVerify
+	// Attestation appears after CertVerify and before Finished
+	if state.Params.ClientRequestedEvidence && len(state.serverAttestationEvidence) == 0 {
+		attHm, alert := hr.ReadMessage()
+		if alert != AlertNoAlert {
+			return nil, nil, alert
+		}
+		if attHm == nil || attHm.msgType != HandshakeTypeAttestation {
+			logf(logTypeAttestation, "[ClientStateWaitCV] Expected Attestation message after CertVerify (sending alert: unexpected message)")
+			return nil, nil, AlertUnexpectedMessage
+		}
+
+		att := &AttestationBody{}
+		if err := safeUnmarshal(att, attHm.body); err != nil {
+			logf(logTypeAttestation, "[ClientStateWaitCV] Error decoding Attestation message: %v", err)
+			return nil, nil, AlertDecodeError
+		}
+
+		logf(logTypeAttestation, "[ClientStateWaitCV] Received server attestation evidence after CertVerify, verifying...")
+		state.serverAttestationEvidence = att.CMWPayload
+		state.handshakeHash.Write(attHm.Marshal())
+	}
+
 	// Verify server attestation evidence if it was received
 	if len(state.serverAttestationEvidence) > 0 {
 		if state.Config.Attestation.Provider == nil {
@@ -1025,8 +1030,6 @@ func (state clientStateWaitCV) Next(hr handshakeMessageReader) (HandshakeState, 
 		}
 		logf(logTypeAttestation, "[ClientStateWaitCV] Server attestation verified successfully")
 	}
-
-	state.handshakeHash.Write(hm.Marshal())
 
 	logf(logTypeHandshake, "[ClientStateWaitCV] -> [ClientStateWaitFinished]")
 	nextState := clientStateWaitFinished{
@@ -1188,7 +1191,28 @@ func (state clientStateWaitFinished) Next(hr handshakeMessageReader) (HandshakeS
 			toSend = append(toSend, QueueHandshakeMessage{certm})
 			state.handshakeHash.Write(certm.Marshal())
 
+			hcv := state.handshakeHash.Sum(nil)
+			logf(logTypeHandshake, "Handshake Hash to be verified: [%d] %x", len(hcv), hcv)
+
+			certificateVerify := &CertificateVerifyBody{Algorithm: certScheme}
+			logf(logTypeHandshake, "Creating CertVerify: %04x %v", certScheme, state.cryptoParams.Hash)
+
+			err = certificateVerify.Sign(cert.PrivateKey, hcv)
+			if err != nil {
+				logf(logTypeHandshake, "[ClientStateWaitFinished] Error signing CertificateVerify [%v]", err)
+				return nil, nil, AlertInternalError
+			}
+			certvm, err := state.hsCtx.hOut.HandshakeMessageFromBody(certificateVerify)
+			if err != nil {
+				logf(logTypeHandshake, "[ClientStateWaitFinished] Error marshaling CertificateVerify [%v]", err)
+				return nil, nil, AlertInternalError
+			}
+
+			toSend = append(toSend, QueueHandshakeMessage{certvm})
+			state.handshakeHash.Write(certvm.Marshal())
+
 			// Send Attestation message if server requested evidence
+			// Attestation appears after CertVerify and before Finished
 			if state.Params.ServerRequestedEvidence {
 				// Get public key from certificate and marshal to DER
 				publicKeyDER, err := MarshalPublicKeyToDER(cert.PrivateKey.Public())
@@ -1224,30 +1248,10 @@ func (state clientStateWaitFinished) Next(hr handshakeMessageReader) (HandshakeS
 					logf(logTypeAttestation, "[ClientStateWaitFinished] Error marshaling Attestation: %v", err)
 					return nil, nil, AlertInternalError
 				}
-				logf(logTypeAttestation, "[ClientStateWaitFinished] Sending client attestation evidence (ROT: %s)", state.Config.Attestation.MyROT)
+				logf(logTypeAttestation, "[ClientStateWaitFinished] Sending client attestation evidence after CertVerify (ROT: %s)", state.Config.Attestation.MyROT)
 				toSend = append(toSend, QueueHandshakeMessage{attm})
 				state.handshakeHash.Write(attm.Marshal())
 			}
-
-			hcv := state.handshakeHash.Sum(nil)
-			logf(logTypeHandshake, "Handshake Hash to be verified: [%d] %x", len(hcv), hcv)
-
-			certificateVerify := &CertificateVerifyBody{Algorithm: certScheme}
-			logf(logTypeHandshake, "Creating CertVerify: %04x %v", certScheme, state.cryptoParams.Hash)
-
-			err = certificateVerify.Sign(cert.PrivateKey, hcv)
-			if err != nil {
-				logf(logTypeHandshake, "[ClientStateWaitFinished] Error signing CertificateVerify [%v]", err)
-				return nil, nil, AlertInternalError
-			}
-			certvm, err := state.hsCtx.hOut.HandshakeMessageFromBody(certificateVerify)
-			if err != nil {
-				logf(logTypeHandshake, "[ClientStateWaitFinished] Error marshaling CertificateVerify [%v]", err)
-				return nil, nil, AlertInternalError
-			}
-
-			toSend = append(toSend, QueueHandshakeMessage{certvm})
-			state.handshakeHash.Write(certvm.Marshal())
 		}
 	}
 
