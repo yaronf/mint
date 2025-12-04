@@ -457,7 +457,7 @@ func (r *DefaultRecordLayer) nextRecord(allowOldEpoch bool) (*TLSPlaintext, erro
 	// Therefore, we don't need locks in nextRecord() for TLS!
 
 	var seq uint64
-	var cipher *cipherState
+	cipher := r.cipher
 	if r.datagram {
 		// TODO(ekr@rtfm.com): Handle duplicates.
 		seq, _ = decodeUint(header[3:11], 8)
@@ -466,12 +466,20 @@ func (r *DefaultRecordLayer) nextRecord(allowOldEpoch bool) (*TLSPlaintext, erro
 		// Look up the cipher suite from the epoch
 		c, ok := r.readCiphers[epoch]
 		if !ok {
+			logf(logTypeIO, "%s Message from unknown epoch: [%v]", r.label, epoch)
 			return nil, AlertWouldBlock
 		}
-		cipher = c
+
+		if epoch != cipher.epoch {
+			logf(logTypeIO, "%s Message from non-current epoch: [%v != %v] out-of-epoch reads=%v", r.label, epoch,
+				cipher.epoch, allowOldEpoch)
+			if !allowOldEpoch {
+				return nil, AlertWouldBlock
+			}
+			cipher = c
+		}
 	} else {
 		// For TLS, use current cipher state
-		cipher = r.cipher
 		if cipher == nil {
 			return nil, fmt.Errorf("tls.record: cipher state is nil")
 		}
