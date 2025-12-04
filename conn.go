@@ -1262,7 +1262,20 @@ func (c *Conn) controllerLoop() {
 
 		case <-c.closed:
 			// Application closed connection
-			logf(logTypeHandshake, "%s controllerLoop: closed signal received", c.label())
+			logf(logTypeHandshake, "%s controllerLoop: closed signal received, checking for pending commands", c.label())
+			// Check if there's a pending close command before returning
+			select {
+			case cmd := <-c.commands:
+				if cmd.cmdType == cmdClose {
+					logf(logTypeHandshake, "%s controllerLoop: processing pending close command", c.label())
+					c.handleCloseCommand(cmd)
+				} else {
+					// Other command - send error
+					cmd.result <- commandResult{err: io.EOF}
+				}
+			default:
+				// No pending commands
+			}
 			return
 		}
 	}

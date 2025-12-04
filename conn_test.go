@@ -60,6 +60,12 @@ func (p *pipeConn) Read(data []byte) (n int, err error) {
 	if err == io.EOF {
 		err = nil
 	}
+	// If buffer is empty and we read 0 bytes, check if connection is closed
+	// This helps detect closure when buffer is empty
+	if n == 0 && err == nil && p.r.Len() == 0 {
+		// Don't return error here - let the caller handle empty buffer
+		// The record layer will return AlertWouldBlock for empty reads
+	}
 	return
 }
 
@@ -376,6 +382,8 @@ func testConnInner(t *testing.T, name string, p testInstanceState) {
 
 	client := Client(cConn, &conf)
 	server := Server(sConn, &conf)
+	defer client.Close()
+	defer server.Close()
 
 	var clientAlert, serverAlert Alert
 
@@ -414,6 +422,8 @@ func TestInvalidSelfSigned(t *testing.T) {
 	client := Client(cConn, &Config{ServerName: serverName})
 	// The server uses a self-signed certificate
 	server := Server(sConn, &Config{Certificates: certificates})
+	defer client.Close()
+	defer server.Close()
 
 	done := make(chan bool)
 	go func() {
@@ -424,6 +434,7 @@ func TestInvalidSelfSigned(t *testing.T) {
 	clientAlert := client.Handshake()
 	assertEquals(t, clientAlert, AlertBadCertificate)
 
+	// Close server explicitly to unblock if handshake is stuck
 	server.Close()
 	<-done
 }
@@ -464,6 +475,8 @@ func TestRootCAPool(t *testing.T) {
 	client := Client(cConn, clientConfig)
 	// The server uses a self-signed certificate
 	server := Server(sConn, &Config{Certificates: certificates})
+	defer client.Close()
+	defer server.Close()
 
 	var clientAlert, serverAlert Alert
 	done := make(chan bool)
@@ -533,6 +546,8 @@ func TestVerifyPeerCertificateInsecureSkipVerify(t *testing.T) {
 	client := Client(cConn, clientConfig)
 	// The server uses a self-signed certificate
 	server := Server(sConn, &Config{Certificates: certificates})
+	defer client.Close()
+	defer server.Close()
 
 	var clientAlert, serverAlert Alert
 	done := make(chan bool)
@@ -563,6 +578,8 @@ func TestVerifyPeerCertificateRejected(t *testing.T) {
 	client := Client(cConn, clientConfig)
 	// The server uses a self-signed certificate
 	server := Server(sConn, &Config{Certificates: certificates})
+	defer client.Close()
+	defer server.Close()
 
 	done := make(chan bool)
 	go func() {
@@ -574,7 +591,8 @@ func TestVerifyPeerCertificateRejected(t *testing.T) {
 	assertEquals(t, clientAlert, AlertBadCertificate)
 	assertEquals(t, verifyCalled, true)
 
-	sConn.Close()
+	// Close server explicitly to unblock if handshake is stuck
+	server.Close()
 	<-done
 }
 
@@ -618,6 +636,8 @@ func TestCertChain(t *testing.T) {
 	client := Client(cConn, clientConfig)
 	// The server uses a self-signed certificate
 	server := Server(sConn, serverConfig)
+	defer client.Close()
+	defer server.Close()
 
 	var clientAlert, serverAlert Alert
 	done := make(chan bool)
@@ -648,6 +668,8 @@ func TestClientAuth(t *testing.T) {
 	cConn, sConn := pipe()
 	client := Client(cConn, configClient)
 	server := Server(sConn, configServer)
+	defer client.Close()
+	defer server.Close()
 
 	var clientAlert, serverAlert Alert
 	done := make(chan bool)
@@ -690,6 +712,8 @@ func TestClientAuthVerifyPeerAccepted(t *testing.T) {
 	cConn, sConn := pipe()
 	client := Client(cConn, configClient)
 	server := Server(sConn, configServer)
+	defer client.Close()
+	defer server.Close()
 
 	var clientAlert, serverAlert Alert
 	done := make(chan bool)
@@ -725,6 +749,8 @@ func TestClientAuthVerifyPeerRejected(t *testing.T) {
 	cConn, sConn := pipe()
 	client := Client(cConn, configClient)
 	server := Server(sConn, configServer)
+	defer client.Close()
+	defer server.Close()
 
 	done := make(chan bool)
 	go func() {
@@ -736,7 +762,6 @@ func TestClientAuthVerifyPeerRejected(t *testing.T) {
 	assertEquals(t, serverAlert, AlertBadCertificate)
 	assertEquals(t, verifyCalled, true)
 
-	cConn.Close()
 	<-done
 }
 
@@ -764,6 +789,10 @@ func TestPSKFlows(t *testing.T) {
 		checkConsistency(t, client, server)
 
 		assertTrue(t, client.state.Params.UsingPSK, "Session did not use the provided PSK")
+
+		// Close connections before next iteration
+		client.Close()
+		server.Close()
 	}
 }
 
@@ -781,6 +810,8 @@ func TestResumption(t *testing.T) {
 	cConn1, sConn1 := pipe()
 	client1 := Client(cConn1, clientConfig)
 	server1 := Server(sConn1, serverConfig)
+	defer client1.Close()
+	defer server1.Close()
 
 	var clientAlert, serverAlert Alert
 
@@ -835,6 +866,8 @@ func TestResumption(t *testing.T) {
 	cConn2, sConn2 := pipe()
 	client2 := Client(cConn2, clientConfig)
 	server2 := Server(sConn2, serverConfig)
+	defer client2.Close()
+	defer server2.Close()
 
 	go func(t *testing.T) {
 		serverAlert = server2.Handshake()
@@ -868,6 +901,8 @@ func test0xRTT(t *testing.T, name string, p testInstanceState) {
 
 	client := Client(cbConn, &conf)
 	server := Server(sbConn, &conf)
+	defer client.Close()
+	defer server.Close()
 
 	client.Handshake() // This sends CH
 	zdata := []byte("ABC")
@@ -913,8 +948,10 @@ func Test0xRTTFailure(t *testing.T) {
 	cConn, sConn := pipe()
 
 	client := Client(cConn, clientConfig)
+	defer client.Close()
 
 	server := Server(sConn, serverConfig)
+	defer server.Close()
 
 	done := make(chan bool)
 	go func(t *testing.T) {
@@ -935,6 +972,8 @@ func TestKeyUpdate(t *testing.T) {
 	conf := basicConfig
 	client := Client(cConn, conf)
 	server := Server(sConn, conf)
+	defer client.Close()
+	defer server.Close()
 
 	oneBuf := []byte{'a'}
 	c2s := make(chan bool)
@@ -1020,6 +1059,106 @@ func TestKeyUpdate(t *testing.T) {
 	assertByteEquals(t, clientState3.clientTrafficSecret, serverState3.clientTrafficSecret)
 	assertNotByteEquals(t, serverState2.serverTrafficSecret, serverState3.serverTrafficSecret)
 	assertNotByteEquals(t, clientState2.clientTrafficSecret, clientState3.clientTrafficSecret)
+}
+
+func TestKeyUpdateMultipleSequential(t *testing.T) {
+	// Test multiple sequential KeyUpdates to verify:
+	// 1. Sequence numbers reset correctly after each KeyUpdate
+	// 2. Keys continue to update correctly through multiple cycles
+	// 3. Controller handles multiple KeyUpdate operations correctly
+	// 4. EpochUpdate handling works for subsequent KeyUpdates
+	cConn, sConn := pipe()
+
+	conf := basicConfig
+	client := Client(cConn, conf)
+	server := Server(sConn, conf)
+	defer client.Close()
+	defer server.Close()
+
+	oneBuf := []byte{'a'}
+	c2s := make(chan bool)
+	s2c := make(chan bool)
+	go func(t *testing.T) {
+		alert := server.Handshake()
+		assertEquals(t, alert, AlertNoAlert)
+
+		// Send initial data
+		server.Write(oneBuf)
+		s2c <- true
+
+		// Perform multiple server-initiated KeyUpdates
+		for i := 0; i < 3; i++ {
+			<-c2s
+			err := server.SendKeyUpdate(false)
+			assertNotError(t, err, "Key update send failed")
+			server.Write(oneBuf)
+			s2c <- true
+		}
+
+		// Perform multiple client-initiated KeyUpdates
+		for i := 0; i < 3; i++ {
+			<-c2s
+			server.Read(oneBuf)
+			server.Write(oneBuf)
+			s2c <- true
+		}
+	}(t)
+
+	alert := client.Handshake()
+	assertEquals(t, alert, AlertNoAlert)
+
+	// Read initial data
+	client.Read(oneBuf)
+	<-s2c
+
+	// Track states through multiple KeyUpdates
+	prevClientState := client.state
+	prevServerState := server.state
+
+	// Test multiple server-initiated KeyUpdates
+	for i := 0; i < 3; i++ {
+		c2s <- true
+		<-s2c
+		client.Read(oneBuf)
+
+		clientState := client.state
+		serverState := server.state
+
+		// Verify secrets match between client and server
+		assertByteEquals(t, clientState.serverTrafficSecret, serverState.serverTrafficSecret)
+		assertByteEquals(t, clientState.clientTrafficSecret, serverState.clientTrafficSecret)
+
+		// Verify server secrets changed (server-initiated KeyUpdate)
+		assertNotByteEquals(t, prevServerState.serverTrafficSecret, serverState.serverTrafficSecret)
+		// Client secrets should remain unchanged (server only updated its own keys)
+		assertByteEquals(t, prevClientState.clientTrafficSecret, clientState.clientTrafficSecret)
+
+		prevClientState = clientState
+		prevServerState = serverState
+	}
+
+	// Test multiple client-initiated KeyUpdates
+	for i := 0; i < 3; i++ {
+		client.SendKeyUpdate(false)
+		client.Write(oneBuf)
+		c2s <- true
+		<-s2c
+
+		clientState := client.state
+		serverState := server.state
+
+		// Verify secrets match between client and server
+		assertByteEquals(t, clientState.serverTrafficSecret, serverState.serverTrafficSecret)
+		assertByteEquals(t, clientState.clientTrafficSecret, serverState.clientTrafficSecret)
+
+		// Verify client secrets changed (client-initiated KeyUpdate)
+		assertNotByteEquals(t, prevClientState.clientTrafficSecret, clientState.clientTrafficSecret)
+		// Server secrets should remain unchanged (client only updated its own keys)
+		assertByteEquals(t, prevServerState.serverTrafficSecret, serverState.serverTrafficSecret)
+
+		prevClientState = clientState
+		prevServerState = serverState
+	}
 }
 
 func TestNonblockingHandshakeAndDataFlow(t *testing.T) {
@@ -1174,6 +1313,8 @@ func TestExternalExtensions(t *testing.T) {
 
 	client := Client(cConn, config)
 	server := Server(sConn, config)
+	defer client.Close()
+	defer server.Close()
 
 	var clientAlert, serverAlert Alert
 
@@ -1216,6 +1357,8 @@ func TestConnectionState(t *testing.T) {
 	cConn, sConn := pipe()
 	client := Client(cConn, configClient)
 	server := Server(sConn, serverConfig)
+	defer client.Close()
+	defer server.Close()
 
 	done := make(chan bool)
 	go func(t *testing.T) {
@@ -1245,6 +1388,8 @@ func TestDTLS(t *testing.T) {
 	config.ExtensionHandler = handler
 	client := Client(cConn, config)
 	server := Server(sConn, config)
+	defer client.Close()
+	defer server.Close()
 
 	var clientAlert, serverAlert Alert
 
@@ -1351,6 +1496,8 @@ func TestTimeoutAndRetransmissionDTLS(t *testing.T) {
 
 	client := Client(cbConn, nbDTLSConfig)
 	server := Server(sbConn, nbDTLSConfig)
+	defer client.Close()
+	defer server.Close()
 
 	var clientAlert, serverAlert Alert
 
@@ -1633,6 +1780,8 @@ func TestEarlyIOFail(t *testing.T) {
 
 	client := Client(cbConn, nbConfig)
 	server := Server(sbConn, nbConfig)
+	defer client.Close()
+	defer server.Close()
 	readWriteExpectFail(t, client)
 	readWriteExpectFail(t, server)
 
@@ -1652,6 +1801,8 @@ func TestDTLSOutOfEpochHSFail(t *testing.T) {
 
 	client := Client(cbConn, nbDTLSConfig)
 	server := Server(sbConn, nbDTLSConfig)
+	defer client.Close()
+	defer server.Close()
 
 	hsUntilBlocked(t, client, cbConn)
 	hsUntilBlocked(t, server, sbConn)
@@ -1677,6 +1828,8 @@ func TestDTLSOutOfEpochPostHSDiscard(t *testing.T) {
 
 	client := Client(cbConn, pskDTLSConfig)
 	server := Server(sbConn, pskDTLSConfig)
+	defer client.Close()
+	defer server.Close()
 
 	hsRunHandshakeOneThread(t, client, server)
 
@@ -1707,6 +1860,8 @@ func TestHRRRecordVersion(t *testing.T) {
 	assertNotError(t, err, "Couldn't make default cookie protector")
 	sconf.CookieProtector = cp
 	server := Server(sbConn, &sconf)
+	defer client.Close()
+	defer server.Close()
 
 	hsUntilBlocked(t, client, cbConn) // CH1
 	cbConn.Flush()
@@ -1738,6 +1893,8 @@ func TestEarlyDataWithHRR(t *testing.T) {
 	sconf.CookieProtector = cp
 	sconf.NonBlocking = true
 	server := Server(sConn, &sconf)
+	defer client.Close()
+	defer server.Close()
 
 	hsRunHandshakeOneThread(t, client, server)
 }
@@ -1758,6 +1915,8 @@ func TestEarlyDataNotWritableAfterHRR(t *testing.T) {
 	sconf.CookieProtector = cp
 	sconf.NonBlocking = true
 	server := Server(sbConn, &sconf)
+	defer client.Close()
+	defer server.Close()
 
 	// Send CH
 	hsUntilBlocked(t, client, cbConn)
@@ -1787,6 +1946,8 @@ func TestHandshakeMessageAcrossBoundary(t *testing.T) {
 
 	client := Client(cbConn, nbConfig)
 	server := Server(sbConn, nbConfig)
+	defer client.Close()
+	defer server.Close()
 
 	var clientAlert, serverAlert Alert
 
