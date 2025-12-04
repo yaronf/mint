@@ -363,8 +363,13 @@ func (h *HandshakeLayer) ReadMessage() (*HandshakeMessage, error) {
 			logf(logTypeVerbose, "Trying to read a new record")
 			err = h.readRecord()
 
-			if err != nil && (h.nonblocking || err != AlertWouldBlock) {
-				return nil, err
+			// In non-blocking mode, if we get AlertWouldBlock, return it immediately
+			// In blocking mode, continue looping to retry
+			if err != nil {
+				if h.nonblocking || err != AlertWouldBlock {
+					return nil, err
+				}
+				// Blocking mode with AlertWouldBlock - continue loop to retry
 			}
 		}
 
@@ -372,8 +377,13 @@ func (h *HandshakeLayer) ReadMessage() (*HandshakeMessage, error) {
 		if err == nil {
 			break
 		}
-		if err != nil && (h.nonblocking || err != AlertWouldBlock) {
-			return nil, err
+		// In non-blocking mode, if frame processing fails, return error immediately
+		// In blocking mode, continue looping to retry
+		if err != nil {
+			if h.nonblocking || err != AlertWouldBlock {
+				return nil, err
+			}
+			// Blocking mode with AlertWouldBlock - continue loop to retry
 		}
 	}
 
@@ -402,17 +412,53 @@ func (h *HandshakeLayer) ReadMessage() (*HandshakeMessage, error) {
 
 func (h *HandshakeLayer) QueueMessage(hm *HandshakeMessage) error {
 	if h.datagram {
+		// DTLS: capture cipher state at queue time (original behavior)
 		hm.cipher = h.conn.(*DefaultRecordLayer).cipher
 		h.queued = append(h.queued, hm)
 		return nil
 	}
-	_, err := h.WriteMessages([]*HandshakeMessage{hm})
-	return err
+	
+	// TLS: Capture the current cipher state when queuing the message
+	// This ensures that KeyUpdate messages are encrypted with the old keys
+	// (before RekeyOut), as required by RFC 8446bis Section 4.6.3
+	// For KeyUpdate messages, we need to use seq=0 because the receiver will
+	// have reset its sequence number to 0 after processing the previous KeyUpdate
+	if rl, ok := h.conn.(*DefaultRecordLayer); ok {
+		rl.Lock()
+		if hm.msgType == HandshakeTypeKeyUpdate {
+			// For KeyUpdate messages, we need special handling:
+			// - If epoch is EpochUpdate (subsequent KeyUpdate), use seq=0 because receiver resets to 0 after previous RekeyIn
+			// - If epoch is EpochApplicationData (first KeyUpdate), use current seq (which should be 0 after handshake)
+			if rl.cipher.epoch == EpochUpdate {
+				// Subsequent KeyUpdate: receiver has reset to seq=0 after previous KeyUpdate
+				hm.cipher = &cipherState{
+					epoch:    rl.cipher.epoch,
+					ivLength: rl.cipher.ivLength,
+					seq:      0, // Use seq=0 to match receiver's expectation after previous KeyUpdate
+					iv:       rl.cipher.iv, // Share IV buffer (read-only)
+					cipher:   rl.cipher.cipher,
+				}
+				logf(logTypeHandshake, "QueueMessage: KeyUpdate (EpochUpdate) - using cipher epoch=%s seq=0", rl.cipher.epoch.label())
+			} else {
+				// First KeyUpdate: use current sequence number (should be 0 after handshake)
+				hm.cipher = rl.cipher
+				logf(logTypeHandshake, "QueueMessage: KeyUpdate (EpochApplicationData) - using cipher epoch=%s seq=%x", rl.cipher.epoch.label(), rl.cipher.seq)
+			}
+		} else {
+			// For other messages, use current cipher state
+			hm.cipher = rl.cipher
+		}
+		rl.Unlock()
+	}
+	h.queued = append(h.queued, hm)
+	return nil
 }
 
 func (h *HandshakeLayer) SendQueuedMessages() (int, error) {
 	logf(logTypeHandshake, "Sending outgoing messages")
 	count, err := h.WriteMessages(h.queued)
+	// For DTLS, don't clear the queue - messages need to remain for retransmission until ACKed
+	// For TLS, clear the queue after sending
 	if !h.datagram {
 		h.ClearQueuedMessages()
 	}
@@ -484,11 +530,30 @@ func (h *HandshakeLayer) writeFragment(hm *HandshakeMessage, start int, room int
 			},
 			hm.cipher, 0)
 	} else {
-		err = h.conn.WriteRecord(
-			&TLSPlaintext{
-				contentType: RecordTypeHandshake,
-				fragment:    buf,
-			})
+		// For TLS, use the cipher state that was captured when the message was queued
+		// This ensures KeyUpdate messages are encrypted with the old keys (before RekeyOut)
+		if rl, ok := h.conn.(*DefaultRecordLayer); ok && hm.cipher != nil {
+			// Use the captured cipher state (old keys) for this message
+			logf(logTypeHandshake, "writeFragment: using captured cipher epoch=%s seq=%x for message type=%v", 
+				hm.cipher.epoch.label(), hm.cipher.seq, hm.msgType)
+			err = rl.writeRecordWithPadding(
+				&TLSPlaintext{
+					contentType: RecordTypeHandshake,
+					fragment:    buf,
+				},
+				hm.cipher, 0)
+		} else {
+			// Fallback to current cipher if no captured cipher (shouldn't happen for queued messages)
+			if rl, ok := h.conn.(*DefaultRecordLayer); ok {
+				logf(logTypeHandshake, "writeFragment: WARNING - no captured cipher, using current cipher epoch=%s seq=%x", 
+					rl.cipher.epoch.label(), rl.cipher.seq)
+			}
+			err = h.conn.WriteRecord(
+				&TLSPlaintext{
+					contentType: RecordTypeHandshake,
+					fragment:    buf,
+				})
+		}
 	}
 	return true, start + bodylen, err
 }

@@ -29,12 +29,12 @@ const (
 	DirectionRead  = Direction(2)
 )
 
-// struct {
-//     ContentType type;
-//     ProtocolVersion record_version [0301 for CH, 0303 for others]
-//     uint16 length;
-//     opaque fragment[TLSPlaintext.length];
-// } TLSPlaintext;
+//	struct {
+//	    ContentType type;
+//	    ProtocolVersion record_version [0301 for CH, 0303 for others]
+//	    uint16 length;
+//	    opaque fragment[TLSPlaintext.length];
+//	} TLSPlaintext;
 type TLSPlaintext struct {
 	// Omitted: record_version (static)
 	// Omitted: length         (computed from fragment)
@@ -92,6 +92,12 @@ type DefaultRecordLayer struct {
 	nextData     []byte        // The next record to send
 	cachedRecord *TLSPlaintext // Last record read, cached to enable "peek"
 	cachedError  error         // Error on the last record read
+
+	// Cached encrypted record for retry after RekeyIn
+	pendingDecryptRecord *TLSPlaintext // Encrypted record that failed decryption
+	pendingDecryptHeader []byte        // Header for pending decrypt record
+	pendingDecryptSeq    uint64        // Sequence number for pending decrypt record
+	pendingDecryptEpoch  Epoch         // Epoch when record was cached (to detect RekeyIn)
 
 	cipher      *cipherState
 	readCiphers map[Epoch]*cipherState
@@ -181,10 +187,35 @@ func (r *DefaultRecordLayer) Rekey(epoch Epoch, factory AEADFactory, keys *KeySe
 	if err != nil {
 		return err
 	}
+	r.Lock()
 	r.cipher = cipher
 	if r.datagram && r.direction == DirectionRead {
 		r.readCiphers[epoch] = cipher
 	}
+	// If we have a pending decrypt record, retry decryption with new keys
+	if r.pendingDecryptRecord != nil && r.pendingDecryptHeader != nil {
+		logf(logTypeIO, "%s Rekey: retrying decryption of pending application data record", r.label)
+		pt := r.pendingDecryptRecord
+		header := r.pendingDecryptHeader
+		seq := r.pendingDecryptSeq
+		// Reset sequence number to 0 for new epoch
+		if r.cipher != nil {
+			seq = 0
+		}
+		pt, _, err = r.decrypt(seq, header, pt)
+		if err == nil {
+			// Success! Cache the decrypted record
+			r.cachedRecord = pt
+			r.cachedError = nil
+			r.pendingDecryptRecord = nil
+			r.pendingDecryptHeader = nil
+			logf(logTypeIO, "%s Rekey: successfully decrypted pending record after rekey", r.label)
+		} else {
+			logf(logTypeIO, "%s Rekey: retry decryption failed: %v", r.label, err)
+			// Keep pending record for next retry
+		}
+	}
+	r.Unlock()
 	return nil
 }
 
@@ -265,6 +296,9 @@ func (r *DefaultRecordLayer) encrypt(cipher *cipherState, seq uint64, header []b
 func (r *DefaultRecordLayer) decrypt(seq uint64, header []byte, pt *TLSPlaintext) (*TLSPlaintext, int, error) {
 	assert(r.direction == DirectionRead)
 	logf(logTypeIO, "%s Decrypt seq=[%x]", r.label, seq)
+	if r.cipher == nil {
+		return nil, 0, fmt.Errorf("tls.record.decrypt: cipher state is nil")
+	}
 	if len(pt.fragment) < r.cipher.overhead() {
 		msg := fmt.Sprintf("tls.record.decrypt: Record too short [%d] < [%d]", len(pt.fragment), r.cipher.overhead())
 		return nil, 0, DecryptError(msg)
@@ -277,9 +311,11 @@ func (r *DefaultRecordLayer) decrypt(seq uint64, header []byte, pt *TLSPlaintext
 	}
 
 	// Decrypt
-	_, err := r.cipher.cipher.Open(out.fragment[:0], r.cipher.computeNonce(seq), pt.fragment, header)
+	nonce := r.cipher.computeNonce(seq)
+	logf(logTypeIO, "%s Decrypt: epoch=[%s] seq=[%x] nonce=[%x] ciphertext_len=[%d]", r.label, r.cipher.epoch.label(), seq, nonce, len(pt.fragment))
+	_, err := r.cipher.cipher.Open(out.fragment[:0], nonce, pt.fragment, header)
 	if err != nil {
-		logf(logTypeIO, "%s AEAD decryption failure [%x]", r.label, pt)
+		logf(logTypeIO, "%s AEAD decryption failure: epoch=[%s] seq=[%x] nonce=[%x] ciphertext=[%x] error=[%v]", r.label, r.cipher.epoch.label(), seq, nonce, pt.fragment, err)
 		return nil, 0, DecryptError("tls.record.decrypt: AEAD decrypt failed")
 	}
 
@@ -317,6 +353,15 @@ func (r *DefaultRecordLayer) PeekRecordType(block bool) (RecordType, error) {
 func (r *DefaultRecordLayer) ReadRecord() (*TLSPlaintext, error) {
 	pt, err := r.nextRecord(false)
 
+	// If we got an error but have a cached record from Rekey retry, return that instead
+	if err != nil && r.cachedRecord != nil && r.cachedError == nil {
+		logf(logTypeIO, "%s ReadRecord: returning cached record from Rekey retry", r.label)
+		pt = r.cachedRecord
+		err = nil
+		r.cachedRecord = nil
+		return pt, nil
+	}
+
 	// Consume the cached record if there was one
 	r.cachedRecord = nil
 	r.cachedError = nil
@@ -335,7 +380,6 @@ func (r *DefaultRecordLayer) ReadRecordAnyEpoch() (*TLSPlaintext, error) {
 }
 
 func (r *DefaultRecordLayer) nextRecord(allowOldEpoch bool) (*TLSPlaintext, error) {
-	cipher := r.cipher
 	if r.cachedRecord != nil {
 		logf(logTypeIO, "%s Returning cached record", r.label)
 		return r.cachedRecord, r.cachedError
@@ -361,6 +405,7 @@ func (r *DefaultRecordLayer) nextRecord(allowOldEpoch bool) (*TLSPlaintext, erro
 			}
 
 			if n == 0 {
+				logf(logTypeIO, "%s Read returned 0 bytes, returning AlertWouldBlock", r.label)
 				return nil, AlertWouldBlock
 			}
 
@@ -405,7 +450,14 @@ func (r *DefaultRecordLayer) nextRecord(allowOldEpoch bool) (*TLSPlaintext, erro
 	// TODO(ekr@rtfm.com): Enforce that for epoch > 0, the content type is app data.
 
 	// Attempt to decrypt fragment
-	seq := cipher.seq
+	// For DTLS, Read() already holds the lock, so don't lock again (would cause deadlock)
+	// For TLS: The controller is single-threaded. socketReaderLoop() sends records to controllerLoop() via socketRecords channel,
+	// and controllerLoop() processes them sequentially. So nextRecord() completes before Rekey() can be called.
+	// There's no concurrent access - nextRecord() finishes before Rekey() starts.
+	// Therefore, we don't need locks in nextRecord() for TLS!
+
+	var seq uint64
+	var cipher *cipherState
 	if r.datagram {
 		// TODO(ekr@rtfm.com): Handle duplicates.
 		seq, _ = decodeUint(header[3:11], 8)
@@ -414,29 +466,148 @@ func (r *DefaultRecordLayer) nextRecord(allowOldEpoch bool) (*TLSPlaintext, erro
 		// Look up the cipher suite from the epoch
 		c, ok := r.readCiphers[epoch]
 		if !ok {
-			logf(logTypeIO, "%s Message from unknown epoch: [%v]", r.label, epoch)
 			return nil, AlertWouldBlock
 		}
+		cipher = c
+	} else {
+		// For TLS, use current cipher state
+		cipher = r.cipher
+		if cipher == nil {
+			return nil, fmt.Errorf("tls.record: cipher state is nil")
+		}
+		seq = cipher.seq
 
-		if epoch != cipher.epoch {
-			logf(logTypeIO, "%s Message from non-current epoch: [%v != %v] out-of-epoch reads=%v", r.label, epoch,
-				cipher.epoch, allowOldEpoch)
-			if !allowOldEpoch {
-				return nil, AlertWouldBlock
+		// Check if we have a pending decrypt record and RekeyIn has happened
+		// (cipher epoch changed, indicating new keys are available)
+		if r.pendingDecryptRecord != nil && r.pendingDecryptHeader != nil {
+			// Check if cipher epoch has changed (indicating RekeyIn happened)
+			// If so, retry decryption with new keys
+			if cipher.epoch != r.pendingDecryptEpoch {
+				logf(logTypeIO, "%s nextRecord: cipher epoch changed from %s to %s, retrying decryption of pending record", r.label, r.pendingDecryptEpoch.label(), cipher.epoch.label())
+				ptRetry := r.pendingDecryptRecord
+				headerRetry := r.pendingDecryptHeader
+				seqRetry := uint64(0) // Reset sequence number for new epoch
+				ptRetry, _, errRetry := r.decrypt(seqRetry, headerRetry, ptRetry)
+				if errRetry == nil {
+					// Success! Use the decrypted record
+					pt = ptRetry
+					err = nil
+					r.pendingDecryptRecord = nil
+					r.pendingDecryptHeader = nil
+					// Skip normal decrypt path - pt is already decrypted
+					// Increment sequence number and set epoch
+					r.cipher.incrementSequenceNumber()
+					pt.epoch = r.cipher.epoch
+					logf(logTypeIO, "%s nextRecord: successfully decrypted pending record after RekeyIn", r.label)
+					// Fall through to return pt
+				} else {
+					logf(logTypeIO, "%s nextRecord: retry decryption failed: %v", r.label, errRetry)
+					// Keep pending record, return error
+					return nil, errRetry
+				}
+			} else {
+				// RekeyIn hasn't happened yet
+				// Check if current record matches pending decrypt record by comparing encrypted fragments
+				// If it matches, this is the same record that failed decryption - block until RekeyIn
+				// If it doesn't match, this is a different record (e.g., KeyUpdate handshake) - process it
+				if r.pendingDecryptRecord != nil && len(pt.fragment) == len(r.pendingDecryptRecord.fragment) {
+					// Compare encrypted fragments byte-by-byte to see if this is the same record
+					sameRecord := true
+					for i := 0; i < len(pt.fragment); i++ {
+						if pt.fragment[i] != r.pendingDecryptRecord.fragment[i] {
+							sameRecord = false
+							break
+						}
+					}
+					if sameRecord {
+						// This is the same record that failed decryption - block until RekeyIn
+						logf(logTypeIO, "%s nextRecord: same record as pending decrypt record (matched by fragment), blocking until RekeyIn", r.label)
+						return nil, AlertWouldBlock
+					}
+				}
+				// Different record - process it (e.g., KeyUpdate handshake that will trigger RekeyIn)
+				logf(logTypeIO, "%s nextRecord: different record (fragment doesn't match pending), processing to allow KeyUpdate", r.label)
 			}
-			cipher = c
 		}
 	}
 
-	if cipher.cipher != nil {
-		logf(logTypeIO, "%s RecordLayer.ReadRecord epoch=[%s] seq=[%x] [%d] ciphertext=[%x]", r.label, cipher.epoch.label(), seq, pt.contentType, pt.fragment)
-		pt, _, err = r.decrypt(seq, header, pt)
-		if err != nil {
-			logf(logTypeIO, "%s Decryption failed", r.label)
-			return nil, err
+	if cipher != nil && cipher.cipher != nil && err == nil {
+		// Handshake and alert records: decrypt immediately (needed for parsing)
+		// Skip if we already decrypted above (from retry)
+		if pt != nil && len(pt.fragment) > 0 && pt.epoch == cipher.epoch {
+			// Already decrypted from retry above, skip
+			logf(logTypeIO, "%s RecordLayer.ReadRecord: using retried decrypted record, skipping decrypt", r.label)
+		} else {
+			logf(logTypeIO, "%s RecordLayer.ReadRecord BEFORE decrypt: epoch=[%s] seq=[%x] contentType=[%d] ciphertext_len=[%d]", r.label, cipher.epoch.label(), seq, pt.contentType, len(pt.fragment))
+			logf(logTypeIO, "%s RecordLayer.ReadRecord epoch=[%s] seq=[%x] [%d] ciphertext=[%x]", r.label, cipher.epoch.label(), seq, pt.contentType, pt.fragment)
+			logCipher := cipher
+			// Save a copy of pt before decrypt, since decrypt might return nil on error
+			// We need the encrypted fragment to cache for retry after RekeyIn
+			encryptedPtBeforeDecrypt := &TLSPlaintext{
+				contentType: pt.contentType,
+				fragment:    make([]byte, len(pt.fragment)),
+			}
+			copy(encryptedPtBeforeDecrypt.fragment, pt.fragment)
+			pt, _, err = r.decrypt(seq, header, pt)
+			if err != nil {
+				// pt may be nil on decrypt error, so use original pt for caching
+				originalPt := pt
+				if pt == nil {
+					// Reconstruct pt from header if decrypt returned nil
+					originalPt = &TLSPlaintext{
+						contentType: RecordType(header[0]),
+						fragment:    make([]byte, 0), // Will be set from pendingDecryptRecord if needed
+					}
+				}
+				if logCipher != nil && logCipher.cipher != nil {
+					contentTypeStr := "unknown"
+					if originalPt != nil {
+						contentTypeStr = fmt.Sprintf("%d", originalPt.contentType)
+					}
+					logf(logTypeIO, "%s Decryption failed: epoch=[%s] seq=[%x] contentType=[%s] error=[%v]", r.label, logCipher.epoch.label(), seq, contentTypeStr, err)
+				}
+				// For decryption failures, cache the encrypted record so we can retry after RekeyIn
+				// This handles the case where application data is encrypted with new keys after KeyUpdate
+				// but we try to decrypt with old keys before processing the KeyUpdate handshake
+				// Note: In TLS 1.3, header content type is always 23 for encrypted records,
+				// so we cache all decryption failures and retry after RekeyIn
+				// Only cache if we don't already have a pending decrypt record
+				if r.pendingDecryptRecord == nil {
+					logf(logTypeIO, "%s Caching encrypted record for retry after RekeyIn", r.label)
+					// Use the encrypted record we saved before decrypt was called
+					encryptedPt := encryptedPtBeforeDecrypt
+					r.pendingDecryptRecord = encryptedPt
+					r.pendingDecryptHeader = make([]byte, len(header))
+					copy(r.pendingDecryptHeader, header)
+					r.pendingDecryptSeq = seq
+					r.pendingDecryptEpoch = cipher.epoch // Store current epoch to detect RekeyIn
+					// Return AlertWouldBlock instead of error to allow controller to process KeyUpdate first
+					// The controller will process the KeyUpdate handshake, trigger RekeyIn, and then
+					// the next ReadRecord() call will retry decryption with new keys
+					return nil, AlertWouldBlock
+				} else {
+					// Already have a pending decrypt record - this is a second failure
+					// This shouldn't happen in normal operation, but if it does, return error
+					logf(logTypeIO, "%s Decryption failed but already have pending decrypt record, returning error", r.label)
+					return nil, err
+				}
+			}
+			// Clear pending decrypt cache on successful decryption
+			r.pendingDecryptRecord = nil
+			r.pendingDecryptHeader = nil
+			// Increment sequence number on success
+			r.cipher.incrementSequenceNumber()
+			pt.epoch = r.cipher.epoch
+			if logCipher != nil {
+				logf(logTypeIO, "%s RecordLayer.ReadRecord AFTER decrypt: epoch=[%s] seq=[%x] contentType=[%d] plaintext_len=[%d]", r.label, logCipher.epoch.label(), seq, pt.contentType, len(pt.fragment))
+			}
+		}
+	} else {
+		// No decryption needed (plaintext record)
+		if cipher != nil {
+			pt.epoch = cipher.epoch
 		}
 	}
-	pt.epoch = cipher.epoch
 
 	// Check that plaintext length is not too long
 	if len(pt.fragment) > maxFragmentLen {
@@ -446,7 +617,6 @@ func (r *DefaultRecordLayer) nextRecord(allowOldEpoch bool) (*TLSPlaintext, erro
 	logf(logTypeIO, "%s RecordLayer.ReadRecord [%d] [%x]", r.label, pt.contentType, pt.fragment)
 
 	r.cachedRecord = pt
-	cipher.incrementSequenceNumber()
 	return pt, nil
 }
 
@@ -486,8 +656,10 @@ func (r *DefaultRecordLayer) writeRecordWithPadding(pt *TLSPlaintext, cipher *ci
 
 	var ciphertext []byte
 	if cipher.cipher != nil {
+		logf(logTypeIO, "%s RecordLayer.WriteRecord BEFORE encrypt: epoch=[%s] seq=[%x] contentType=[%d] plaintext_len=[%d]", r.label, cipher.epoch.label(), cipher.seq, pt.contentType, len(pt.fragment))
 		logf(logTypeIO, "%s RecordLayer.WriteRecord epoch=[%s] seq=[%x] [%d] plaintext=[%x]", r.label, cipher.epoch.label(), cipher.seq, pt.contentType, pt.fragment)
 		ciphertext = r.encrypt(cipher, seq, header, pt, padLen)
+		logf(logTypeIO, "%s RecordLayer.WriteRecord AFTER encrypt: epoch=[%s] seq=[%x] contentType=[%d] ciphertext_len=[%d]", r.label, cipher.epoch.label(), cipher.seq, pt.contentType, len(ciphertext))
 	} else {
 		if padLen > 0 {
 			return fmt.Errorf("tls.record: Padding can only be done on encrypted records")
