@@ -246,6 +246,11 @@ func (state serverStateStart) Next(hr handshakeMessageReader) (HandshakeState, [
 	// Figure out if we actually should do DH / PSK
 	connParams.UsingDH, connParams.UsingPSK = PSKModeNegotiation(canDoDH, canDoPSK, clientPSKModes.KEModes)
 
+	// Store negotiated group for EKU (if DH is used)
+	if connParams.UsingDH {
+		connParams.NegotiatedGroup = dhGroup
+	}
+
 	// Select a ciphersuite
 	connParams.CipherSuite, err = CipherSuiteNegotiation(psk, ch.CipherSuites, state.Config.CipherSuites)
 	if err != nil {
