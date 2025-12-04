@@ -145,6 +145,18 @@ func (state clientStateStart) Next(hr handshakeMessageReader) (HandshakeState, [
 		}
 	}
 
+	// Add flags extension if Extended Key Update is enabled
+	if state.Config.EnableExtendedKeyUpdate {
+		flagsExt := &FlagsExtension{}
+		flagsExt.SetFlag(FlagExtendedKeyUpdate)
+		err = ch.Extensions.Add(flagsExt)
+		if err != nil {
+			logf(logTypeHandshake, "[ClientStateStart] Error adding flags extension: %v", err)
+			return nil, nil, AlertInternalError
+		}
+		logf(logTypeHandshake, "[ClientStateStart] Added flags extension with extended_key_update flag")
+	}
+
 	// Run the external extension handler.
 	if state.Config.ExtensionHandler != nil {
 		err := state.Config.ExtensionHandler.Send(HandshakeTypeClientHello, &ch.Extensions)
@@ -468,6 +480,7 @@ func (state clientStateWaitSH) Next(hr handshakeMessageReader) (HandshakeState, 
 		}
 
 		state.Params.UsingDH = true
+		state.Params.NegotiatedGroup = sks.Group // Store negotiated group for EKU
 		dhSecret, _ = keyAgreement(sks.Group, sks.KeyExchange, priv)
 	}
 
@@ -590,11 +603,13 @@ func (state clientStateWaitEE) Next(hr handshakeMessageReader) (HandshakeState, 
 
 	serverALPN := &ALPNExtension{}
 	serverEarlyData := &EarlyDataExtension{}
+	serverFlags := &FlagsExtension{}
 
 	foundExts, err := ee.Extensions.Parse(
 		[]ExtensionBody{
 			serverALPN,
 			serverEarlyData,
+			serverFlags,
 		})
 	if err != nil {
 		logf(logTypeHandshake, "[ClientStateWaitEE] Error decoding extensions: %v", err)
@@ -605,6 +620,15 @@ func (state clientStateWaitEE) Next(hr handshakeMessageReader) (HandshakeState, 
 
 	if foundExts[ExtensionTypeALPN] && len(serverALPN.Protocols) > 0 {
 		state.Params.NextProto = serverALPN.Protocols[0]
+	}
+
+	// Check if server acknowledged Extended Key Update flag
+	if foundExts[ExtensionTypeFlags] && serverFlags.HasFlag(FlagExtendedKeyUpdate) {
+		// Client sent the flag and server acknowledged it
+		if state.Config.EnableExtendedKeyUpdate {
+			state.Params.UsingExtendedKeyUpdate = true
+			logf(logTypeHandshake, "[ClientStateWaitEE] Extended Key Update negotiated")
+		}
 	}
 
 	state.handshakeHash.Write(hm.Marshal())
@@ -1061,6 +1085,13 @@ func (state clientStateWaitFinished) Next(hr handshakeMessageReader) (HandshakeS
 	resumptionSecret := deriveSecret(state.cryptoParams, state.masterSecret, labelResumptionSecret, h6)
 	logf(logTypeCrypto, "resumption secret: [%d] %x", len(resumptionSecret), resumptionSecret)
 
+	// Compute and store derived value for EKU (if EKU is negotiated)
+	var ekuDerivedSecret []byte
+	if state.Params.UsingExtendedKeyUpdate {
+		ekuDerivedSecret = deriveSecret(state.cryptoParams, state.masterSecret, labelDerived, []byte{})
+		logf(logTypeCrypto, "EKU derived secret: [%d] %x", len(ekuDerivedSecret), ekuDerivedSecret)
+	}
+
 	toSend = append(toSend, []HandshakeAction{
 		QueueHandshakeMessage{finm},
 		SendQueuedHandshake{},
@@ -1080,6 +1111,7 @@ func (state clientStateWaitFinished) Next(hr handshakeMessageReader) (HandshakeS
 		clientTrafficSecret: clientTrafficSecret,
 		serverTrafficSecret: serverTrafficSecret,
 		exporterSecret:      exporterSecret,
+		ekuDerivedSecret:    ekuDerivedSecret,
 		peerCertificates:    state.peerCertificates,
 		verifiedChains:      state.verifiedChains,
 	}

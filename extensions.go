@@ -624,3 +624,69 @@ func (c CookieExtension) Marshal() ([]byte, error) {
 func (c *CookieExtension) Unmarshal(data []byte) (int, error) {
 	return syntax.Unmarshal(data, c)
 }
+
+// TLS Flags Extension (draft-ietf-tls-tlsflags-16)
+// Used to negotiate optional TLS features via bit flags
+//
+// struct {
+//     uint16 flags<0..2^16-1>;
+// } FlagsExtension;
+//
+// Flags are represented as bits in a uint16, where each bit position
+// represents a specific flag. Flags are numbered starting from bit 0 (LSB).
+
+// Flag constants for TLS Flags Extension
+// These correspond to bit positions in the flags field
+const (
+	// FlagExtendedKeyUpdate indicates support for Extended Key Update (EKU)
+	// as specified in draft-ietf-tls-extended-key-update-07
+	// Bit position: 0 (LSB)
+	FlagExtendedKeyUpdate uint16 = 1 << 0 // Bit 0
+)
+
+// FlagsExtension implements the TLS flags extension
+// Wire format: uint16 flags (bit field)
+type FlagsExtension struct {
+	Flags uint16 // Bit field representing various TLS flags
+}
+
+func (fe FlagsExtension) Type() ExtensionType {
+	return ExtensionTypeFlags
+}
+
+// flagsExtensionInner is the wire format structure
+// struct {
+//     uint16 flags;
+// } FlagsExtension;
+type flagsExtensionInner struct {
+	Flags uint16
+}
+
+func (fe FlagsExtension) Marshal() ([]byte, error) {
+	return syntax.Marshal(flagsExtensionInner{Flags: fe.Flags})
+}
+
+func (fe *FlagsExtension) Unmarshal(data []byte) (int, error) {
+	var inner flagsExtensionInner
+	read, err := syntax.Unmarshal(data, &inner)
+	if err != nil {
+		return 0, err
+	}
+	fe.Flags = inner.Flags
+	return read, nil
+}
+
+// HasFlag checks if a specific flag is set
+func (fe FlagsExtension) HasFlag(flag uint16) bool {
+	return (fe.Flags & flag) != 0
+}
+
+// SetFlag sets a specific flag
+func (fe *FlagsExtension) SetFlag(flag uint16) {
+	fe.Flags |= flag
+}
+
+// ClearFlag clears a specific flag
+func (fe *FlagsExtension) ClearFlag(flag uint16) {
+	fe.Flags &^= flag
+}

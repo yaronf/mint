@@ -45,6 +45,7 @@ const (
 	HandshakeTypeServerConfiguration HandshakeType = 17
 	HandshakeTypeFinished            HandshakeType = 20
 	HandshakeTypeKeyUpdate           HandshakeType = 24
+	HandshakeTypeExtendedKeyUpdate   HandshakeType = 25 // TBD2 - placeholder until IANA assignment (using 25 temporarily)
 	HandshakeTypeMessageHash         HandshakeType = 254
 )
 
@@ -125,6 +126,7 @@ const (
 	ExtensionTypeCookie              ExtensionType = 44
 	ExtensionTypePSKKeyExchangeModes ExtensionType = 45
 	ExtensionTypeTicketEarlyDataInfo ExtensionType = 46
+	ExtensionTypeFlags                ExtensionType = 0xFF01 // TBD1 - placeholder until IANA assignment
 )
 
 // enum {...} NamedGroup

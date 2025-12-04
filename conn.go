@@ -128,6 +128,13 @@ type Config struct {
 	PSKModes         []PSKKeyExchangeMode
 	NonBlocking      bool
 	UseDTLS          bool
+	// EnableExtendedKeyUpdate enables support for Extended Key Update (EKU) as specified
+	// in draft-ietf-tls-extended-key-update-07. When enabled, EKU provides post-compromise
+	// security through fresh (EC)DHE key exchange during an active session.
+	// If EKU is negotiated, standard KeyUpdate MUST NOT be used (mutually exclusive).
+	// Both peers must enable EKU for it to be negotiated.
+	// Default: false (disabled for backward compatibility).
+	EnableExtendedKeyUpdate bool
 
 	RecordLayer RecordLayerFactory
 
@@ -169,6 +176,7 @@ func (c *Config) Clone() *Config {
 		PSKModes:              c.PSKModes,
 		NonBlocking:           c.NonBlocking,
 		UseDTLS:               c.UseDTLS,
+		EnableExtendedKeyUpdate: c.EnableExtendedKeyUpdate,
 	}
 }
 
@@ -262,6 +270,7 @@ type controllerCommandType int
 
 const (
 	cmdKeyUpdate controllerCommandType = iota
+	cmdExtendedKeyUpdate
 	cmdClose
 )
 
@@ -308,6 +317,9 @@ type Conn struct {
 
 	// KeyUpdate waiting state
 	pendingKeyUpdateResponse chan struct{} // Signals when KeyUpdate response is received
+
+	// ExtendedKeyUpdate waiting state
+	pendingEKUResponse chan struct{} // Signals when EKU response (Message 2) or new_key_update (Message 4) is received
 }
 
 func NewConn(conn net.Conn, config *Config, isClient bool) *Conn {
@@ -326,6 +338,7 @@ func NewConn(conn net.Conn, config *Config, isClient bool) *Conn {
 		closed:                   make(chan struct{}),
 		controllerRunning:        false,
 		pendingKeyUpdateResponse: nil, // Will be created when needed
+		pendingEKUResponse:       nil, // Will be created when needed
 	}
 	if !config.UseDTLS {
 		if config.RecordLayer == nil {
@@ -1138,6 +1151,234 @@ func (c *Conn) SendKeyUpdate(requestUpdate bool) error {
 	return c.initiateKeyUpdate(requestUpdate)
 }
 
+// SendExtendedKeyUpdate initiates an Extended Key Update (EKU) exchange.
+//
+// EKU provides post-compromise security by performing a fresh (EC)DHE key exchange
+// within an active TLS session. This is more secure than standard KeyUpdate, which
+// only derives new keys from existing traffic secrets without fresh entropy.
+//
+// The EKU exchange consists of 4 messages:
+//   1. key_update_request: Initiator sends a KeyShareEntry with a fresh public key
+//   2. key_update_response: Responder sends a KeyShareEntry with a fresh public key
+//   3. new_key_update: Initiator sends after deriving new keys from the shared secret
+//   4. new_key_update: Responder sends after deriving new keys from the shared secret
+//
+// This method blocks until all 4 messages are exchanged and new keys are activated.
+// The method returns an error if:
+//   - EKU was not negotiated during the handshake
+//   - The handshake is not yet complete
+//   - An EKU is already in progress
+//   - The connection is closed
+//
+// For DTLS connections, EKU is handled synchronously without the controller.
+// For TLS connections, EKU uses the TLS Controller architecture.
+//
+// See draft-ietf-tls-extended-key-update-07 for the complete specification.
+func (c *Conn) SendExtendedKeyUpdate() error {
+	if !c.handshakeComplete {
+		return errors.New("cannot update keys until after handshake")
+	}
+
+	if !c.state.Params.UsingExtendedKeyUpdate {
+		return errors.New("Extended Key Update not negotiated")
+	}
+
+	if c.state.ekuInProgress {
+		return errors.New("Extended Key Update already in progress")
+	}
+
+	// For DTLS, handle EKU synchronously (no controller)
+	if c.config.UseDTLS {
+		return c.sendExtendedKeyUpdateDTLS()
+	}
+
+	// For TLS, use controller
+	if !c.controllerRunning {
+		return errors.New("Extended Key Update called before controller started")
+	}
+
+	// Create command and send to controller
+	resultChan := make(chan commandResult, 1)
+	cmd := controllerCommand{
+		cmdType: cmdExtendedKeyUpdate,
+		result:  resultChan,
+	}
+
+	logf(logTypeHandshake, "%s SendExtendedKeyUpdate() sending command to controller", c.label())
+	// Send command (blocks until controller accepts)
+	select {
+	case c.commands <- cmd:
+		logf(logTypeHandshake, "%s SendExtendedKeyUpdate() command sent, waiting for result", c.label())
+		// Wait for result (blocks until complete)
+		select {
+		case result := <-resultChan:
+			logf(logTypeHandshake, "%s SendExtendedKeyUpdate() received result, err=%v", c.label(), result.err)
+			return result.err
+		case err := <-c.errors:
+			return err
+		case <-c.closed:
+			return io.EOF
+		}
+	case err := <-c.errors:
+		return err
+	case <-c.closed:
+		return io.EOF
+	}
+}
+
+// sendExtendedKeyUpdateDTLS handles EKU for DTLS synchronously
+func (c *Conn) sendExtendedKeyUpdateDTLS() error {
+	logf(logTypeHandshake, "%s sendExtendedKeyUpdateDTLS() called", c.label())
+
+	// Step 1: Send key_update_request (Message 1)
+	actions, alert := (&c.state).ExtendedKeyUpdateInitiate()
+	if alert != AlertNoAlert {
+		c.sendAlert(alert)
+		return fmt.Errorf("alert while generating EKU request: %v", alert)
+	}
+
+	// Take actions (send key_update_request)
+	for _, action := range actions {
+		actionAlert := c.takeAction(action)
+		if actionAlert != AlertNoAlert {
+			c.sendAlert(actionAlert)
+			return fmt.Errorf("alert during EKU actions: %v", actionAlert)
+		}
+	}
+
+	// Step 2: Wait for key_update_response (Message 2)
+	// Poll Read() to process incoming messages
+	for !c.state.ekuInProgress || c.state.ekuIsInitiator {
+		// Check if we've received Message 2 (response)
+		// The state machine will have processed it if we're past the response stage
+		if c.state.ekuResponseMessage != nil {
+			break
+		}
+
+		// Read a record to process incoming messages
+		c.in.Lock()
+		pt, err := c.in.ReadRecord()
+		c.in.Unlock()
+
+		if pt == nil {
+			if err == io.EOF {
+				return io.EOF
+			}
+			if err == AlertWouldBlock {
+				// No data available, continue waiting
+				continue
+			}
+			return err
+		}
+
+		// Process the record
+		if pt.contentType == RecordTypeHandshake {
+			if err := c.consumeRecordDTLS(pt); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Step 3: Wait for responder's new_key_update (Message 4)
+	// The state machine should have sent our new_key_update (Message 3) automatically
+	for c.state.ekuInProgress {
+		// Read records to process incoming messages
+		c.in.Lock()
+		pt, err := c.in.ReadRecord()
+		c.in.Unlock()
+
+		if pt == nil {
+			if err == io.EOF {
+				return io.EOF
+			}
+			if err == AlertWouldBlock {
+				// No data available, continue waiting
+				continue
+			}
+			return err
+		}
+
+		// Process the record
+		if pt.contentType == RecordTypeHandshake {
+			if err := c.consumeRecordDTLS(pt); err != nil {
+				return err
+			}
+		}
+
+		// Check if EKU is complete (state cleared)
+		if !c.state.ekuInProgress {
+			break
+		}
+	}
+
+	logf(logTypeHandshake, "%s sendExtendedKeyUpdateDTLS() completed", c.label())
+	return nil
+}
+
+// consumeRecordDTLS processes a DTLS record for EKU
+func (c *Conn) consumeRecordDTLS(pt *TLSPlaintext) error {
+	if pt.contentType != RecordTypeHandshake {
+		return nil // Not a handshake record
+	}
+
+	// Parse handshake message
+	start := 0
+	headerLen := handshakeHeaderLenDTLS
+
+	for start < len(pt.fragment) {
+		if len(pt.fragment[start:]) < headerLen {
+			return fmt.Errorf("post-handshake handshake message too short for header")
+		}
+
+		hm := &HandshakeMessage{}
+		hm.msgType = HandshakeType(pt.fragment[start])
+		hmLen := (int(pt.fragment[start+1]) << 16) + (int(pt.fragment[start+2]) << 8) + int(pt.fragment[start+3])
+
+		if len(pt.fragment[start+headerLen:]) < hmLen {
+			return fmt.Errorf("post-handshake handshake message too short for body")
+		}
+		hm.body = pt.fragment[start+headerLen : start+headerLen+hmLen]
+
+		// Reject standard KeyUpdate if EKU is negotiated
+		if hm.msgType == HandshakeTypeKeyUpdate && c.state.Params.UsingExtendedKeyUpdate {
+			logf(logTypeHandshake, "%s consumeRecordDTLS() ERROR: Received standard KeyUpdate but EKU is negotiated", c.label())
+			alert := AlertUnexpectedMessage
+			c.sendAlert(alert)
+			return fmt.Errorf("unexpected standard KeyUpdate when Extended Key Update is negotiated: %v", alert)
+		}
+
+		// Process message using state machine
+		state, actions, alert := c.state.ProcessMessage(hm)
+		if alert != AlertNoAlert {
+			logf(logTypeHandshake, "Error in state transition: %v", alert)
+			c.sendAlert(alert)
+			return alert
+		}
+
+		// Take actions (rekey, send response, etc.)
+		for _, action := range actions {
+			actionAlert := c.takeAction(action)
+			if actionAlert != AlertNoAlert {
+				logf(logTypeHandshake, "Error during handshake actions: %v", actionAlert)
+				c.sendAlert(actionAlert)
+				return actionAlert
+			}
+		}
+
+		// Update state
+		var connected bool
+		c.state, connected = state.(stateConnected)
+		if !connected {
+			logf(logTypeHandshake, "Disconnected after state transition")
+			return fmt.Errorf("disconnected after state transition")
+		}
+
+		start += headerLen + hmLen
+	}
+
+	return nil
+}
+
 func (c *Conn) GetHsState() State {
 	if c.hState == nil {
 		return StateInit
@@ -1366,6 +1607,8 @@ func (c *Conn) handleCommand(cmd controllerCommand) {
 	switch cmd.cmdType {
 	case cmdKeyUpdate:
 		c.handleKeyUpdateCommand(cmd)
+	case cmdExtendedKeyUpdate:
+		c.handleExtendedKeyUpdateCommand(cmd)
 	case cmdClose:
 		c.handleCloseCommand(cmd)
 	default:
@@ -1379,6 +1622,13 @@ func (c *Conn) handleKeyUpdateCommand(cmd controllerCommand) {
 	logf(logTypeHandshake, "%s handleKeyUpdateCommand() called, requestUpdate=%v", c.label(), cmd.requestUpdate)
 	if !c.handshakeComplete {
 		cmd.result <- commandResult{err: errors.New("cannot update keys until after handshake")}
+		return
+	}
+
+	// Standard KeyUpdate is not allowed when EKU is negotiated (mutually exclusive)
+	if c.state.Params.UsingExtendedKeyUpdate {
+		logf(logTypeHandshake, "%s handleKeyUpdateCommand() ERROR: Standard KeyUpdate not allowed when EKU is negotiated", c.label())
+		cmd.result <- commandResult{err: errors.New("standard KeyUpdate not allowed when Extended Key Update is negotiated")}
 		return
 	}
 
@@ -1472,6 +1722,97 @@ func (c *Conn) handleKeyUpdateCommand(cmd controllerCommand) {
 	cmd.result <- commandResult{err: nil}
 }
 
+// handleExtendedKeyUpdateCommand processes an Extended Key Update command
+// This handles the 4-message EKU exchange: request -> response -> new_key_update (initiator) -> new_key_update (responder)
+func (c *Conn) handleExtendedKeyUpdateCommand(cmd controllerCommand) {
+	logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() called", c.label())
+	if !c.handshakeComplete {
+		cmd.result <- commandResult{err: errors.New("cannot update keys until after handshake")}
+		return
+	}
+
+	if !c.state.Params.UsingExtendedKeyUpdate {
+		cmd.result <- commandResult{err: errors.New("Extended Key Update not negotiated")}
+		return
+	}
+
+	if c.state.ekuInProgress {
+		cmd.result <- commandResult{err: errors.New("Extended Key Update already in progress")}
+		return
+	}
+
+	logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() calling state.ExtendedKeyUpdateInitiate()", c.label())
+	// Create the EKU request (Message 1) and update state
+	actions, alert := (&c.state).ExtendedKeyUpdateInitiate()
+	if alert != AlertNoAlert {
+		c.sendAlert(alert)
+		cmd.result <- commandResult{err: fmt.Errorf("alert while generating EKU request: %v", alert)}
+		return
+	}
+
+	logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() taking %d actions", c.label(), len(actions))
+	// Take actions (send key_update_request)
+	for i, action := range actions {
+		logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() taking action %d/%d: %T", c.label(), i+1, len(actions), action)
+		actionAlert := c.takeAction(action)
+		if actionAlert != AlertNoAlert {
+			c.sendAlert(actionAlert)
+			cmd.result <- commandResult{err: fmt.Errorf("alert during EKU actions: %v", actionAlert)}
+			return
+		}
+	}
+
+	logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() setting up wait for EKU response (Message 2)", c.label())
+	// Create channel to wait for peer's EKU response (Message 2)
+	// Note: No mutex needed - controller is single-threaded and API is synchronous
+	if c.pendingEKUResponse != nil {
+		logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() ERROR: already waiting for EKU response", c.label())
+		cmd.result <- commandResult{err: errors.New("Extended Key Update already in progress")}
+		return
+	}
+	c.pendingEKUResponse = make(chan struct{})
+	logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() created pendingEKUResponse channel, EKU request sent, waiting for response", c.label())
+
+	// Spawn a goroutine to wait for the 4-message exchange to complete
+	// The controller loop must continue to process incoming socket records
+	go func() {
+		logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() goroutine started, waiting for EKU response (Message 2)", c.label())
+		// Wait for peer's EKU response (Message 2)
+		select {
+		case <-c.pendingEKUResponse:
+			// Message 2 received and processed (state machine handled it)
+			// Now wait for Message 4 (responder's new_key_update)
+			logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() goroutine: received EKU response (Message 2) signal, waiting for new_key_update (Message 4)", c.label())
+			// Recreate channel for Message 4
+			c.pendingEKUResponse = make(chan struct{})
+			select {
+			case <-c.pendingEKUResponse:
+				// Message 4 received and processed
+				logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() goroutine: received new_key_update (Message 4) signal, EKU complete!", c.label())
+				c.pendingEKUResponse = nil
+				cmd.result <- commandResult{err: nil}
+			case err := <-c.errors:
+				logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() goroutine: error while waiting for Message 4: %v", c.label(), err)
+				c.pendingEKUResponse = nil
+				cmd.result <- commandResult{err: err}
+			case <-c.closed:
+				logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() goroutine: connection closed while waiting for Message 4", c.label())
+				c.pendingEKUResponse = nil
+				cmd.result <- commandResult{err: io.EOF}
+			}
+		case err := <-c.errors:
+			logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() goroutine: error while waiting for Message 2: %v", c.label(), err)
+			c.pendingEKUResponse = nil
+			cmd.result <- commandResult{err: err}
+		case <-c.closed:
+			logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() goroutine: connection closed while waiting for Message 2", c.label())
+			c.pendingEKUResponse = nil
+			cmd.result <- commandResult{err: io.EOF}
+		}
+	}()
+	logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() returning, controller can continue processing", c.label())
+}
+
 // handleCloseCommand processes a Close command
 func (c *Conn) handleCloseCommand(cmd controllerCommand) {
 	// Close the closed channel to signal shutdown
@@ -1525,8 +1866,21 @@ func (c *Conn) processHandshakeRecord(pt *TLSPlaintext) {
 		}
 		hm.body = pt.fragment[start+headerLen : start+headerLen+hmLen]
 
-		// Check if this is a KeyUpdate response we're waiting for
+		// Reject standard KeyUpdate if EKU is negotiated (mutually exclusive)
+		if hm.msgType == HandshakeTypeKeyUpdate && c.state.Params.UsingExtendedKeyUpdate {
+			logf(logTypeHandshake, "%s processHandshakeRecord() ERROR: Received standard KeyUpdate but EKU is negotiated", c.label())
+			alert := AlertUnexpectedMessage
+			c.sendAlert(alert)
+			select {
+			case c.errors <- fmt.Errorf("unexpected standard KeyUpdate when Extended Key Update is negotiated: %v", alert):
+			case <-c.closed:
+			}
+			return
+		}
+
+		// Check if this is a KeyUpdate or ExtendedKeyUpdate message we're waiting for
 		isKeyUpdateResponse := false
+		isEKUResponse := false
 		bodyGeneric, err := hm.ToBody()
 		if err == nil {
 			if keyUpdateBody, ok := bodyGeneric.(*KeyUpdateBody); ok {
@@ -1538,6 +1892,24 @@ func (c *Conn) processHandshakeRecord(pt *TLSPlaintext) {
 				if c.pendingKeyUpdateResponse != nil {
 					isKeyUpdateResponse = true
 					logf(logTypeHandshake, "%s processHandshakeRecord() this is the KeyUpdate response we're waiting for!", c.label())
+				}
+			} else if ekuBody, ok := bodyGeneric.(*ExtendedKeyUpdateBody); ok {
+				// This is an ExtendedKeyUpdate message
+				logf(logTypeHandshake, "%s processHandshakeRecord() received ExtendedKeyUpdate message, type=%v, pendingEKUResponse=%v, ekuInProgress=%v, ekuIsInitiator=%v",
+					c.label(), ekuBody.EKUType, c.pendingEKUResponse != nil, c.state.ekuInProgress, c.state.ekuIsInitiator)
+				// If we're waiting for EKU response and we're the initiator:
+				// - Message 2 (Response): Signal after processing
+				// - Message 4 (NewKeyUpdate from responder): Signal after processing
+				if c.pendingEKUResponse != nil && c.state.ekuInProgress {
+					if ekuBody.EKUType == ExtendedKeyUpdateTypeResponse && c.state.ekuIsInitiator {
+						// Message 2: Response to our request
+						isEKUResponse = true
+						logf(logTypeHandshake, "%s processHandshakeRecord() this is the EKU response (Message 2) we're waiting for!", c.label())
+					} else if ekuBody.EKUType == ExtendedKeyUpdateTypeNewKeyUpdate && c.state.ekuIsInitiator {
+						// Message 4: Responder's new_key_update
+						isEKUResponse = true
+						logf(logTypeHandshake, "%s processHandshakeRecord() this is the responder's new_key_update (Message 4) we're waiting for!", c.label())
+					}
 				}
 			}
 		}
@@ -1590,6 +1962,32 @@ func (c *Conn) processHandshakeRecord(pt *TLSPlaintext) {
 				logf(logTypeHandshake, "%s processHandshakeRecord() KeyUpdate response signal sent", c.label())
 			} else {
 				logf(logTypeHandshake, "%s processHandshakeRecord() WARNING: isKeyUpdateResponse=true but pendingKeyUpdateResponse is nil!", c.label())
+			}
+		}
+
+		// If this was an EKU message we were waiting for, signal completion
+		if isEKUResponse {
+			// Note: No mutex needed - controller is single-threaded
+			if c.pendingEKUResponse != nil {
+				logf(logTypeHandshake, "%s processHandshakeRecord() signaling EKU response completion", c.label())
+				close(c.pendingEKUResponse)
+				// Don't set to nil here - the goroutine will recreate it for Message 4 or set to nil when complete
+				logf(logTypeHandshake, "%s processHandshakeRecord() EKU response signal sent", c.label())
+			} else {
+				logf(logTypeHandshake, "%s processHandshakeRecord() WARNING: isEKUResponse=true but pendingEKUResponse is nil!", c.label())
+			}
+		}
+
+		// If this was an EKU message we were waiting for, signal completion
+		if isEKUResponse {
+			// Note: No mutex needed - controller is single-threaded
+			if c.pendingEKUResponse != nil {
+				logf(logTypeHandshake, "%s processHandshakeRecord() signaling EKU response completion", c.label())
+				close(c.pendingEKUResponse)
+				// Don't set to nil here - the goroutine will recreate it for Message 4 or set to nil when complete
+				logf(logTypeHandshake, "%s processHandshakeRecord() EKU response signal sent", c.label())
+			} else {
+				logf(logTypeHandshake, "%s processHandshakeRecord() WARNING: isEKUResponse=true but pendingEKUResponse is nil!", c.label())
 			}
 		}
 

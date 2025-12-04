@@ -479,3 +479,70 @@ func (eoed EndOfEarlyDataBody) Marshal() ([]byte, error) {
 func (eoed *EndOfEarlyDataBody) Unmarshal(data []byte) (int, error) {
 	return 0, nil
 }
+
+// Extended Key Update (EKU) message types
+// enum {
+//     key_update_request(0),
+//     key_update_response(1),
+//     new_key_update(2),
+//     (255)
+// } ExtendedKeyUpdateType;
+type ExtendedKeyUpdateType uint8
+
+const (
+	ExtendedKeyUpdateTypeRequest    ExtendedKeyUpdateType = 0 // key_update_request
+	ExtendedKeyUpdateTypeResponse   ExtendedKeyUpdateType = 1 // key_update_response
+	ExtendedKeyUpdateTypeNewKeyUpdate ExtendedKeyUpdateType = 2 // new_key_update
+)
+
+// ExtendedKeyUpdate message body
+// struct {
+//     ExtendedKeyUpdateType eku_type;
+//     select (eku_type) {
+//         case key_update_request: {
+//             KeyShareEntry key_share;
+//         }
+//         case key_update_response: {
+//             KeyShareEntry key_share;
+//         }
+//         case new_key_update: {
+//             /* empty */
+//         }
+//     };
+// } ExtendedKeyUpdate;
+type ExtendedKeyUpdateBody struct {
+	EKUType  ExtendedKeyUpdateType
+	KeyShare *KeyShareEntry // Present for request/response, nil for new_key_update
+}
+
+func (eku ExtendedKeyUpdateBody) Type() HandshakeType {
+	return HandshakeTypeExtendedKeyUpdate
+}
+
+// extendedKeyUpdateInner is the wire format structure
+// KeyShare is optional - present for request/response, absent for new_key_update
+type extendedKeyUpdateInner struct {
+	EKUType  ExtendedKeyUpdateType
+	KeyShare *KeyShareEntry `tls:"optional"`
+}
+
+func (eku ExtendedKeyUpdateBody) Marshal() ([]byte, error) {
+	inner := extendedKeyUpdateInner{
+		EKUType: eku.EKUType,
+		KeyShare: eku.KeyShare,
+	}
+	return syntax.Marshal(inner)
+}
+
+func (eku *ExtendedKeyUpdateBody) Unmarshal(data []byte) (int, error) {
+	var inner extendedKeyUpdateInner
+	read, err := syntax.Unmarshal(data, &inner)
+	if err != nil {
+		return 0, err
+	}
+
+	eku.EKUType = inner.EKUType
+	eku.KeyShare = inner.KeyShare
+
+	return read, nil
+}

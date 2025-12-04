@@ -122,6 +122,7 @@ func (state serverStateStart) Next(hr handshakeMessageReader) (HandshakeState, [
 	clientALPN := new(ALPNExtension)
 	clientPSKModes := new(PSKKeyExchangeModesExtension)
 	clientCookie := new(CookieExtension)
+	clientFlags := &FlagsExtension{}
 
 	// Handle external extensions.
 	if state.Config.ExtensionHandler != nil {
@@ -144,6 +145,7 @@ func (state serverStateStart) Next(hr handshakeMessageReader) (HandshakeState, [
 			clientALPN,
 			clientPSKModes,
 			clientCookie,
+			clientFlags,
 		})
 
 	if err != nil {
@@ -379,6 +381,19 @@ func (state serverStateStart) Next(hr handshakeMessageReader) (HandshakeState, [
 		return nil, nil, AlertNoApplicationProtocol
 	}
 
+	// Check Extended Key Update negotiation
+	if foundExts[ExtensionTypeFlags] && clientFlags.HasFlag(FlagExtendedKeyUpdate) {
+		// Client sent extended_key_update flag
+		if state.Config.EnableExtendedKeyUpdate {
+			// Server also supports it - negotiate EKU
+			connParams.UsingExtendedKeyUpdate = true
+			logf(logTypeHandshake, "[ServerStateStart] Extended Key Update negotiated")
+		} else {
+			// Server doesn't support it - ignore the flag (per draft: "If the flag is not set, servers ignore...")
+			logf(logTypeHandshake, "[ServerStateStart] Client sent extended_key_update flag but server doesn't support it, ignoring")
+		}
+	}
+
 	state.hsCtx.receivedEndOfFlight()
 
 	logf(logTypeHandshake, "[ServerStateStart] -> [ServerStateNegotiated]")
@@ -590,6 +605,17 @@ func (state serverStateNegotiated) Next(_ handshakeMessageReader) (HandshakeStat
 			logf(logTypeHandshake, "[ServerStateNegotiated] Error adding EDI to EncryptedExtensions [%v]", err)
 			return nil, nil, AlertInternalError
 		}
+	}
+	// Add flags extension if Extended Key Update was negotiated
+	if state.Params.UsingExtendedKeyUpdate {
+		flagsExt := &FlagsExtension{}
+		flagsExt.SetFlag(FlagExtendedKeyUpdate)
+		err = eeList.Add(flagsExt)
+		if err != nil {
+			logf(logTypeHandshake, "[ServerStateNegotiated] Error adding flags extension to EncryptedExtensions [%v]", err)
+			return nil, nil, AlertInternalError
+		}
+		logf(logTypeHandshake, "[ServerStateNegotiated] Added flags extension with extended_key_update flag to EncryptedExtensions")
 	}
 	ee := &EncryptedExtensionsBody{eeList}
 
@@ -1152,6 +1178,13 @@ func (state serverStateWaitFinished) Next(hr handshakeMessageReader) (HandshakeS
 	resumptionSecret := deriveSecret(state.cryptoParams, state.masterSecret, labelResumptionSecret, h6)
 	logf(logTypeCrypto, "resumption secret: [%d] %x", len(resumptionSecret), resumptionSecret)
 
+	// Compute and store derived value for EKU (if EKU is negotiated)
+	var ekuDerivedSecret []byte
+	if state.Params.UsingExtendedKeyUpdate {
+		ekuDerivedSecret = deriveSecret(state.cryptoParams, state.masterSecret, labelDerived, []byte{})
+		logf(logTypeCrypto, "EKU derived secret: [%d] %x", len(ekuDerivedSecret), ekuDerivedSecret)
+	}
+
 	// Compute client traffic keys
 	clientTrafficKeys := makeTrafficKeys(state.cryptoParams, state.clientTrafficSecret)
 
@@ -1167,6 +1200,7 @@ func (state serverStateWaitFinished) Next(hr handshakeMessageReader) (HandshakeS
 		clientTrafficSecret: state.clientTrafficSecret,
 		serverTrafficSecret: state.serverTrafficSecret,
 		exporterSecret:      state.exporterSecret,
+		ekuDerivedSecret:    ekuDerivedSecret,
 		peerCertificates:    state.peerCertificates,
 		verifiedChains:      state.verifiedChains,
 	}
