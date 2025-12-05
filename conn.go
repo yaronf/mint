@@ -1894,6 +1894,10 @@ func (c *Conn) processHandshakeRecord(pt *TLSPlaintext) {
 			return
 		}
 		hm.body = pt.fragment[start+headerLen : start+headerLen+hmLen]
+		
+		// Store raw handshake message bytes (including header) for EKU key derivation binding
+		// This ensures both sides use the exact same bytes for context, not re-marshaled versions
+		rawHandshakeMessage := pt.fragment[start : start+headerLen+hmLen]
 
 		// Reject standard KeyUpdate if EKU is negotiated (mutually exclusive)
 		if hm.msgType == HandshakeTypeKeyUpdate && c.state.Params.UsingExtendedKeyUpdate {
@@ -1956,8 +1960,9 @@ func (c *Conn) processHandshakeRecord(pt *TLSPlaintext) {
 		}
 
 		// Process message using state machine
+		// Pass raw handshake message bytes for EKU key derivation binding
 		logf(logTypeHandshake, "%s processHandshakeRecord() calling ProcessMessage() for msgType=%v", c.label(), hm.msgType)
-		state, actions, alert := (&c.state).ProcessMessage(hm)
+		state, actions, alert := (&c.state).ProcessMessageWithRawBytes(hm, rawHandshakeMessage)
 		if alert != AlertNoAlert {
 			logf(logTypeHandshake, "%s processHandshakeRecord() ERROR in state transition: %v", c.label(), alert)
 			c.sendAlert(alert)

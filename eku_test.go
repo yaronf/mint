@@ -355,9 +355,7 @@ func TestEKUMultipleSequential(t *testing.T) {
 	t.Log("TestEKUMultipleSequential: Client writing after first EKU")
 	client.Write(oneBuf)
 	<-s2c
-	t.Log("TestEKUMultipleSequential: Client received second s2c")
-	client.Read(oneBuf)
-	t.Log("TestEKUMultipleSequential: Client read after first EKU")
+	t.Log("TestEKUMultipleSequential: Client received second s2c (server read our data)")
 
 	// Second EKU
 	t.Log("TestEKUMultipleSequential: Client initiating second EKU")

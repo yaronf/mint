@@ -285,6 +285,10 @@ func (state stateConnected) Next(hr handshakeMessageReader) (HandshakeState, []H
 }
 
 func (state stateConnected) ProcessMessage(hm *HandshakeMessage) (HandshakeState, []HandshakeAction, Alert) {
+	return state.ProcessMessageWithRawBytes(hm, nil)
+}
+
+func (state stateConnected) ProcessMessageWithRawBytes(hm *HandshakeMessage, rawBytes []byte) (HandshakeState, []HandshakeAction, Alert) {
 	if hm == nil {
 		logf(logTypeHandshake, "[StateConnected] Unexpected message")
 		return nil, nil, AlertUnexpectedMessage
@@ -330,7 +334,7 @@ func (state stateConnected) ProcessMessage(hm *HandshakeMessage) (HandshakeState
 		}
 		return state, toSend, AlertNoAlert
 	case *ExtendedKeyUpdateBody:
-		hs, actions, alert := state.handleExtendedKeyUpdate(hm, body)
+		hs, actions, alert := state.handleExtendedKeyUpdate(hm, body, rawBytes)
 		// handleExtendedKeyUpdate returns *stateConnected, but ProcessMessage expects stateConnected value
 		if hs == nil {
 			return nil, actions, alert
@@ -545,7 +549,8 @@ func (state *stateConnected) deriveEKUKeysForResponder(ourKeyShare, peerKeyShare
 
 // handleExtendedKeyUpdate processes Extended Key Update messages
 // This handles both initiator and responder paths
-func (state *stateConnected) handleExtendedKeyUpdate(hm *HandshakeMessage, body *ExtendedKeyUpdateBody) (HandshakeState, []HandshakeAction, Alert) {
+// rawBytes is the raw handshake message bytes from the wire (for key derivation binding)
+func (state *stateConnected) handleExtendedKeyUpdate(hm *HandshakeMessage, body *ExtendedKeyUpdateBody, rawBytes []byte) (HandshakeState, []HandshakeAction, Alert) {
 	logf(logTypeHandshake, "[StateConnected] handleExtendedKeyUpdate: EKUType=%v, UsingExtendedKeyUpdate=%v, NegotiatedGroup=%v, ekuInProgress=%v, ekuIsInitiator=%v",
 		body.EKUType, state.Params.UsingExtendedKeyUpdate, state.Params.NegotiatedGroup, state.ekuInProgress, state.ekuIsInitiator)
 	
@@ -589,7 +594,14 @@ func (state *stateConnected) handleExtendedKeyUpdate(hm *HandshakeMessage, body 
 
 		// Store peer's key share and request message
 		state.ekuPeerKeyShare = body.KeyShare
-		state.ekuRequestMessage = hm.Marshal()
+		// Use raw bytes if provided (from wire), otherwise marshal (for compatibility)
+		// rawBytes is the raw handshake message bytes from the wire (for key derivation binding)
+		if rawBytes != nil && len(rawBytes) > 0 {
+			state.ekuRequestMessage = make([]byte, len(rawBytes))
+			copy(state.ekuRequestMessage, rawBytes)
+		} else {
+			state.ekuRequestMessage = hm.Marshal()
+		}
 
 		// Generate fresh key share using negotiated group
 		// Store both public and private key - private key is needed for key derivation
@@ -654,7 +666,12 @@ func (state *stateConnected) handleExtendedKeyUpdate(hm *HandshakeMessage, body 
 
 		// Store peer's key share and response message
 		state.ekuPeerKeyShare = body.KeyShare
-		state.ekuResponseMessage = hm.Marshal()
+		// Use raw bytes if provided (from wire), otherwise marshal (for compatibility)
+		if rawBytes != nil && len(rawBytes) > 0 {
+			state.ekuResponseMessage = rawBytes
+		} else {
+			state.ekuResponseMessage = hm.Marshal()
+		}
 
 		// Derive new secrets using EKU key derivation
 		rekeyActions, alert := state.deriveEKUKeys(state.ekuOurKeyShare, state.ekuPeerKeyShare, state.ekuRequestMessage, state.ekuResponseMessage)
@@ -755,7 +772,16 @@ func (state *stateConnected) handleExtendedKeyUpdate(hm *HandshakeMessage, body 
 			}
 			toSend = append(toSend, SendQueuedHandshake{})
 
-		logf(logTypeHandshake, "[StateConnected] Responder: Queued new_key_update (Message 4) for sending, actions count=%d", len(toSend))
+		// Clear EKU state after sending Message 4 - exchange is complete
+		state.ekuInProgress = false
+		state.ekuIsInitiator = false
+		state.ekuOurKeyShare = nil
+		state.ekuOurPrivateKey = nil
+		state.ekuPeerKeyShare = nil
+		state.ekuRequestMessage = nil
+		state.ekuResponseMessage = nil
+
+		logf(logTypeHandshake, "[StateConnected] Responder: Queued new_key_update (Message 4) for sending, EKU exchange complete, actions count=%d", len(toSend))
 		for i, action := range toSend {
 			logf(logTypeHandshake, "[StateConnected] Responder: Action[%d]=%T", i, action)
 		}
