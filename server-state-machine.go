@@ -387,15 +387,21 @@ func (state serverStateStart) Next(hr handshakeMessageReader) (HandshakeState, [
 	}
 
 	// Check Extended Key Update negotiation
+	// EKU requires DH to be negotiated (needs a group for key exchange)
 	if foundExts[ExtensionTypeFlags] && clientFlags.HasFlag(FlagExtendedKeyUpdate) {
 		// Client sent extended_key_update flag
-		if state.Config.EnableExtendedKeyUpdate {
-			// Server also supports it - negotiate EKU
+		// Only negotiate EKU if server supports it AND DH is actually being used (not just available)
+		if state.Config.EnableExtendedKeyUpdate && connParams.UsingDH {
+			// Server also supports it and DH is being used - negotiate EKU
 			connParams.UsingExtendedKeyUpdate = true
 			logf(logTypeHandshake, "[ServerStateStart] Extended Key Update negotiated")
 		} else {
-			// Server doesn't support it - ignore the flag (per draft: "If the flag is not set, servers ignore...")
-			logf(logTypeHandshake, "[ServerStateStart] Client sent extended_key_update flag but server doesn't support it, ignoring")
+			// Server doesn't support it or DH not being used - ignore the flag
+			if !state.Config.EnableExtendedKeyUpdate {
+				logf(logTypeHandshake, "[ServerStateStart] Client sent extended_key_update flag but server doesn't support it, ignoring")
+			} else if !connParams.UsingDH {
+				logf(logTypeHandshake, "[ServerStateStart] Client sent extended_key_update flag but DH not being used, ignoring")
+			}
 		}
 	}
 

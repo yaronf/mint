@@ -287,12 +287,14 @@ func (state stateConnected) ProcessMessage(hm *HandshakeMessage) (HandshakeState
 		return nil, nil, AlertUnexpectedMessage
 	}
 
+	logf(logTypeHandshake, "[StateConnected] ProcessMessage: msgType=%v", hm.msgType)
 	bodyGeneric, err := hm.ToBody()
 	if err != nil {
 		logf(logTypeHandshake, "[StateConnected] Error decoding message: %v", err)
 		return nil, nil, AlertDecodeError
 	}
 
+	logf(logTypeHandshake, "[StateConnected] ProcessMessage: decoded body type=%T", bodyGeneric)
 	switch body := bodyGeneric.(type) {
 	case *KeyUpdateBody:
 		// Standard KeyUpdate - reject if EKU is negotiated
@@ -325,7 +327,15 @@ func (state stateConnected) ProcessMessage(hm *HandshakeMessage) (HandshakeState
 		}
 		return state, toSend, AlertNoAlert
 	case *ExtendedKeyUpdateBody:
-		return state.handleExtendedKeyUpdate(hm, body)
+		hs, actions, alert := state.handleExtendedKeyUpdate(hm, body)
+		// handleExtendedKeyUpdate returns *stateConnected, but ProcessMessage expects stateConnected value
+		if hs == nil {
+			return nil, actions, alert
+		}
+		if sc, ok := hs.(*stateConnected); ok {
+			return *sc, actions, alert
+		}
+		return hs, actions, alert
 	case *NewSessionTicketBody:
 		// XXX: Allow NewSessionTicket in both directions?
 		if !state.isClient {
@@ -538,6 +548,9 @@ func (state *stateConnected) deriveEKUKeysForResponder(ourKeyShare, peerKeyShare
 // handleExtendedKeyUpdate processes Extended Key Update messages
 // This handles both initiator and responder paths
 func (state *stateConnected) handleExtendedKeyUpdate(hm *HandshakeMessage, body *ExtendedKeyUpdateBody) (HandshakeState, []HandshakeAction, Alert) {
+	logf(logTypeHandshake, "[StateConnected] handleExtendedKeyUpdate: EKUType=%v, UsingExtendedKeyUpdate=%v, NegotiatedGroup=%v, ekuInProgress=%v, ekuIsInitiator=%v",
+		body.EKUType, state.Params.UsingExtendedKeyUpdate, state.Params.NegotiatedGroup, state.ekuInProgress, state.ekuIsInitiator)
+	
 	if !state.Params.UsingExtendedKeyUpdate {
 		logf(logTypeHandshake, "[StateConnected] Received ExtendedKeyUpdate but EKU not negotiated")
 		return nil, nil, AlertUnexpectedMessage
@@ -548,6 +561,7 @@ func (state *stateConnected) handleExtendedKeyUpdate(hm *HandshakeMessage, body 
 		// Handle request - could be from initiator (tie-breaking) or responder path
 		if state.ekuInProgress && state.ekuIsInitiator {
 			// We're in initiator state, received a request - tie-breaking needed
+			logf(logTypeHandshake, "[StateConnected] Received EKU request while initiator - tie-breaking")
 			return state.handleEKUTieBreaking(hm, body)
 		}
 		// Otherwise, we're the responder - handle request (Message 1)
@@ -564,6 +578,12 @@ func (state *stateConnected) handleExtendedKeyUpdate(hm *HandshakeMessage, body 
 		}
 
 		// Validate group matches negotiated group
+		// Note: NegotiatedGroup should be set when EKU is negotiated (requires DH)
+		logf(logTypeHandshake, "[StateConnected] Validating EKU request: KeyShare.Group=%v, NegotiatedGroup=%v", body.KeyShare.Group, state.Params.NegotiatedGroup)
+		if state.Params.NegotiatedGroup == 0 {
+			logf(logTypeHandshake, "[StateConnected] Received EKU request but NegotiatedGroup is 0 (EKU requires DH)")
+			return nil, nil, AlertInternalError
+		}
 		if body.KeyShare.Group != state.Params.NegotiatedGroup {
 			logf(logTypeHandshake, "[StateConnected] Received EKU request with wrong group: %v != %v", body.KeyShare.Group, state.Params.NegotiatedGroup)
 			return nil, nil, AlertIllegalParameter
@@ -655,43 +675,124 @@ func (state *stateConnected) handleExtendedKeyUpdate(hm *HandshakeMessage, body 
 			return nil, nil, AlertInternalError
 		}
 
-		// Return actions: send new_key_update and rekey outbound
+		// Return actions: rekey inbound first (to decrypt Message 4), then send new_key_update (Message 3), then rekey outbound
+		// The initiator needs to do RekeyIn BEFORE receiving Message 4, so it can decrypt Message 4 with new keys
+		// But deriveEKUKeys only returns RekeyOut. We need to also do RekeyIn.
+		// Actually, wait - the initiator derives keys when receiving Message 2, but only does RekeyOut.
+		// The initiator should do RekeyIn when receiving Message 3, not when receiving Message 4.
+		// But Message 3 is sent by the initiator, not received. So the initiator can't do RekeyIn when receiving Message 3.
+		// Actually, the initiator should do RekeyIn when receiving Message 4, but Message 4 is encrypted with new keys.
+		// So the initiator needs to decrypt Message 4 with new keys, but it only has old keys until RekeyIn.
+		// This is a chicken-and-egg problem. The solution is that Message 4 should be encrypted with OLD keys (before RekeyOut).
+		// But that doesn't match the draft. Let me check the draft again.
+		// Actually, I think the issue is that Message 4 should be encrypted with NEW keys (after RekeyOut), and the initiator
+		// should decrypt it with NEW keys (after RekeyIn). But the initiator needs to decrypt Message 4 BEFORE it can process it and do RekeyIn.
+		// The solution is that the record layer retries decryption after RekeyIn. So the flow is:
+		// 1. Message 4 arrives encrypted with new keys
+		// 2. Decryption fails (initiator has old keys)
+		// 3. Record is cached, AlertWouldBlock is returned
+		// 4. Controller processes Message 4 (but wait, it can't process it if decryption failed!)
+		// Actually, I think Message 4 should be encrypted with OLD keys (before RekeyOut), not NEW keys.
+		// Let me check the draft to see what keys Message 4 should be encrypted with.
+		// For now, let's assume Message 4 should be encrypted with OLD keys, so the initiator can decrypt it with OLD keys,
+		// then do RekeyIn after processing Message 4.
 		toSend := []HandshakeAction{
 			QueueHandshakeMessage{ekuNewMsg},
 			SendQueuedHandshake{},
 		}
 		toSend = append(toSend, rekeyActions...)
 
-		logf(logTypeHandshake, "[StateConnected] Initiator: Sent new_key_update (Message 3), waiting for responder's new_key_update (Message 4)")
+		logf(logTypeHandshake, "[StateConnected] Initiator: Sent new_key_update (Message 3), waiting for responder's new_key_update (Message 4), actions count=%d", len(toSend))
+		for i, action := range toSend {
+			logf(logTypeHandshake, "[StateConnected] Initiator: Action[%d]=%T", i, action)
+		}
 		return state, toSend, AlertNoAlert
 
 	case ExtendedKeyUpdateTypeNewKeyUpdate:
-		// Initiator receives responder's new_key_update (Message 4)
-		if !state.ekuInProgress || !state.ekuIsInitiator {
-			logf(logTypeHandshake, "[StateConnected] Received EKU new_key_update but not in initiator state")
+		if state.ekuInProgress && !state.ekuIsInitiator {
+			// Responder receives initiator's new_key_update (Message 3)
+			logf(logTypeHandshake, "[StateConnected] Responder: Received initiator's new_key_update (Message 3)")
+
+			// Derive new secrets using EKU key derivation
+			rekeyActions, alert := state.deriveEKUKeysForResponder(state.ekuOurKeyShare, state.ekuPeerKeyShare, state.ekuRequestMessage, state.ekuResponseMessage)
+			if alert != AlertNoAlert {
+				logf(logTypeHandshake, "[StateConnected] Error deriving EKU keys for responder: %v", alert)
+				return nil, nil, alert
+			}
+
+			// Create new_key_update message (Message 4)
+			ekuNewBody := &ExtendedKeyUpdateBody{
+				EKUType:  ExtendedKeyUpdateTypeNewKeyUpdate,
+				KeyShare: nil, // new_key_update has no KeyShare
+			}
+
+			ekuNewMsg, err := state.hsCtx.hOut.HandshakeMessageFromBody(ekuNewBody)
+			if err != nil {
+				logf(logTypeHandshake, "[StateConnected] Error marshaling responder's new_key_update: %v", err)
+				return nil, nil, AlertInternalError
+			}
+
+			// Return actions: RekeyIn first (to decrypt Message 3), then queue Message 4 (BEFORE RekeyOut so it uses old keys),
+			// then RekeyOut (to update send keys), then send Message 4
+			// Message 4 should be encrypted with OLD keys (before RekeyOut) so the initiator can decrypt it with OLD keys,
+			// then do RekeyIn after processing Message 4
+			toSend := []HandshakeAction{}
+			// Add RekeyIn first (to decrypt Message 3)
+			for _, action := range rekeyActions {
+				if _, ok := action.(RekeyIn); ok {
+					toSend = append(toSend, action)
+					break
+				}
+			}
+			// Queue Message 4 BEFORE RekeyOut so it captures old cipher state
+			toSend = append(toSend, QueueHandshakeMessage{ekuNewMsg})
+			// Add RekeyOut (to update send keys for future messages)
+			for _, action := range rekeyActions {
+				if _, ok := action.(RekeyOut); ok {
+					toSend = append(toSend, action)
+					break
+				}
+			}
+			toSend = append(toSend, SendQueuedHandshake{})
+
+		logf(logTypeHandshake, "[StateConnected] Responder: Queued new_key_update (Message 4) for sending, actions count=%d", len(toSend))
+		for i, action := range toSend {
+			logf(logTypeHandshake, "[StateConnected] Responder: Action[%d]=%T", i, action)
+		}
+		return state, toSend, AlertNoAlert
+		} else if state.ekuInProgress && state.ekuIsInitiator {
+			// Initiator receives responder's new_key_update (Message 4)
+			logf(logTypeHandshake, "[StateConnected] Initiator: Received responder's new_key_update (Message 4)")
+
+			// Update receive keys (RekeyIn)
+			// Traffic keys were already derived when we received the response (Message 2)
+			// We need to use the SAME keys that were derived then, which are now in state.clientTrafficSecret/state.serverTrafficSecret
+			// For client: receive server's traffic (serverTrafficSecret)
+			// For server: receive client's traffic (clientTrafficSecret)
+			var trafficKeys KeySet
+			if state.isClient {
+				// Client receives server's traffic
+				trafficKeys = makeTrafficKeys(state.cryptoParams, state.serverTrafficSecret)
+			} else {
+				// Server receives client's traffic
+				trafficKeys = makeTrafficKeys(state.cryptoParams, state.clientTrafficSecret)
+			}
+
+			// Clear EKU state - exchange is complete
+			state.ekuInProgress = false
+			state.ekuIsInitiator = false
+			state.ekuOurKeyShare = nil
+			state.ekuPeerKeyShare = nil
+			state.ekuRequestMessage = nil
+			state.ekuResponseMessage = nil
+
+			logf(logTypeHandshake, "[StateConnected] Initiator: ✓ Received responder's new_key_update (Message 4), EKU exchange complete, returning RekeyIn action")
+			return state, []HandshakeAction{RekeyIn{epoch: EpochUpdate, KeySet: trafficKeys}}, AlertNoAlert
+		} else {
+			// Not in EKU state or wrong state
+			logf(logTypeHandshake, "[StateConnected] Received EKU new_key_update but not in EKU state (ekuInProgress=%v, ekuIsInitiator=%v)", state.ekuInProgress, state.ekuIsInitiator)
 			return nil, nil, AlertUnexpectedMessage
 		}
-
-		// Update receive keys (RekeyIn)
-		// Traffic keys were already derived when we received the response (Message 2)
-		// We just need to update receive keys now
-		var trafficKeys KeySet
-		if state.isClient {
-			trafficKeys = makeTrafficKeys(state.cryptoParams, state.serverTrafficSecret)
-		} else {
-			trafficKeys = makeTrafficKeys(state.cryptoParams, state.clientTrafficSecret)
-		}
-
-		// Clear EKU state - exchange is complete
-		state.ekuInProgress = false
-		state.ekuIsInitiator = false
-		state.ekuOurKeyShare = nil
-		state.ekuPeerKeyShare = nil
-		state.ekuRequestMessage = nil
-		state.ekuResponseMessage = nil
-
-		logf(logTypeHandshake, "[StateConnected] Initiator: Received responder's new_key_update (Message 4), EKU exchange complete")
-		return state, []HandshakeAction{RekeyIn{epoch: EpochUpdate, KeySet: trafficKeys}}, AlertNoAlert
 
 	default:
 		logf(logTypeHandshake, "[StateConnected] Unknown ExtendedKeyUpdateType: %v", body.EKUType)

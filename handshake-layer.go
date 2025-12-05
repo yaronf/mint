@@ -92,11 +92,16 @@ func (hm HandshakeMessage) ToBody() (HandshakeMessageBody, error) {
 		body = new(KeyUpdateBody)
 	case HandshakeTypeEndOfEarlyData:
 		body = new(EndOfEarlyDataBody)
+	case HandshakeTypeExtendedKeyUpdate:
+		body = new(ExtendedKeyUpdateBody)
 	default:
-		return body, fmt.Errorf("tls.handshakemessage: Unsupported body type")
+		return body, fmt.Errorf("tls.handshakemessage: Unsupported body type %v", hm.msgType)
 	}
 
 	err := safeUnmarshal(body, hm.body)
+	if err != nil {
+		return body, fmt.Errorf("tls.handshakemessage: Error unmarshaling %T: %v", body, err)
+	}
 	return body, err
 }
 
@@ -425,12 +430,12 @@ func (h *HandshakeLayer) QueueMessage(hm *HandshakeMessage) error {
 	// have reset its sequence number to 0 after processing the previous KeyUpdate
 	if rl, ok := h.conn.(*DefaultRecordLayer); ok {
 		rl.Lock()
-		if hm.msgType == HandshakeTypeKeyUpdate {
-			// For KeyUpdate messages, we need special handling:
-			// - If epoch is EpochUpdate (subsequent KeyUpdate), use seq=0 because receiver resets to 0 after previous RekeyIn
-			// - If epoch is EpochApplicationData (first KeyUpdate), use current seq (which should be 0 after handshake)
+		if hm.msgType == HandshakeTypeKeyUpdate || hm.msgType == HandshakeTypeExtendedKeyUpdate {
+			// For KeyUpdate and ExtendedKeyUpdate messages, we need special handling:
+			// - If epoch is EpochUpdate (subsequent KeyUpdate/EKU), use seq=0 because receiver resets to 0 after previous RekeyIn
+			// - If epoch is EpochApplicationData (first KeyUpdate/EKU), use current seq (which should be 0 after handshake)
 			if rl.cipher.epoch == EpochUpdate {
-				// Subsequent KeyUpdate: receiver has reset to seq=0 after previous KeyUpdate
+				// Subsequent KeyUpdate/EKU: receiver has reset to seq=0 after previous KeyUpdate
 				hm.cipher = &cipherState{
 					epoch:    rl.cipher.epoch,
 					ivLength: rl.cipher.ivLength,
@@ -438,11 +443,11 @@ func (h *HandshakeLayer) QueueMessage(hm *HandshakeMessage) error {
 					iv:       rl.cipher.iv, // Share IV buffer (read-only)
 					cipher:   rl.cipher.cipher,
 				}
-				logf(logTypeHandshake, "QueueMessage: KeyUpdate (EpochUpdate) - using cipher epoch=%s seq=0", rl.cipher.epoch.label())
+				logf(logTypeHandshake, "QueueMessage: %v (EpochUpdate) - using cipher epoch=%s seq=0", hm.msgType, rl.cipher.epoch.label())
 			} else {
-				// First KeyUpdate: use current sequence number (should be 0 after handshake)
+				// First KeyUpdate/EKU: use current sequence number (should be 0 after handshake)
 				hm.cipher = rl.cipher
-				logf(logTypeHandshake, "QueueMessage: KeyUpdate (EpochApplicationData) - using cipher epoch=%s seq=%x", rl.cipher.epoch.label(), rl.cipher.seq)
+				logf(logTypeHandshake, "QueueMessage: %v (EpochApplicationData) - using cipher epoch=%s seq=%x", hm.msgType, rl.cipher.epoch.label(), rl.cipher.seq)
 			}
 		} else {
 			// For other messages, use current cipher state
