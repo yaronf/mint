@@ -109,6 +109,7 @@ type stateConnected struct {
 	ekuIsInitiator     bool           // Are we the initiator of current EKU?
 	ekuPeerKeyShare    *KeyShareEntry // Peer's key share from response
 	ekuOurKeyShare     *KeyShareEntry // Our key share (for initiator)
+	ekuOurPrivateKey   []byte         // Our private key for key share (needed for key derivation)
 	ekuRequestMessage  []byte         // Marshaled key_update_request (full HandshakeMessage for key derivation binding)
 	ekuResponseMessage []byte         // Marshaled key_update_response (full HandshakeMessage for key derivation binding)
 }
@@ -193,7 +194,8 @@ func (state *stateConnected) ExtendedKeyUpdateInitiate() ([]HandshakeAction, Ale
 	}
 
 	// Generate fresh key share using negotiated group
-	pub, _, err := newKeyShare(state.Params.NegotiatedGroup)
+	// Store both public and private key - private key is needed for key derivation
+	pub, priv, err := newKeyShare(state.Params.NegotiatedGroup)
 	if err != nil {
 		logf(logTypeHandshake, "[StateConnected] ExtendedKeyUpdateInitiate: Error generating key share: %v", err)
 		return nil, AlertInternalError
@@ -203,6 +205,7 @@ func (state *stateConnected) ExtendedKeyUpdateInitiate() ([]HandshakeAction, Ale
 		Group:       state.Params.NegotiatedGroup,
 		KeyExchange: pub,
 	}
+	state.ekuOurPrivateKey = priv // Store private key for key derivation
 
 	// Create ExtendedKeyUpdate message (key_update_request)
 	ekuBody := &ExtendedKeyUpdateBody{
@@ -396,17 +399,13 @@ func (state *stateConnected) deriveEKUKeys(ourKeyShare, peerKeyShare *KeyShareEn
 	// TODO: Store private key in ekuOurKeyShare or regenerate it
 	logf(logTypeHandshake, "[StateConnected] deriveEKUKeys: Computing shared secret, group=%v", ourKeyShare.Group)
 
-	// Generate a new key share to get the private key (we'll use the same group)
-	// Actually, we should have stored the private key when we generated it in ExtendedKeyUpdateInitiate
-	// For now, let's assume we need to regenerate - but this is inefficient
-	// The proper fix is to store the private key in ExtendedKeyUpdateInitiate
-	_, priv, err := newKeyShare(ourKeyShare.Group)
-	if err != nil {
-		logf(logTypeHandshake, "[StateConnected] deriveEKUKeys: Error generating key share: %v", err)
+	// Use stored private key from ExtendedKeyUpdateInitiate
+	if state.ekuOurPrivateKey == nil {
+		logf(logTypeHandshake, "[StateConnected] deriveEKUKeys: ekuOurPrivateKey is nil")
 		return nil, AlertInternalError
 	}
 
-	sharedSecret, err := keyAgreement(ourKeyShare.Group, peerKeyShare.KeyExchange, priv)
+	sharedSecret, err := keyAgreement(ourKeyShare.Group, peerKeyShare.KeyExchange, state.ekuOurPrivateKey)
 	if err != nil {
 		logf(logTypeHandshake, "[StateConnected] deriveEKUKeys: Error computing shared secret: %v", err)
 		return nil, AlertInternalError
@@ -481,14 +480,13 @@ func (state *stateConnected) deriveEKUKeysForResponder(ourKeyShare, peerKeyShare
 	// Same key derivation as initiator, but responder needs both RekeyIn and RekeyOut
 	logf(logTypeHandshake, "[StateConnected] deriveEKUKeysForResponder: Computing shared secret, group=%v", ourKeyShare.Group)
 
-	// Generate private key (same limitation as deriveEKUKeys - TODO: store private key)
-	_, priv, err := newKeyShare(ourKeyShare.Group)
-	if err != nil {
-		logf(logTypeHandshake, "[StateConnected] deriveEKUKeysForResponder: Error generating key share: %v", err)
+	// Use stored private key from ExtendedKeyUpdateInitiate (for initiator) or from response generation (for responder)
+	if state.ekuOurPrivateKey == nil {
+		logf(logTypeHandshake, "[StateConnected] deriveEKUKeysForResponder: ekuOurPrivateKey is nil")
 		return nil, AlertInternalError
 	}
 
-	sharedSecret, err := keyAgreement(ourKeyShare.Group, peerKeyShare.KeyExchange, priv)
+	sharedSecret, err := keyAgreement(ourKeyShare.Group, peerKeyShare.KeyExchange, state.ekuOurPrivateKey)
 	if err != nil {
 		logf(logTypeHandshake, "[StateConnected] deriveEKUKeysForResponder: Error computing shared secret: %v", err)
 		return nil, AlertInternalError
@@ -594,7 +592,8 @@ func (state *stateConnected) handleExtendedKeyUpdate(hm *HandshakeMessage, body 
 		state.ekuRequestMessage = hm.Marshal()
 
 		// Generate fresh key share using negotiated group
-		pub, _, err := newKeyShare(state.Params.NegotiatedGroup)
+		// Store both public and private key - private key is needed for key derivation
+		pub, priv, err := newKeyShare(state.Params.NegotiatedGroup)
 		if err != nil {
 			logf(logTypeHandshake, "[StateConnected] Error generating key share for response: %v", err)
 			return nil, nil, AlertInternalError
@@ -605,6 +604,7 @@ func (state *stateConnected) handleExtendedKeyUpdate(hm *HandshakeMessage, body 
 			KeyExchange: pub,
 		}
 		state.ekuOurKeyShare = ourKeyShare
+		state.ekuOurPrivateKey = priv // Store private key for key derivation
 
 		// Create ExtendedKeyUpdate response message (Message 2)
 		ekuResponseBody := &ExtendedKeyUpdateBody{
@@ -782,6 +782,7 @@ func (state *stateConnected) handleExtendedKeyUpdate(hm *HandshakeMessage, body 
 			state.ekuInProgress = false
 			state.ekuIsInitiator = false
 			state.ekuOurKeyShare = nil
+			state.ekuOurPrivateKey = nil
 			state.ekuPeerKeyShare = nil
 			state.ekuRequestMessage = nil
 			state.ekuResponseMessage = nil

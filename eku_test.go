@@ -304,21 +304,34 @@ func TestEKUMultipleSequential(t *testing.T) {
 	s2c := make(chan bool)
 
 	go func() {
+		t.Log("TestEKUMultipleSequential: Server goroutine STARTED")
 		alert := server.Handshake()
+		t.Logf("TestEKUMultipleSequential: Server Handshake() returned: alert=%v", alert)
 		assertEquals(t, alert, AlertNoAlert)
+		assertTrue(t, server.state.Params.UsingExtendedKeyUpdate, "Server should have EKU negotiated")
 
+		t.Log("TestEKUMultipleSequential: Server writing initial data")
 		server.Write(oneBuf)
 		s2c <- true
+		t.Log("TestEKUMultipleSequential: Server sent first s2c")
 
 		// First EKU
+		t.Log("TestEKUMultipleSequential: Server waiting for first c2s")
 		<-c2s
+		t.Log("TestEKUMultipleSequential: Server received first c2s, about to read")
 		server.Read(oneBuf)
+		t.Log("TestEKUMultipleSequential: Server read after first EKU")
 		s2c <- true
+		t.Log("TestEKUMultipleSequential: Server sent second s2c")
 
 		// Second EKU
+		t.Log("TestEKUMultipleSequential: Server waiting for second c2s")
 		<-c2s
+		t.Log("TestEKUMultipleSequential: Server received second c2s, about to read")
 		server.Read(oneBuf)
+		t.Log("TestEKUMultipleSequential: Server read after second EKU")
 		s2c <- true
+		t.Log("TestEKUMultipleSequential: Server sent third s2c")
 	}()
 
 	t.Log("TestEKUMultipleSequential: Client starting handshake")

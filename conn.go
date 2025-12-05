@@ -690,10 +690,11 @@ func (c *Conn) Write(buffer []byte) (int, error) {
 		return 0, errors.New("write called before controller started")
 	}
 
-	logf(logTypeHandshake, "%s Write() TLS: controller is running, sending to dataToSend channel, len=%d", c.label(), len(buffer))
+	logf(logTypeHandshake, "%s Write() TLS: controller is running, about to send to dataToSend channel, len=%d (channel len=%d, cap=%d)", c.label(), len(buffer), len(c.dataToSend), cap(c.dataToSend))
 	// Send data to controller
 	// Since application is synchronous, only one Write() can be active at a time
 	if c.config.NonBlocking {
+		logf(logTypeHandshake, "%s Write() NonBlocking mode: attempting to send", c.label())
 		// Non-blocking mode: return immediately if channel is full
 		select {
 		case c.dataToSend <- buffer:
@@ -711,12 +712,13 @@ func (c *Conn) Write(buffer []byte) (int, error) {
 		}
 	} else {
 		// Blocking mode: wait until controller accepts data
+		logf(logTypeHandshake, "%s Write() Blocking mode: BLOCKING on select, waiting for controller to read from dataToSend", c.label())
 		select {
 		case c.dataToSend <- buffer:
 			// Data sent successfully - controller will encrypt and send to socket
 			// Note: This blocks until controller reads from channel (or channel has capacity)
 			// With 64KB buffer, channel should rarely be full
-			logf(logTypeHandshake, "%s Write() sent to dataToSend, returning", c.label())
+			logf(logTypeHandshake, "%s Write() Blocking: ✓✓✓ SUCCESS: sent to dataToSend, returning", c.label())
 			return len(buffer), nil
 		case err := <-c.errors:
 			// Error from controller
@@ -1456,15 +1458,17 @@ func (c *Conn) socketReaderLoop() {
 			return
 		}
 
-		logf(logTypeHandshake, "%s socketReaderLoop: ReadRecord success, contentType=%v, epoch=%v, fragment_len=%d, sending to controller", c.label(), pt.contentType, pt.epoch, len(pt.fragment))
+		logf(logTypeHandshake, "%s socketReaderLoop: ✓✓✓ ReadRecord success, contentType=%v, epoch=%v, fragment_len=%d, sending to controller", c.label(), pt.contentType, pt.epoch, len(pt.fragment))
 		if inImpl, ok := c.in.(*DefaultRecordLayer); ok {
 			logf(logTypeHandshake, "%s socketReaderLoop: current in.cipher epoch=%s seq=%x", c.label(), inImpl.cipher.epoch.label(), inImpl.cipher.seq)
 		}
 		// Send record to controller (blocks until controller receives it)
+		logf(logTypeHandshake, "%s socketReaderLoop: BLOCKING: sending record to socketRecords channel (len=%d, cap=%d)", c.label(), len(c.socketRecords), cap(c.socketRecords))
 		select {
 		case c.socketRecords <- pt:
-			logf(logTypeHandshake, "%s socketReaderLoop: sent record to controller, controller should process it now", c.label())
+			logf(logTypeHandshake, "%s socketReaderLoop: ✓✓✓✓✓ SUCCESS: sent record to controller, controller should process it now", c.label())
 		case <-c.closed:
+			logf(logTypeHandshake, "%s socketReaderLoop: connection closed while sending record", c.label())
 			return
 		}
 	}
@@ -1478,19 +1482,19 @@ func (c *Conn) controllerLoop() {
 	go c.socketReaderLoop()
 
 	for {
-		logf(logTypeHandshake, "%s controllerLoop: waiting on select", c.label())
+		logf(logTypeHandshake, "%s controllerLoop: waiting on select (dataToSend=%d buffered, socketRecords=%d buffered)", c.label(), len(c.dataToSend), len(c.socketRecords))
 		select {
 		case data := <-c.dataToSend:
 			// Encrypt and send data
-			logf(logTypeHandshake, "%s controllerLoop: received data from dataToSend, len=%d", c.label(), len(data))
+			logf(logTypeHandshake, "%s controllerLoop: ✓✓✓ RECEIVED data from dataToSend, len=%d", c.label(), len(data))
 			c.handleDataToSend(data)
-			logf(logTypeHandshake, "%s controllerLoop: finished handling dataToSend", c.label())
+			logf(logTypeHandshake, "%s controllerLoop: ✓✓✓ finished handling dataToSend, len=%d", c.label(), len(data))
 
 		case pt := <-c.socketRecords:
 			// Record received from socket
-			logf(logTypeHandshake, "%s controllerLoop: received record from socketReaderLoop, contentType=%v", c.label(), pt.contentType)
+			logf(logTypeHandshake, "%s controllerLoop: ✓✓✓ RECEIVED record from socketReaderLoop, contentType=%v, epoch=%v, fragment_len=%d", c.label(), pt.contentType, pt.epoch, len(pt.fragment))
 			c.handleSocketRecord(pt)
-			logf(logTypeHandshake, "%s controllerLoop: finished processing record", c.label())
+			logf(logTypeHandshake, "%s controllerLoop: ✓✓✓ finished processing record, contentType=%v", c.label(), pt.contentType)
 
 		case err := <-c.socketErrors:
 			// Socket error
@@ -1545,20 +1549,23 @@ func (c *Conn) handleSocketRecord(pt *TLSPlaintext) {
 
 	case RecordTypeApplicationData:
 		// Decrypt and send to application
-		logf(logTypeHandshake, "%s handleSocketRecord() ✓ processing application data, len=%d", c.label(), len(pt.fragment))
+		logf(logTypeHandshake, "%s handleSocketRecord() ✓✓✓ processing application data, len=%d, epoch=%v", c.label(), len(pt.fragment), pt.epoch)
+		if inImpl, ok := c.in.(*DefaultRecordLayer); ok {
+			logf(logTypeHandshake, "%s handleSocketRecord() current in.cipher epoch=%s seq=%x (before decryptRecord)", c.label(), inImpl.cipher.epoch.label(), inImpl.cipher.seq)
+		}
 		decrypted := c.decryptRecord(pt)
-		logf(logTypeHandshake, "%s handleSocketRecord() ✓ decrypted, len=%d, sending to dataToReceive", c.label(), len(decrypted))
+		logf(logTypeHandshake, "%s handleSocketRecord() ✓✓✓ decrypted, len=%d, about to send to dataToReceive (channel len=%d, cap=%d)", c.label(), len(decrypted), len(c.dataToReceive), cap(c.dataToReceive))
 		select {
 		case c.dataToReceive <- decrypted:
 			// Successfully queued for application
-			logf(logTypeHandshake, "%s handleSocketRecord() ✓✓✓ sent application data to dataToReceive channel, len=%d", c.label(), len(decrypted))
+			logf(logTypeHandshake, "%s handleSocketRecord() ✓✓✓✓✓ SUCCESS: sent application data to dataToReceive channel, len=%d", c.label(), len(decrypted))
 		case <-c.closed:
 			// Connection closed, discard data
 			logf(logTypeHandshake, "%s handleSocketRecord() connection closed, discarding data", c.label())
 		default:
 			// Channel is full - should not happen in normal operation with 64KB buffer
 			// Send error to application
-			logf(logTypeHandshake, "%s handleSocketRecord() ⚠ WARNING: dataToReceive channel full!", c.label())
+			logf(logTypeHandshake, "%s handleSocketRecord() ⚠⚠⚠ WARNING: dataToReceive channel full! len=%d, cap=%d", c.label(), len(c.dataToReceive), cap(c.dataToReceive))
 			select {
 			case c.errors <- errors.New("dataToReceive channel full"):
 			case <-c.closed:
@@ -1575,6 +1582,9 @@ func (c *Conn) handleSocketRecord(pt *TLSPlaintext) {
 // handleDataToSend encrypts and sends data to the socket
 func (c *Conn) handleDataToSend(data []byte) {
 	logf(logTypeHandshake, "%s handleDataToSend() START: called, len=%d", c.label(), len(data))
+	if outImpl, ok := c.out.(*DefaultRecordLayer); ok {
+		logf(logTypeHandshake, "%s handleDataToSend() current out.cipher epoch=%s seq=%x", c.label(), outImpl.cipher.epoch.label(), outImpl.cipher.seq)
+	}
 	// Lock the output channel for thread safety
 	c.out.Lock()
 	defer c.out.Unlock()
@@ -1582,33 +1592,42 @@ func (c *Conn) handleDataToSend(data []byte) {
 	// Send full-size fragments
 	var start int
 	for start = 0; len(data)-start >= maxFragmentLen; start += maxFragmentLen {
+		logf(logTypeHandshake, "%s handleDataToSend() writing fragment [%d:%d], len=%d", c.label(), start, start+maxFragmentLen, maxFragmentLen)
 		err := c.out.WriteRecord(&TLSPlaintext{
 			contentType: RecordTypeApplicationData,
 			fragment:    data[start : start+maxFragmentLen],
 		})
 		if err != nil {
+			logf(logTypeHandshake, "%s handleDataToSend() ERROR writing fragment: %v", c.label(), err)
 			select {
 			case c.errors <- err:
 			case <-c.closed:
 			}
 			return
 		}
+		logf(logTypeHandshake, "%s handleDataToSend() ✓ wrote fragment [%d:%d]", c.label(), start, start+maxFragmentLen)
 	}
 
 	// Send a final partial fragment if necessary
 	if start < len(data) {
+		logf(logTypeHandshake, "%s handleDataToSend() writing final fragment [%d:%d], len=%d", c.label(), start, len(data), len(data)-start)
 		err := c.out.WriteRecord(&TLSPlaintext{
 			contentType: RecordTypeApplicationData,
 			fragment:    data[start:],
 		})
 		if err != nil {
+			logf(logTypeHandshake, "%s handleDataToSend() ERROR writing final fragment: %v", c.label(), err)
 			select {
 			case c.errors <- err:
 			case <-c.closed:
 			}
 			return
 		}
+		logf(logTypeHandshake, "%s handleDataToSend() ✓ wrote final fragment [%d:%d]", c.label(), start, len(data))
 	}
+
+	logf(logTypeHandshake, "%s handleDataToSend() COMPLETE: sent all %d bytes to socket", c.label(), len(data))
+	return
 }
 
 // handleCommand processes a command from the application
