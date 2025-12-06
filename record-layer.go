@@ -188,9 +188,17 @@ func (r *DefaultRecordLayer) Rekey(epoch Epoch, factory AEADFactory, keys *KeySe
 		return err
 	}
 	r.Lock()
+	oldCipher := r.cipher
 	r.cipher = cipher
 	if r.datagram && r.direction == DirectionRead {
 		r.readCiphers[epoch] = cipher
+	}
+	if r.direction == DirectionWrite {
+		if oldCipher != nil {
+			logf(logTypeIO, "%s RekeyOut: old cipher epoch=[%s] seq=[%x], new cipher epoch=[%s] seq=[%x]", r.label, oldCipher.epoch.label(), oldCipher.seq, cipher.epoch.label(), cipher.seq)
+		} else {
+			logf(logTypeIO, "%s RekeyOut: new cipher epoch=[%s] seq=[%x] (first cipher)", r.label, cipher.epoch.label(), cipher.seq)
+		}
 	}
 	// If we have a pending decrypt record, retry decryption with new keys
 	if r.pendingDecryptRecord != nil && r.pendingDecryptHeader != nil {
@@ -398,18 +406,23 @@ func (r *DefaultRecordLayer) nextRecord(allowOldEpoch bool) (*TLSPlaintext, erro
 	for err != nil {
 		if r.frame.needed() > 0 {
 			buf := make([]byte, r.frame.details.headerLen()+maxFragmentLen)
+			logf(logTypeIO, "%s ReadRecord: about to call r.conn.Read(), frame.needed()=%d", r.label, r.frame.needed())
 			n, err := r.conn.Read(buf)
 			if err != nil {
 				logf(logTypeIO, "%s Error reading, %v", r.label, err)
+				// If we get io.EOF, return it so socketReaderLoop can exit
+				if err == io.EOF {
+					return nil, io.EOF
+				}
 				return nil, err
 			}
 
 			if n == 0 {
-				logf(logTypeIO, "%s Read returned 0 bytes, returning AlertWouldBlock", r.label)
+				logf(logTypeIO, "%s Read returned 0 bytes, returning AlertWouldBlock (frame.needed()=%d)", r.label, r.frame.needed())
 				return nil, AlertWouldBlock
 			}
 
-			logf(logTypeIO, "%s Read %v bytes", r.label, n)
+			logf(logTypeIO, "%s Read %v bytes (frame.needed()=%d)", r.label, n, r.frame.needed())
 
 			buf = buf[:n]
 			r.frame.addChunk(buf)
@@ -483,6 +496,10 @@ func (r *DefaultRecordLayer) nextRecord(allowOldEpoch bool) (*TLSPlaintext, erro
 		if cipher == nil {
 			return nil, fmt.Errorf("tls.record: cipher state is nil")
 		}
+		// RFC 8446bis Section 5.3: "the first record transmitted under a particular traffic key MUST use sequence number 0."
+		// After RekeyIn, cipher.seq is reset to 0. If this is the first record after RekeyIn, use seq=0.
+		// However, if cipher.seq > 0, we've already read records, so use cipher.seq.
+		// But if decryption fails with cipher.seq, we might need to try seq=0 if this is the first record from the peer.
 		seq = cipher.seq
 
 		// Check if we have a pending decrypt record and RekeyIn has happened
@@ -664,10 +681,11 @@ func (r *DefaultRecordLayer) writeRecordWithPadding(pt *TLSPlaintext, cipher *ci
 
 	var ciphertext []byte
 	if cipher.cipher != nil {
-		logf(logTypeIO, "%s RecordLayer.WriteRecord BEFORE encrypt: epoch=[%s] seq=[%x] contentType=[%d] plaintext_len=[%d]", r.label, cipher.epoch.label(), cipher.seq, pt.contentType, len(pt.fragment))
-		logf(logTypeIO, "%s RecordLayer.WriteRecord epoch=[%s] seq=[%x] [%d] plaintext=[%x]", r.label, cipher.epoch.label(), cipher.seq, pt.contentType, pt.fragment)
+		seqBeforeIncrement := cipher.seq
+		logf(logTypeIO, "%s RecordLayer.WriteRecord BEFORE encrypt: epoch=[%s] seq=[%x] (cipher.seq before) contentType=[%d] plaintext_len=[%d]", r.label, cipher.epoch.label(), seqBeforeIncrement, pt.contentType, len(pt.fragment))
+		logf(logTypeIO, "%s RecordLayer.WriteRecord epoch=[%s] seq=[%x] [%d] plaintext=[%x]", r.label, cipher.epoch.label(), seqBeforeIncrement, pt.contentType, pt.fragment)
 		ciphertext = r.encrypt(cipher, seq, header, pt, padLen)
-		logf(logTypeIO, "%s RecordLayer.WriteRecord AFTER encrypt: epoch=[%s] seq=[%x] contentType=[%d] ciphertext_len=[%d]", r.label, cipher.epoch.label(), cipher.seq, pt.contentType, len(ciphertext))
+		logf(logTypeIO, "%s RecordLayer.WriteRecord AFTER encrypt: epoch=[%s] seq=[%x] contentType=[%d] ciphertext_len=[%d]", r.label, cipher.epoch.label(), seqBeforeIncrement, pt.contentType, len(ciphertext))
 	} else {
 		if padLen > 0 {
 			return fmt.Errorf("tls.record: Padding can only be done on encrypted records")
@@ -681,9 +699,14 @@ func (r *DefaultRecordLayer) writeRecordWithPadding(pt *TLSPlaintext, cipher *ci
 
 	record := append(header, ciphertext...)
 
-	logf(logTypeIO, "%s RecordLayer.WriteRecord epoch=[%s] seq=[%x] [%d] ciphertext=[%x]", r.label, cipher.epoch.label(), cipher.seq, contentType, ciphertext)
+	if cipher.cipher != nil {
+		logf(logTypeIO, "%s RecordLayer.WriteRecord epoch=[%s] seq=[%x] [%d] ciphertext=[%x]", r.label, cipher.epoch.label(), cipher.seq, contentType, ciphertext)
+	}
 
 	cipher.incrementSequenceNumber()
+	if cipher.cipher != nil {
+		logf(logTypeIO, "%s RecordLayer.WriteRecord AFTER increment: epoch=[%s] seq=[%x] (cipher.seq after, next record will use this)", r.label, cipher.epoch.label(), cipher.seq)
+	}
 	_, err := r.conn.Write(record)
 	return err
 }

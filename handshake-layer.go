@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"time"
 )
 
 const (
@@ -12,22 +13,21 @@ const (
 	maxHandshakeMessageLen = 1 << 24 // max handshake message length
 )
 
-// struct {
-//     HandshakeType msg_type;    /* handshake type */
-//     uint24 length;             /* bytes in message */
-//     select (HandshakeType) {
-//       ...
-//     } body;
-// } Handshake;
+//	struct {
+//	    HandshakeType msg_type;    /* handshake type */
+//	    uint24 length;             /* bytes in message */
+//	    select (HandshakeType) {
+//	      ...
+//	    } body;
+//	} Handshake;
 //
 // We do the select{...} part in a different layer, so we treat the
 // actual message body as opaque:
 //
-// struct {
-//     HandshakeType msg_type;
-//     opaque msg<0..2^24-1>
-// } Handshake;
-//
+//	struct {
+//	    HandshakeType msg_type;
+//	    opaque msg<0..2^24-1>
+//	} Handshake;
 type HandshakeMessage struct {
 	msgType  HandshakeType
 	seq      uint32
@@ -369,12 +369,14 @@ func (h *HandshakeLayer) ReadMessage() (*HandshakeMessage, error) {
 			err = h.readRecord()
 
 			// In non-blocking mode, if we get AlertWouldBlock, return it immediately
-			// In blocking mode, continue looping to retry
+			// In blocking mode, wait a bit before retrying to avoid busy loop
 			if err != nil {
 				if h.nonblocking || err != AlertWouldBlock {
 					return nil, err
 				}
-				// Blocking mode with AlertWouldBlock - continue loop to retry
+				// Blocking mode with AlertWouldBlock - wait before retrying
+				time.Sleep(1 * time.Millisecond)
+				continue
 			}
 		}
 
@@ -422,7 +424,7 @@ func (h *HandshakeLayer) QueueMessage(hm *HandshakeMessage) error {
 		h.queued = append(h.queued, hm)
 		return nil
 	}
-	
+
 	// TLS: Capture the current cipher state when queuing the message
 	// This ensures that KeyUpdate messages are encrypted with the old keys
 	// (before RekeyOut), as required by RFC 8446bis Section 4.6.3
@@ -430,25 +432,32 @@ func (h *HandshakeLayer) QueueMessage(hm *HandshakeMessage) error {
 	// have reset its sequence number to 0 after processing the previous KeyUpdate
 	if rl, ok := h.conn.(*DefaultRecordLayer); ok {
 		rl.Lock()
-		if hm.msgType == HandshakeTypeKeyUpdate || hm.msgType == HandshakeTypeExtendedKeyUpdate {
-			// For KeyUpdate and ExtendedKeyUpdate messages, we need special handling:
-			// - If epoch is EpochUpdate (subsequent KeyUpdate/EKU), use seq=0 because receiver resets to 0 after previous RekeyIn
-			// - If epoch is EpochApplicationData (first KeyUpdate/EKU), use current seq (which should be 0 after handshake)
+		if hm.msgType == HandshakeTypeKeyUpdate {
+			// For standard KeyUpdate messages, use seq=0 when epoch is EpochUpdate (subsequent KeyUpdate)
+			// because the receiver resets to seq=0 after previous RekeyIn
 			if rl.cipher.epoch == EpochUpdate {
-				// Subsequent KeyUpdate/EKU: receiver has reset to seq=0 after previous KeyUpdate
+				// Subsequent KeyUpdate: receiver has reset to seq=0 after previous KeyUpdate
 				hm.cipher = &cipherState{
 					epoch:    rl.cipher.epoch,
 					ivLength: rl.cipher.ivLength,
-					seq:      0, // Use seq=0 to match receiver's expectation after previous KeyUpdate
+					seq:      0,            // Use seq=0 to match receiver's expectation after previous KeyUpdate
 					iv:       rl.cipher.iv, // Share IV buffer (read-only)
 					cipher:   rl.cipher.cipher,
 				}
 				logf(logTypeHandshake, "QueueMessage: %v (EpochUpdate) - using cipher epoch=%s seq=0", hm.msgType, rl.cipher.epoch.label())
 			} else {
-				// First KeyUpdate/EKU: use current sequence number (should be 0 after handshake)
+				// First KeyUpdate: use current sequence number (should be 0 after handshake)
 				hm.cipher = rl.cipher
 				logf(logTypeHandshake, "QueueMessage: %v (EpochApplicationData) - using cipher epoch=%s seq=%x", hm.msgType, rl.cipher.epoch.label(), rl.cipher.seq)
 			}
+		} else if hm.msgType == HandshakeTypeExtendedKeyUpdate {
+			// For ExtendedKeyUpdate messages:
+			// - Request/Response (Message 1/2): use CURRENT sequence number (they use current keys)
+			// - NewKeyUpdate (Message 3/4): use OLD keys (captured before RekeyOut), seq handling is in state machine
+			// Since we can't distinguish message types at queue time, always use current sequence number
+			// The state machine will handle Message 3/4 specially (they capture old cipher state before RekeyOut)
+			hm.cipher = rl.cipher
+			logf(logTypeHandshake, "QueueMessage: %v - using cipher epoch=%s seq=%x (current seq)", hm.msgType, rl.cipher.epoch.label(), rl.cipher.seq)
 		} else {
 			// For other messages, use current cipher state
 			hm.cipher = rl.cipher
@@ -539,7 +548,7 @@ func (h *HandshakeLayer) writeFragment(hm *HandshakeMessage, start int, room int
 		// This ensures KeyUpdate messages are encrypted with the old keys (before RekeyOut)
 		if rl, ok := h.conn.(*DefaultRecordLayer); ok && hm.cipher != nil {
 			// Use the captured cipher state (old keys) for this message
-			logf(logTypeHandshake, "writeFragment: using captured cipher epoch=%s seq=%x for message type=%v", 
+			logf(logTypeHandshake, "writeFragment: using captured cipher epoch=%s seq=%x for message type=%v",
 				hm.cipher.epoch.label(), hm.cipher.seq, hm.msgType)
 			err = rl.writeRecordWithPadding(
 				&TLSPlaintext{
@@ -550,7 +559,7 @@ func (h *HandshakeLayer) writeFragment(hm *HandshakeMessage, start int, room int
 		} else {
 			// Fallback to current cipher if no captured cipher (shouldn't happen for queued messages)
 			if rl, ok := h.conn.(*DefaultRecordLayer); ok {
-				logf(logTypeHandshake, "writeFragment: WARNING - no captured cipher, using current cipher epoch=%s seq=%x", 
+				logf(logTypeHandshake, "writeFragment: WARNING - no captured cipher, using current cipher epoch=%s seq=%x",
 					rl.cipher.epoch.label(), rl.cipher.seq)
 			}
 			err = h.conn.WriteRecord(

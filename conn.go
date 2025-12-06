@@ -166,16 +166,16 @@ func (c *Config) Clone() *Config {
 		RootCAs:            c.RootCAs,
 		InsecureSkipVerify: c.InsecureSkipVerify,
 
-		Certificates:          c.Certificates,
-		VerifyPeerCertificate: c.VerifyPeerCertificate,
-		CipherSuites:          c.CipherSuites,
-		Groups:                c.Groups,
-		SignatureSchemes:      c.SignatureSchemes,
-		NextProtos:            c.NextProtos,
-		PSKs:                  c.PSKs,
-		PSKModes:              c.PSKModes,
-		NonBlocking:           c.NonBlocking,
-		UseDTLS:               c.UseDTLS,
+		Certificates:            c.Certificates,
+		VerifyPeerCertificate:   c.VerifyPeerCertificate,
+		CipherSuites:            c.CipherSuites,
+		Groups:                  c.Groups,
+		SignatureSchemes:        c.SignatureSchemes,
+		NextProtos:              c.NextProtos,
+		PSKs:                    c.PSKs,
+		PSKModes:                c.PSKModes,
+		NonBlocking:             c.NonBlocking,
+		UseDTLS:                 c.UseDTLS,
 		EnableExtendedKeyUpdate: c.EnableExtendedKeyUpdate,
 	}
 }
@@ -274,10 +274,21 @@ const (
 	cmdClose
 )
 
+// EKUResult contains the result of an Extended Key Update operation
+type EKUResult struct {
+	Success bool  // EKU completed successfully
+	Error   error // Error if EKU failed (nil if Success=true)
+}
+
+// EKUCallback is called when an Extended Key Update completes.
+// It is invoked from the controller goroutine, so it must be thread-safe.
+type EKUCallback func(EKUResult)
+
 type controllerCommand struct {
 	cmdType       controllerCommandType
-	requestUpdate bool // For KeyUpdate command
-	result        chan commandResult
+	requestUpdate bool               // For KeyUpdate command
+	result        chan commandResult // For synchronous commands (KeyUpdate, Close)
+	callback      EKUCallback        // For async EKU command
 }
 
 type commandResult struct {
@@ -319,7 +330,11 @@ type Conn struct {
 	pendingKeyUpdateResponse chan struct{} // Signals when KeyUpdate response is received
 
 	// ExtendedKeyUpdate waiting state
-	pendingEKUResponse chan struct{} // Signals when EKU response (Message 2) or new_key_update (Message 4) is received
+	pendingEKUCallback EKUCallback // Callback to invoke when EKU completes
+	ekuMessageCount    int         // Count of EKU messages received (0=waiting for Message 2, 1=waiting for Message 4)
+
+	// Post-handshake DTLS sequence number tracking (for deduplication of retransmissions)
+	postHandshakeMsgSeq uint32 // Last processed post-handshake DTLS message sequence number
 }
 
 func NewConn(conn net.Conn, config *Config, isClient bool) *Conn {
@@ -338,7 +353,8 @@ func NewConn(conn net.Conn, config *Config, isClient bool) *Conn {
 		closed:                   make(chan struct{}),
 		controllerRunning:        false,
 		pendingKeyUpdateResponse: nil, // Will be created when needed
-		pendingEKUResponse:       nil, // Will be created when needed
+		pendingEKUCallback:       nil, // Callback to invoke when EKU completes
+		ekuMessageCount:          0,   // Count of EKU messages received
 	}
 	if !config.UseDTLS {
 		if config.RecordLayer == nil {
@@ -367,7 +383,11 @@ func NewConn(conn net.Conn, config *Config, isClient bool) *Conn {
 
 // Read up
 func (c *Conn) consumeRecord() error {
+	// Lock c.in for ReadRecord() - unlock before processing actions to avoid deadlock
+	// if actions (like RekeyIn) need to lock c.in
+	c.in.Lock()
 	pt, err := c.in.ReadRecord()
+	c.in.Unlock()
 	if pt == nil {
 		logf(logTypeIO, "extendBuffer returns error %v", err)
 		return err
@@ -392,15 +412,77 @@ func (c *Conn) consumeRecord() error {
 			hm.msgType = HandshakeType(pt.fragment[start])
 			hmLen := (int(pt.fragment[start+1]) << 16) + (int(pt.fragment[start+2]) << 8) + int(pt.fragment[start+3])
 
+			// For DTLS, extract sequence number for deduplication of retransmissions
+			var msgSeq uint32
+			if c.config.UseDTLS {
+				// DTLS handshake header: msgType(1) + length(3) + seq(2) + offset(3) + fragment_length(3)
+				// Extract seq at offset 4 (after msgType and length)
+				if len(pt.fragment[start:]) < 6 {
+					return fmt.Errorf("post-handshake DTLS handshake message too short for sequence number")
+				}
+				seqBytes := pt.fragment[start+4 : start+6]
+				msgSeq = uint32((int(seqBytes[0]) << 8) + int(seqBytes[1]))
+				logf(logTypeHandshake, "%s consumeRecord() DTLS post-handshake: msgType=%v, msgSeq=%d, postHandshakeMsgSeq=%d", c.label(), hm.msgType, msgSeq, c.postHandshakeMsgSeq)
+
+				// Check if this is a duplicate/retransmission
+				// If seq < postHandshakeMsgSeq, we've already processed this message
+				// If seq == postHandshakeMsgSeq, it's the same message (retransmission)
+				if msgSeq < c.postHandshakeMsgSeq {
+					logf(logTypeHandshake, "%s Skipping duplicate DTLS post-handshake message with seq=%d (already processed, last processed=%d)", c.label(), msgSeq, c.postHandshakeMsgSeq)
+					// Skip this message but continue processing the rest of the fragment
+					start += headerLen + hmLen
+					continue
+				}
+				if msgSeq == c.postHandshakeMsgSeq && c.postHandshakeMsgSeq > 0 {
+					logf(logTypeHandshake, "%s Skipping retransmitted DTLS post-handshake message with seq=%d (already processed)", c.label(), msgSeq)
+					// Skip this message but continue processing the rest of the fragment
+					start += headerLen + hmLen
+					continue
+				}
+			}
+
 			if len(pt.fragment[start+headerLen:]) < hmLen {
 				return fmt.Errorf("post-handshake handshake message too short for body")
 			}
 			hm.body = pt.fragment[start+headerLen : start+headerLen+hmLen]
 
+			// Store raw handshake message bytes (including header) for EKU key derivation binding
+			// This ensures both sides use the exact same bytes for context, not re-marshaled versions
+			rawHandshakeMessage := pt.fragment[start : start+headerLen+hmLen]
+			if hm.msgType == HandshakeTypeExtendedKeyUpdate {
+				previewLen := 12
+				if len(rawHandshakeMessage) < previewLen {
+					previewLen = len(rawHandshakeMessage)
+				}
+				logf(logTypeHandshake, "%s consumeRecord() passing rawHandshakeMessage to ProcessMessageWithRawBytes: len=%d, first %d bytes: %x", c.label(), len(rawHandshakeMessage), previewLen, rawHandshakeMessage[:previewLen])
+			}
+
+			// Handle EKU callback check BEFORE ProcessMessage() updates the state
+			// Check if this is an EKU message we're waiting for
+			var isEKUResponse bool
+			if hm.msgType == HandshakeTypeExtendedKeyUpdate && c.pendingEKUCallback != nil {
+				bodyGeneric, err := hm.ToBody()
+				if err == nil {
+					if ekuBody, ok := bodyGeneric.(*ExtendedKeyUpdateBody); ok {
+						// Check state BEFORE ProcessMessage() - use ekuMessageCount to determine which message we're waiting for
+						if ekuBody.EKUType == ExtendedKeyUpdateTypeResponse && c.ekuMessageCount == 0 && c.state.ekuInProgress && c.state.ekuIsInitiator {
+							// Message 2: Response to our request (waiting for first message)
+							isEKUResponse = true
+							logf(logTypeHandshake, "%s consumeRecord() ✓ EKU Message 2 (Response) received", c.label())
+						} else if ekuBody.EKUType == ExtendedKeyUpdateTypeNewKeyUpdate && c.ekuMessageCount == 1 && c.state.ekuInProgress && c.state.ekuIsInitiator {
+							// Message 4: Responder's new_key_update (waiting for second message)
+							isEKUResponse = true
+							logf(logTypeHandshake, "%s consumeRecord() ✓ EKU Message 4 (NewKeyUpdate) received", c.label())
+						}
+					}
+				}
+			}
+
 			// XXX: If we want to support more advanced cases, e.g., post-handshake
 			// authentication, we'll need to allow transitions other than
 			// Connected -> Connected
-			state, actions, alert := c.state.ProcessMessage(hm)
+			// Note: c.in is unlocked here, so actions (like RekeyIn) can lock c.in if needed
+			state, actions, alert := c.state.ProcessMessageWithRawBytes(hm, rawHandshakeMessage)
 			if alert != AlertNoAlert {
 				logf(logTypeHandshake, "Error in state transition: %v", alert)
 				c.sendAlert(alert)
@@ -422,6 +504,40 @@ func (c *Conn) consumeRecord() error {
 				logf(logTypeHandshake, "Disconnected after state transition: %v", alert)
 				c.sendAlert(alert)
 				return io.EOF
+			}
+
+			// Handle EKU callback if this is an EKU message we're waiting for
+			// (Similar logic to processHandshakeRecord() but for consumeRecord() path)
+			if isEKUResponse && c.pendingEKUCallback != nil {
+				c.ekuMessageCount++
+				logf(logTypeHandshake, "%s consumeRecord() ✓ EKU message received (count=%d/2, callback=%p)", c.label(), c.ekuMessageCount, c.pendingEKUCallback)
+				if c.ekuMessageCount == 2 {
+					// Both Message 2 and Message 4 received - EKU complete!
+					logf(logTypeHandshake, "%s consumeRecord() ✓✓✓ EKU complete! Invoking callback", c.label())
+
+					// Create result
+					result := EKUResult{
+						Success: true,
+						Error:   nil,
+					}
+
+					// Invoke callback if provided
+					// Save callback and clear state BEFORE invoking (in case callback starts new EKU)
+					callback := c.pendingEKUCallback
+					c.pendingEKUCallback = nil
+					c.ekuMessageCount = 0
+
+					if callback != nil {
+						logf(logTypeHandshake, "%s consumeRecord() invoking EKU callback (callback=%p)", c.label(), callback)
+						callback(result) // Invoke callback
+						logf(logTypeHandshake, "%s consumeRecord() EKU callback returned", c.label())
+					}
+				}
+			}
+
+			// Update post-handshake sequence number after successful processing
+			if c.config.UseDTLS {
+				c.postHandshakeMsgSeq = msgSeq
 			}
 
 			start += headerLen + hmLen
@@ -495,14 +611,14 @@ func (c *Conn) Read(buffer []byte) (int, error) {
 
 	// The handshake is now connected.
 	logf(logTypeHandshake, "conn.Read with buffer = %d", len(buffer))
-	
+
 	// DTLS: Read directly from record layer (no controller, no Handshake() call needed)
 	if c.config.UseDTLS {
 		// Run our timers.
 		if err := c.hsCtx.timers.check(time.Now()); err != nil {
 			return 0, AlertInternalError
 		}
-		
+
 		if len(buffer) == 0 {
 			return 0, nil
 		}
@@ -514,11 +630,10 @@ func (c *Conn) Read(buffer []byte) (int, error) {
 			return n, nil
 		}
 
-		// Lock the input channel (same as original code)
-		c.in.Lock()
-		defer c.in.Unlock()
-
 		// Loop calling consumeRecord() until we have data (same pattern as original)
+		// Note: We don't hold c.in lock here because consumeRecord() may trigger
+		// actions (like RekeyIn) that need to lock c.in, which would deadlock.
+		// consumeRecord() will lock c.in internally when calling ReadRecord().
 		for len(c.readBuffer) == 0 {
 			err := c.consumeRecord()
 
@@ -529,9 +644,20 @@ func (c *Conn) Read(buffer []byte) (int, error) {
 					logf(logTypeIO, "conn.Read returns err=%v", err)
 					return 0, err
 				}
-				// In blocking mode, continue loop (will block on next ReadRecord() call)
+				// In blocking mode, wait a bit before retrying to avoid busy loop
+				// pipeConn.Read() doesn't block, so we need to wait before retrying
+				select {
+				case <-time.After(1 * time.Millisecond):
+					// Retry after very short delay (1ms for responsiveness)
+				case <-c.closed:
+					return 0, io.EOF
+				}
+				// Check readBuffer again after delay - data might have arrived
 				continue
 			}
+			// consumeRecord() returned nil (successfully processed a record)
+			// Check if we now have data in readBuffer (application data was processed)
+			// The loop condition will check this, but we can also check here for clarity
 		}
 
 		// We have data in readBuffer, return it
@@ -839,6 +965,19 @@ func (c *Conn) takeAction(actionGeneric HandshakeAction) Alert {
 			logf(logTypeHandshake, "%s Error writing handshake message: %v", label, err)
 			return AlertInternalError
 		}
+		// IMPORTANT: For EKU Message 2 (response), update ekuResponseMessage after queuing
+		// to get the correct sequence number that was assigned during queuing
+		if action.Message.msgType == HandshakeTypeExtendedKeyUpdate {
+			bodyGeneric, err := action.Message.ToBody()
+			if err == nil {
+				if ekuBody, ok := bodyGeneric.(*ExtendedKeyUpdateBody); ok && ekuBody.EKUType == ExtendedKeyUpdateTypeResponse {
+					// This is Message 2 - re-marshal it with the correct sequence number (assigned during queuing)
+					// Always update ekuResponseMessage to get the correct sequence number
+					c.state.ekuResponseMessage = action.Message.Marshal()
+					logf(logTypeHandshake, "%s Updated ekuResponseMessage from queued Message 2 (seq=%d)", label, action.Message.seq)
+				}
+			}
+		}
 
 	case SendQueuedHandshake:
 		// Lock output for thread safety (controller goroutine)
@@ -855,6 +994,8 @@ func (c *Conn) takeAction(actionGeneric HandshakeAction) Alert {
 			logf(logTypeHandshake, "%s SendQueuedHandshake: ERROR sending: %v", label, err)
 		} else {
 			logf(logTypeHandshake, "%s SendQueuedHandshake: successfully sent queued messages", label)
+			// Note: EKU state is now cleared in the state machine when Message 4 is queued,
+			// not when it's sent. This allows new EKU requests to be processed immediately.
 		}
 		c.out.Unlock()
 		if err != nil {
@@ -866,6 +1007,9 @@ func (c *Conn) takeAction(actionGeneric HandshakeAction) Alert {
 				c.hsCtx.handshakeRetransmit,
 				c.hsCtx.timeoutMS)
 		}
+	case ClearQueuedMessages:
+		logf(logTypeHandshake, "%s ClearQueuedMessages: clearing queued handshake messages", label)
+		c.hsCtx.hOut.ClearQueuedMessages()
 	case RekeyIn:
 		logf(logTypeHandshake, "%s Rekeying in to %s: %+v", label, action.epoch.label(), action.KeySet)
 		if inImpl, ok := c.in.(*DefaultRecordLayer); ok {
@@ -1057,6 +1201,7 @@ func (c *Conn) Handshake() Alert {
 		}
 		if alert != AlertNoAlert && alert != AlertStatelessRetry {
 			logf(logTypeHandshake, "Error in state transition: %v", alert)
+			c.sendAlert(alert)
 			return alert
 		}
 
@@ -1166,13 +1311,16 @@ func (c *Conn) SendKeyUpdate(requestUpdate bool) error {
 // only derives new keys from existing traffic secrets without fresh entropy.
 //
 // The EKU exchange consists of 4 messages:
-//   1. key_update_request: Initiator sends a KeyShareEntry with a fresh public key
-//   2. key_update_response: Responder sends a KeyShareEntry with a fresh public key
-//   3. new_key_update: Initiator sends after deriving new keys from the shared secret
-//   4. new_key_update: Responder sends after deriving new keys from the shared secret
+//  1. key_update_request: Initiator sends a KeyShareEntry with a fresh public key
+//  2. key_update_response: Responder sends a KeyShareEntry with a fresh public key
+//  3. new_key_update: Initiator sends after deriving new keys from the shared secret
+//  4. new_key_update: Responder sends after deriving new keys from the shared secret
 //
-// This method blocks until all 4 messages are exchanged and new keys are activated.
-// The method returns an error if:
+// SendExtendedKeyUpdate initiates an Extended Key Update asynchronously.
+// If callback is non-nil, it will be called when EKU completes (after 2 round trips).
+// If callback is nil, the app will not be notified of completion.
+//
+// Returns immediately with an error only if:
 //   - EKU was not negotiated during the handshake
 //   - The handshake is not yet complete
 //   - An EKU is already in progress
@@ -1181,8 +1329,10 @@ func (c *Conn) SendKeyUpdate(requestUpdate bool) error {
 // For DTLS connections, EKU is handled synchronously without the controller.
 // For TLS connections, EKU uses the TLS Controller architecture.
 //
+// The callback is invoked from the controller goroutine and must be thread-safe.
+//
 // See draft-ietf-tls-extended-key-update-07 for the complete specification.
-func (c *Conn) SendExtendedKeyUpdate() error {
+func (c *Conn) SendExtendedKeyUpdate(callback EKUCallback) error {
 	if !c.handshakeComplete {
 		return errors.New("cannot update keys until after handshake")
 	}
@@ -1197,7 +1347,7 @@ func (c *Conn) SendExtendedKeyUpdate() error {
 
 	// For DTLS, handle EKU synchronously (no controller)
 	if c.config.UseDTLS {
-		return c.sendExtendedKeyUpdateDTLS()
+		return c.sendExtendedKeyUpdateDTLS(callback)
 	}
 
 	// For TLS, use controller
@@ -1206,36 +1356,31 @@ func (c *Conn) SendExtendedKeyUpdate() error {
 	}
 
 	// Create command and send to controller
-	resultChan := make(chan commandResult, 1)
+	// Store callback for invocation when EKU completes
 	cmd := controllerCommand{
-		cmdType: cmdExtendedKeyUpdate,
-		result:  resultChan,
+		cmdType:  cmdExtendedKeyUpdate,
+		result:   nil,      // Not used for async EKU
+		callback: callback, // Callback to invoke on completion
 	}
 
-	logf(logTypeHandshake, "%s SendExtendedKeyUpdate() sending command to controller", c.label())
-	// Send command (blocks until controller accepts)
+	logf(logTypeHandshake, "%s SendExtendedKeyUpdate() sending command to controller (async)", c.label())
+	// Send command (non-blocking if channel has capacity)
 	select {
 	case c.commands <- cmd:
-		logf(logTypeHandshake, "%s SendExtendedKeyUpdate() command sent, waiting for result", c.label())
-		// Wait for result (blocks until complete)
-		select {
-		case result := <-resultChan:
-			logf(logTypeHandshake, "%s SendExtendedKeyUpdate() received result, err=%v", c.label(), result.err)
-			return result.err
-		case err := <-c.errors:
-			return err
-		case <-c.closed:
-			return io.EOF
-		}
+		logf(logTypeHandshake, "%s SendExtendedKeyUpdate() command sent, returning immediately (async)", c.label())
+		return nil // Return immediately - EKU will proceed in background
 	case err := <-c.errors:
 		return err
 	case <-c.closed:
 		return io.EOF
+	default:
+		// Channel full - return error rather than blocking
+		return errors.New("controller command queue full")
 	}
 }
 
 // sendExtendedKeyUpdateDTLS handles EKU for DTLS synchronously
-func (c *Conn) sendExtendedKeyUpdateDTLS() error {
+func (c *Conn) sendExtendedKeyUpdateDTLS(callback EKUCallback) error {
 	logf(logTypeHandshake, "%s sendExtendedKeyUpdateDTLS() called", c.label())
 
 	// Step 1: Send key_update_request (Message 1)
@@ -1250,7 +1395,14 @@ func (c *Conn) sendExtendedKeyUpdateDTLS() error {
 		actionAlert := c.takeAction(action)
 		if actionAlert != AlertNoAlert {
 			c.sendAlert(actionAlert)
-			return fmt.Errorf("alert during EKU actions: %v", actionAlert)
+			err := fmt.Errorf("alert during EKU actions: %v", actionAlert)
+			if callback != nil {
+				callback(EKUResult{
+					Success: false,
+					Error:   err,
+				})
+			}
+			return err
 		}
 	}
 
@@ -1320,6 +1472,15 @@ func (c *Conn) sendExtendedKeyUpdateDTLS() error {
 	}
 
 	logf(logTypeHandshake, "%s sendExtendedKeyUpdateDTLS() completed", c.label())
+
+	// Invoke callback if provided
+	if callback != nil {
+		callback(EKUResult{
+			Success: true,
+			Error:   nil,
+		})
+	}
+
 	return nil
 }
 
@@ -1347,6 +1508,10 @@ func (c *Conn) consumeRecordDTLS(pt *TLSPlaintext) error {
 		}
 		hm.body = pt.fragment[start+headerLen : start+headerLen+hmLen]
 
+		// Store raw handshake message bytes (including header) for EKU key derivation binding
+		// This ensures both sides use the exact same bytes for context, not re-marshaled versions
+		rawHandshakeMessage := pt.fragment[start : start+headerLen+hmLen]
+
 		// Reject standard KeyUpdate if EKU is negotiated
 		if hm.msgType == HandshakeTypeKeyUpdate && c.state.Params.UsingExtendedKeyUpdate {
 			logf(logTypeHandshake, "%s consumeRecordDTLS() ERROR: Received standard KeyUpdate but EKU is negotiated", c.label())
@@ -1355,8 +1520,8 @@ func (c *Conn) consumeRecordDTLS(pt *TLSPlaintext) error {
 			return fmt.Errorf("unexpected standard KeyUpdate when Extended Key Update is negotiated: %v", alert)
 		}
 
-		// Process message using state machine
-		state, actions, alert := c.state.ProcessMessage(hm)
+		// Process message using state machine with raw bytes for EKU key derivation
+		state, actions, alert := c.state.ProcessMessageWithRawBytes(hm, rawHandshakeMessage)
 		if alert != AlertNoAlert {
 			logf(logTypeHandshake, "Error in state transition: %v", alert)
 			c.sendAlert(alert)
@@ -1414,6 +1579,11 @@ func (c *Conn) socketReaderLoop() {
 		pt, err := c.in.ReadRecord()
 		if err != nil {
 			logf(logTypeHandshake, "%s socketReaderLoop: ReadRecord() returned error=%v", c.label(), err)
+			// io.EOF means connection closed - exit gracefully
+			if err == io.EOF {
+				logf(logTypeHandshake, "%s socketReaderLoop: ReadRecord returned io.EOF (connection closed), exiting", c.label())
+				return
+			}
 			// AlertWouldBlock means no data available yet
 			if err == AlertWouldBlock {
 				logf(logTypeHandshake, "%s socketReaderLoop: ReadRecord returned AlertWouldBlock, waiting", c.label())
@@ -1756,26 +1926,55 @@ func (c *Conn) handleKeyUpdateCommand(cmd controllerCommand) {
 func (c *Conn) handleExtendedKeyUpdateCommand(cmd controllerCommand) {
 	logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() called", c.label())
 	if !c.handshakeComplete {
-		cmd.result <- commandResult{err: errors.New("cannot update keys until after handshake")}
+		if cmd.callback != nil {
+			cmd.callback(EKUResult{
+				Success: false,
+				Error:   errors.New("cannot update keys until after handshake"),
+			})
+		}
 		return
 	}
 
 	if !c.state.Params.UsingExtendedKeyUpdate {
-		cmd.result <- commandResult{err: errors.New("Extended Key Update not negotiated")}
+		if cmd.callback != nil {
+			cmd.callback(EKUResult{
+				Success: false,
+				Error:   errors.New("Extended Key Update not negotiated"),
+			})
+		}
 		return
 	}
 
+	// Check if EKU is already in progress BEFORE calling ExtendedKeyUpdateInitiate()
+	// Note: No mutex needed - controller is single-threaded and API is synchronous
 	if c.state.ekuInProgress {
+		logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() ERROR: EKU already in progress (ekuInProgress=true)", c.label())
 		cmd.result <- commandResult{err: errors.New("Extended Key Update already in progress")}
+		return
+	}
+	if c.pendingEKUCallback != nil {
+		logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() ERROR: pendingEKUCallback already exists", c.label())
+		if cmd.callback != nil {
+			cmd.callback(EKUResult{
+				Success: false,
+				Error:   errors.New("Extended Key Update already in progress"),
+			})
+		}
 		return
 	}
 
 	logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() calling state.ExtendedKeyUpdateInitiate()", c.label())
 	// Create the EKU request (Message 1) and update state
+	// This will set ekuInProgress = true
 	actions, alert := (&c.state).ExtendedKeyUpdateInitiate()
 	if alert != AlertNoAlert {
 		c.sendAlert(alert)
-		cmd.result <- commandResult{err: fmt.Errorf("alert while generating EKU request: %v", alert)}
+		if cmd.callback != nil {
+			cmd.callback(EKUResult{
+				Success: false,
+				Error:   fmt.Errorf("alert while generating EKU request: %v", alert),
+			})
+		}
 		return
 	}
 
@@ -1786,60 +1985,26 @@ func (c *Conn) handleExtendedKeyUpdateCommand(cmd controllerCommand) {
 		actionAlert := c.takeAction(action)
 		if actionAlert != AlertNoAlert {
 			c.sendAlert(actionAlert)
-			cmd.result <- commandResult{err: fmt.Errorf("alert during EKU actions: %v", actionAlert)}
+			if cmd.callback != nil {
+				cmd.callback(EKUResult{
+					Success: false,
+					Error:   fmt.Errorf("alert during EKU actions: %v", actionAlert),
+				})
+			}
 			return
 		}
 	}
 
 	logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() setting up wait for EKU response (Message 2)", c.label())
-	// Create channel to wait for peer's EKU response (Message 2)
-	// Note: No mutex needed - controller is single-threaded and API is synchronous
-	if c.pendingEKUResponse != nil {
-		logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() ERROR: already waiting for EKU response", c.label())
-		cmd.result <- commandResult{err: errors.New("Extended Key Update already in progress")}
-		return
-	}
-	c.pendingEKUResponse = make(chan struct{})
-	logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() created pendingEKUResponse channel, EKU request sent, waiting for response", c.label())
 
-	// Spawn a goroutine to wait for the 4-message exchange to complete
-	// The controller loop must continue to process incoming socket records
-	go func() {
-		logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() goroutine started, waiting for EKU response (Message 2)", c.label())
-		// Wait for peer's EKU response (Message 2)
-		select {
-		case <-c.pendingEKUResponse:
-			// Message 2 received and processed (state machine handled it)
-			// Now wait for Message 4 (responder's new_key_update)
-			logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() goroutine: received EKU response (Message 2) signal, waiting for new_key_update (Message 4)", c.label())
-			// Recreate channel for Message 4
-			c.pendingEKUResponse = make(chan struct{})
-			select {
-			case <-c.pendingEKUResponse:
-				// Message 4 received and processed
-				logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() goroutine: received new_key_update (Message 4) signal, EKU complete!", c.label())
-				c.pendingEKUResponse = nil
-				cmd.result <- commandResult{err: nil}
-			case err := <-c.errors:
-				logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() goroutine: error while waiting for Message 4: %v", c.label(), err)
-				c.pendingEKUResponse = nil
-				cmd.result <- commandResult{err: err}
-			case <-c.closed:
-				logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() goroutine: connection closed while waiting for Message 4", c.label())
-				c.pendingEKUResponse = nil
-				cmd.result <- commandResult{err: io.EOF}
-			}
-		case err := <-c.errors:
-			logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() goroutine: error while waiting for Message 2: %v", c.label(), err)
-			c.pendingEKUResponse = nil
-			cmd.result <- commandResult{err: err}
-		case <-c.closed:
-			logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() goroutine: connection closed while waiting for Message 2", c.label())
-			c.pendingEKUResponse = nil
-			cmd.result <- commandResult{err: io.EOF}
-		}
-	}()
-	logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() returning, controller can continue processing", c.label())
+	// Store the callback - we'll invoke it when EKU completes (Message 2 and Message 4 received)
+	c.pendingEKUCallback = cmd.callback
+	c.ekuMessageCount = 0 // 0 = waiting for Message 2, will be incremented to 1 when Message 2 arrives, then 2 when Message 4 arrives
+	logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() stored callback (callback=%p, was_nil=%v), EKU request sent, waiting for Message 2 and Message 4",
+		c.label(), cmd.callback, cmd.callback == nil)
+	logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() returning, EKU will proceed asynchronously", c.label())
+	// Note: SendExtendedKeyUpdate() returns immediately - EKU proceeds in background
+	// The state will be cleared by processHandshakeRecord() when both Message 2 and Message 4 arrive
 }
 
 // handleCloseCommand processes a Close command
@@ -1886,6 +2051,39 @@ func (c *Conn) processHandshakeRecord(pt *TLSPlaintext) {
 		hm.msgType = HandshakeType(pt.fragment[start])
 		hmLen := (int(pt.fragment[start+1]) << 16) + (int(pt.fragment[start+2]) << 8) + int(pt.fragment[start+3])
 
+		// For DTLS, extract sequence number for deduplication of retransmissions
+		var msgSeq uint32
+		if c.config.UseDTLS {
+			// DTLS handshake header: msgType(1) + length(3) + seq(2) + offset(3) + fragment_length(3)
+			// Extract seq at offset 4 (after msgType and length)
+			if len(pt.fragment[start:]) < 6 {
+				select {
+				case c.errors <- fmt.Errorf("post-handshake DTLS handshake message too short for sequence number"):
+				case <-c.closed:
+				}
+				return
+			}
+			seqBytes := pt.fragment[start+4 : start+6]
+			msgSeq = uint32((int(seqBytes[0]) << 8) + int(seqBytes[1]))
+			logf(logTypeHandshake, "%s processHandshakeRecord() DTLS post-handshake: msgType=%v, msgSeq=%d, postHandshakeMsgSeq=%d", c.label(), hm.msgType, msgSeq, c.postHandshakeMsgSeq)
+
+			// Check if this is a duplicate/retransmission
+			// If seq < postHandshakeMsgSeq, we've already processed this message
+			// If seq == postHandshakeMsgSeq, it's the same message (retransmission)
+			if msgSeq < c.postHandshakeMsgSeq {
+				logf(logTypeHandshake, "%s Skipping duplicate DTLS post-handshake message with seq=%d (already processed, last processed=%d)", c.label(), msgSeq, c.postHandshakeMsgSeq)
+				// Skip this message but continue processing the rest of the fragment
+				start += headerLen + hmLen
+				continue
+			}
+			if msgSeq == c.postHandshakeMsgSeq && c.postHandshakeMsgSeq > 0 {
+				logf(logTypeHandshake, "%s Skipping retransmitted DTLS post-handshake message with seq=%d (already processed)", c.label(), msgSeq)
+				// Skip this message but continue processing the rest of the fragment
+				start += headerLen + hmLen
+				continue
+			}
+		}
+
 		if len(pt.fragment[start+headerLen:]) < hmLen {
 			select {
 			case c.errors <- fmt.Errorf("post-handshake handshake message too short for body"):
@@ -1894,10 +2092,18 @@ func (c *Conn) processHandshakeRecord(pt *TLSPlaintext) {
 			return
 		}
 		hm.body = pt.fragment[start+headerLen : start+headerLen+hmLen]
-		
+
 		// Store raw handshake message bytes (including header) for EKU key derivation binding
 		// This ensures both sides use the exact same bytes for context, not re-marshaled versions
 		rawHandshakeMessage := pt.fragment[start : start+headerLen+hmLen]
+		if hm.msgType == HandshakeTypeExtendedKeyUpdate {
+			preview := rawHandshakeMessage
+			if len(preview) > 24 {
+				preview = preview[:24]
+			}
+			logf(logTypeHandshake, "%s processHandshakeRecord() storing rawHandshakeMessage for EKU: len=%d, first 12 bytes: %x, hmLen=%d, headerLen=%d",
+				c.label(), len(rawHandshakeMessage), preview, hmLen, headerLen)
+		}
 
 		// Reject standard KeyUpdate if EKU is negotiated (mutually exclusive)
 		if hm.msgType == HandshakeTypeKeyUpdate && c.state.Params.UsingExtendedKeyUpdate {
@@ -1923,7 +2129,7 @@ func (c *Conn) processHandshakeRecord(pt *TLSPlaintext) {
 			logf(logTypeHandshake, "%s processHandshakeRecord() ToBody() succeeded, body type=%T", c.label(), bodyGeneric)
 			if keyUpdateBody, ok := bodyGeneric.(*KeyUpdateBody); ok {
 				// This is a KeyUpdate message
-				logf(logTypeHandshake, "%s processHandshakeRecord() received KeyUpdate message, requestUpdate=%v, pendingKeyUpdateResponse=%v", 
+				logf(logTypeHandshake, "%s processHandshakeRecord() received KeyUpdate message, requestUpdate=%v, pendingKeyUpdateResponse=%v",
 					c.label(), keyUpdateBody.KeyUpdateRequest, c.pendingKeyUpdateResponse != nil)
 				// If we're waiting for a response, this is it (peer responds to our requestUpdate=true)
 				// Note: No mutex needed - controller is single-threaded
@@ -1933,12 +2139,12 @@ func (c *Conn) processHandshakeRecord(pt *TLSPlaintext) {
 				}
 			} else if ekuBody, ok := bodyGeneric.(*ExtendedKeyUpdateBody); ok {
 				// This is an ExtendedKeyUpdate message
-				logf(logTypeHandshake, "%s processHandshakeRecord() RECEIVED ExtendedKeyUpdate message: type=%v, pendingEKUResponse=%v, ekuInProgress=%v, ekuIsInitiator=%v",
-					c.label(), ekuBody.EKUType, c.pendingEKUResponse != nil, c.state.ekuInProgress, c.state.ekuIsInitiator)
+				logf(logTypeHandshake, "%s processHandshakeRecord() RECEIVED ExtendedKeyUpdate message: type=%v, pendingEKUCallback=%v, ekuInProgress=%v, ekuIsInitiator=%v",
+					c.label(), ekuBody.EKUType, c.pendingEKUCallback != nil, c.state.ekuInProgress, c.state.ekuIsInitiator)
 				// If we're waiting for EKU response and we're the initiator:
 				// - Message 2 (Response): Signal after processing
 				// - Message 4 (NewKeyUpdate from responder): Signal after processing
-				if c.pendingEKUResponse != nil {
+				if c.pendingEKUCallback != nil {
 					logf(logTypeHandshake, "%s processHandshakeRecord() checking if this EKU message matches what we're waiting for: type=%v, ekuInProgress=%v, ekuIsInitiator=%v",
 						c.label(), ekuBody.EKUType, c.state.ekuInProgress, c.state.ekuIsInitiator)
 					if ekuBody.EKUType == ExtendedKeyUpdateTypeResponse && c.state.ekuInProgress && c.state.ekuIsInitiator {
@@ -1950,11 +2156,11 @@ func (c *Conn) processHandshakeRecord(pt *TLSPlaintext) {
 						isEKUResponse = true
 						logf(logTypeHandshake, "%s processHandshakeRecord() ✓ MATCH: This is Message 4 (NewKeyUpdate) we're waiting for!", c.label())
 					} else {
-						logf(logTypeHandshake, "%s processHandshakeRecord() ✗ NO MATCH: EKU message conditions not met: type=%v, pendingEKUResponse=%v, ekuInProgress=%v, ekuIsInitiator=%v", 
-							c.label(), ekuBody.EKUType, c.pendingEKUResponse != nil, c.state.ekuInProgress, c.state.ekuIsInitiator)
+						logf(logTypeHandshake, "%s processHandshakeRecord() ✗ NO MATCH: EKU message conditions not met: type=%v, pendingEKUCallback=%v, ekuInProgress=%v, ekuIsInitiator=%v",
+							c.label(), ekuBody.EKUType, c.pendingEKUCallback != nil, c.state.ekuInProgress, c.state.ekuIsInitiator)
 					}
 				} else {
-					logf(logTypeHandshake, "%s processHandshakeRecord() received EKU message but pendingEKUResponse is nil (not waiting for response)", c.label())
+					logf(logTypeHandshake, "%s processHandshakeRecord() received EKU message but pendingEKUCallback is nil (not waiting for response)", c.label())
 				}
 			}
 		}
@@ -1966,6 +2172,18 @@ func (c *Conn) processHandshakeRecord(pt *TLSPlaintext) {
 		if alert != AlertNoAlert {
 			logf(logTypeHandshake, "%s processHandshakeRecord() ERROR in state transition: %v", c.label(), alert)
 			c.sendAlert(alert)
+			// Clean up pending EKU callback if EKU was in progress
+			if c.pendingEKUCallback != nil {
+				logf(logTypeHandshake, "%s processHandshakeRecord() cleaning up pendingEKUCallback due to error", c.label())
+				result := EKUResult{
+					Success: false,
+					Error:   fmt.Errorf("EKU failed: %v", alert),
+				}
+				c.pendingEKUCallback(result)
+				c.pendingEKUCallback = nil
+				c.ekuMessageCount = 0
+			}
+			// No pending EKU command, send to errors channel for other error handlers
 			select {
 			case c.errors <- alert:
 			case <-c.closed:
@@ -1981,6 +2199,18 @@ func (c *Conn) processHandshakeRecord(pt *TLSPlaintext) {
 			if actionAlert != AlertNoAlert {
 				logf(logTypeHandshake, "%s processHandshakeRecord() ERROR during handshake action[%d]: %v", c.label(), i, actionAlert)
 				c.sendAlert(actionAlert)
+				// Clean up pending EKU callback if EKU was in progress
+				if c.pendingEKUCallback != nil {
+					logf(logTypeHandshake, "%s processHandshakeRecord() cleaning up pendingEKUCallback due to action error", c.label())
+					result := EKUResult{
+						Success: false,
+						Error:   fmt.Errorf("EKU failed during action: %v", actionAlert),
+					}
+					c.pendingEKUCallback(result)
+					c.pendingEKUCallback = nil
+					c.ekuMessageCount = 0
+				}
+				// No pending EKU command, send to errors channel for other error handlers
 				select {
 				case c.errors <- actionAlert:
 				case <-c.closed:
@@ -2001,6 +2231,18 @@ func (c *Conn) processHandshakeRecord(pt *TLSPlaintext) {
 			} else {
 				logf(logTypeHandshake, "State is not stateConnected: %T", state)
 			}
+			// Clean up pending EKU callback if EKU was in progress
+			if c.pendingEKUCallback != nil {
+				logf(logTypeHandshake, "%s processHandshakeRecord() cleaning up pendingEKUCallback due to disconnection", c.label())
+				result := EKUResult{
+					Success: false,
+					Error:   fmt.Errorf("disconnected after state transition: state type=%T", state),
+				}
+				c.pendingEKUCallback(result)
+				c.pendingEKUCallback = nil
+				c.ekuMessageCount = 0
+			}
+			// No pending EKU command, send to errors channel for other error handlers
 			select {
 			case c.errors <- fmt.Errorf("disconnected after state transition: state type=%T", state):
 			case <-c.closed:
@@ -2024,14 +2266,48 @@ func (c *Conn) processHandshakeRecord(pt *TLSPlaintext) {
 		// If this was an EKU message we were waiting for, signal completion
 		if isEKUResponse {
 			// Note: No mutex needed - controller is single-threaded
-			if c.pendingEKUResponse != nil {
-				logf(logTypeHandshake, "%s processHandshakeRecord() ✓ SIGNALING EKU response completion (closing channel)", c.label())
-				close(c.pendingEKUResponse)
-				// Don't set to nil here - the goroutine will recreate it for Message 4 or set to nil when complete
-				logf(logTypeHandshake, "%s processHandshakeRecord() ✓ EKU response signal sent (channel closed)", c.label())
+			if c.pendingEKUCallback != nil {
+				c.ekuMessageCount++
+				logf(logTypeHandshake, "%s processHandshakeRecord() ✓ EKU message received (count=%d/2, callback=%p)", c.label(), c.ekuMessageCount, c.pendingEKUCallback)
+				if c.ekuMessageCount == 2 {
+					// Both Message 2 and Message 4 received - EKU complete!
+					logf(logTypeHandshake, "%s processHandshakeRecord() ✓✓✓ EKU complete! Clearing state", c.label())
+
+					// Create result
+					result := EKUResult{
+						Success: true,
+						Error:   nil,
+					}
+
+					// Invoke callback if provided
+					// Save callback and clear state BEFORE invoking (in case callback starts new EKU)
+					callback := c.pendingEKUCallback
+					c.pendingEKUCallback = nil
+					c.ekuMessageCount = 0
+
+					if callback != nil {
+						logf(logTypeHandshake, "%s processHandshakeRecord() invoking EKU callback (callback=%p)", c.label(), callback)
+						callback(result) // Invoke callback
+						logf(logTypeHandshake, "%s processHandshakeRecord() EKU callback returned", c.label())
+					} else {
+						logf(logTypeHandshake, "%s processHandshakeRecord() WARNING: callback is nil!", c.label())
+					}
+
+					// Clear ekuInProgress in state machine to allow next EKU
+					// Note: The state machine should have already cleared this, but ensure it's cleared here too
+					if c.state.ekuInProgress {
+						logf(logTypeHandshake, "%s processHandshakeRecord() WARNING: ekuInProgress was still true, clearing it", c.label())
+						c.state.ekuInProgress = false
+					}
+				}
 			} else {
-				logf(logTypeHandshake, "%s processHandshakeRecord() ⚠ WARNING: isEKUResponse=true but pendingEKUResponse is nil!", c.label())
+				logf(logTypeHandshake, "%s processHandshakeRecord() ⚠ WARNING: isEKUResponse=true but pendingEKUCallback is nil!", c.label())
 			}
+		}
+
+		// Update post-handshake sequence number after successful processing
+		if c.config.UseDTLS {
+			c.postHandshakeMsgSeq = msgSeq
 		}
 
 		start += headerLen + hmLen

@@ -1,7 +1,10 @@
 package mint
 
 import (
+	"io"
+	"sync"
 	"testing"
+	"time"
 )
 
 // Unit Tests for ExtendedKeyUpdate message marshaling/unmarshaling
@@ -108,6 +111,7 @@ func TestExtendedKeyUpdateFullFlow(t *testing.T) {
 	oneBuf := []byte{'a'}
 	c2s := make(chan bool)
 	s2c := make(chan bool)
+	serverStateChan := make(chan stateConnected, 2) // Initial state and final state
 
 	go func() {
 		t.Log("Server: Goroutine STARTED")
@@ -115,6 +119,9 @@ func TestExtendedKeyUpdateFullFlow(t *testing.T) {
 		t.Logf("Server: Handshake() returned: alert=%v", alert)
 		assertEquals(t, alert, AlertNoAlert)
 		assertTrue(t, server.state.Params.UsingExtendedKeyUpdate, "Server should have EKU negotiated")
+
+		// Capture initial server state
+		serverStateChan <- server.state
 
 		// Send a single byte so that the client can consume NST.
 		t.Log("Server: About to write oneBuf")
@@ -146,8 +153,13 @@ func TestExtendedKeyUpdateFullFlow(t *testing.T) {
 		t.Logf("Server: Read() UNBLOCKED: n=%d, err=%v", n, err)
 		t.Logf("Server: Read() returned: n=%d, err=%v", n, err)
 		t.Log("Server: Read completed, sending s2c signal")
+
+		// Capture final server state
+		serverStateChan <- server.state
+
 		s2c <- true
 		t.Log("Server: ✓ Sent s2c signal")
+		t.Log("Server: Goroutine EXITING")
 	}()
 
 	alert := client.Handshake()
@@ -159,20 +171,36 @@ func TestExtendedKeyUpdateFullFlow(t *testing.T) {
 	client.Read(oneBuf)
 	<-s2c
 
+	// Get initial states
 	clientState0 := client.state
-	serverState0 := server.state
+	serverState0 := <-serverStateChan
+	assertTrue(t, clientState0.Params.NegotiatedGroup != 0, "Client should have NegotiatedGroup set (EKU requires DH)")
 	assertTrue(t, serverState0.Params.NegotiatedGroup != 0, "Server should have NegotiatedGroup set (EKU requires DH)")
 	assertEquals(t, clientState0.Params.NegotiatedGroup, serverState0.Params.NegotiatedGroup)
 	assertByteEquals(t, clientState0.serverTrafficSecret, serverState0.serverTrafficSecret)
 	assertByteEquals(t, clientState0.clientTrafficSecret, serverState0.clientTrafficSecret)
 
-	// Initiate Extended Key Update
+	// Initiate Extended Key Update - use callback to wait for completion
+	var ekuResult EKUResult
+	var ekuDone sync.WaitGroup
+	ekuDone.Add(1)
 	t.Log("Test: About to call SendExtendedKeyUpdate()")
 	c2s <- true
 	t.Log("Test: Sent c2s signal, calling SendExtendedKeyUpdate()")
-	err := client.SendExtendedKeyUpdate()
+	err := client.SendExtendedKeyUpdate(func(result EKUResult) {
+		t.Logf("Test: EKU callback called: Success=%v, Error=%v", result.Success, result.Error)
+		ekuResult = result
+		ekuDone.Done()
+	})
 	t.Logf("Test: SendExtendedKeyUpdate() returned: err=%v", err)
 	assertNotError(t, err, "Extended Key Update should succeed")
+
+	// Wait for EKU to complete
+	t.Log("Test: Waiting for EKU callback")
+	ekuDone.Wait()
+	assertTrue(t, ekuResult.Success, "EKU should succeed")
+	assertNil(t, ekuResult.Error, "EKU should not have error")
+	t.Log("Test: EKU completed successfully")
 
 	// Write data to trigger processing
 	t.Log("Test: About to write data after EKU")
@@ -184,15 +212,13 @@ func TestExtendedKeyUpdateFullFlow(t *testing.T) {
 	t.Log("Test: ✓✓✓ Sent second c2s signal to server")
 	// Server will read the data and then send s2c
 	// Don't wait for s2c here - server sends it after reading
-	t.Log("Test: About to read (server should have read our data)")
+	t.Log("Test: About to wait for s2c signal (server should have read our data)")
 	<-s2c
-	t.Log("Test: Received s2c signal, server has read our data, about to read")
-	client.Read(oneBuf)
-	t.Log("Test: Read completed")
+	t.Log("Test: Received s2c signal, server has read our data")
 
 	// Verify keys have changed
 	clientState1 := client.state
-	serverState1 := server.state
+	serverState1 := <-serverStateChan
 	assertByteEquals(t, clientState1.serverTrafficSecret, serverState1.serverTrafficSecret)
 	assertByteEquals(t, clientState1.clientTrafficSecret, serverState1.clientTrafficSecret)
 	assertNotByteEquals(t, clientState0.serverTrafficSecret, clientState1.serverTrafficSecret)
@@ -203,9 +229,6 @@ func TestExtendedKeyUpdateFullFlow(t *testing.T) {
 	// Verify EKU state is cleared
 	assertTrue(t, !clientState1.ekuInProgress, "EKU should not be in progress after completion")
 	assertTrue(t, !serverState1.ekuInProgress, "EKU should not be in progress after completion")
-
-	c2s <- true
-	<-s2c
 }
 
 // Compatibility Tests
@@ -281,7 +304,7 @@ func TestEKUDisabledWhenNotNegotiated(t *testing.T) {
 	<-s2c
 
 	// Try to send Extended KeyUpdate - should fail
-	err := client.SendExtendedKeyUpdate()
+	err := client.SendExtendedKeyUpdate(nil) // No callback
 	assertError(t, err, "Extended KeyUpdate should fail when not negotiated")
 }
 
@@ -332,6 +355,15 @@ func TestEKUMultipleSequential(t *testing.T) {
 		t.Log("TestEKUMultipleSequential: Server read after second EKU")
 		s2c <- true
 		t.Log("TestEKUMultipleSequential: Server sent third s2c")
+
+		// Third EKU
+		t.Log("TestEKUMultipleSequential: Server waiting for third c2s")
+		<-c2s
+		t.Log("TestEKUMultipleSequential: Server received third c2s, about to read")
+		server.Read(oneBuf)
+		t.Log("TestEKUMultipleSequential: Server read after third EKU")
+		s2c <- true
+		t.Log("TestEKUMultipleSequential: Server sent fourth s2c")
 	}()
 
 	t.Log("TestEKUMultipleSequential: Client starting handshake")
@@ -345,31 +377,89 @@ func TestEKUMultipleSequential(t *testing.T) {
 	<-s2c
 	t.Log("TestEKUMultipleSequential: Client received first s2c")
 
-	// First EKU
+	// First EKU - use callback to wait for completion
+	var firstEKUResult EKUResult
+	var firstEKUDone sync.WaitGroup
+	firstEKUDone.Add(1)
 	t.Log("TestEKUMultipleSequential: Client initiating first EKU")
 	c2s <- true
 	t.Log("TestEKUMultipleSequential: Client sent first c2s")
-	err := client.SendExtendedKeyUpdate()
+	err := client.SendExtendedKeyUpdate(func(result EKUResult) {
+		t.Logf("TestEKUMultipleSequential: First EKU callback called: Success=%v, Error=%v", result.Success, result.Error)
+		firstEKUResult = result
+		firstEKUDone.Done()
+	})
 	t.Logf("TestEKUMultipleSequential: Client first SendExtendedKeyUpdate() returned: err=%v", err)
 	assertNotError(t, err, "First Extended Key Update should succeed")
+
+	// Wait for first EKU to complete
+	t.Log("TestEKUMultipleSequential: Client waiting for first EKU callback")
+	firstEKUDone.Wait()
+	assertTrue(t, firstEKUResult.Success, "First EKU should succeed")
+	assertNil(t, firstEKUResult.Error, "First EKU should not have error")
+	t.Log("TestEKUMultipleSequential: Client first EKU completed successfully")
+
 	t.Log("TestEKUMultipleSequential: Client writing after first EKU")
 	client.Write(oneBuf)
 	<-s2c
 	t.Log("TestEKUMultipleSequential: Client received second s2c (server read our data)")
 
-	// Second EKU
+	// Second EKU - use callback to wait for completion
+	var secondEKUResult EKUResult
+	var secondEKUDone sync.WaitGroup
+	secondEKUDone.Add(1)
 	t.Log("TestEKUMultipleSequential: Client initiating second EKU")
 	c2s <- true
 	t.Log("TestEKUMultipleSequential: Client sent second c2s")
-	err = client.SendExtendedKeyUpdate()
+	err = client.SendExtendedKeyUpdate(func(result EKUResult) {
+		t.Logf("TestEKUMultipleSequential: Second EKU callback called: Success=%v, Error=%v", result.Success, result.Error)
+		secondEKUResult = result
+		secondEKUDone.Done()
+	})
 	t.Logf("TestEKUMultipleSequential: Client second SendExtendedKeyUpdate() returned: err=%v", err)
 	assertNotError(t, err, "Second Extended Key Update should succeed")
+
+	// Wait for second EKU to complete
+	t.Log("TestEKUMultipleSequential: Client waiting for second EKU callback")
+	secondEKUDone.Wait()
+	assertTrue(t, secondEKUResult.Success, "Second EKU should succeed")
+	assertNil(t, secondEKUResult.Error, "Second EKU should not have error")
+	t.Log("TestEKUMultipleSequential: Client second EKU completed successfully")
 	t.Log("TestEKUMultipleSequential: Client writing after second EKU")
 	client.Write(oneBuf)
 	<-s2c
 	t.Log("TestEKUMultipleSequential: Client received third s2c")
-	client.Read(oneBuf)
-	t.Log("TestEKUMultipleSequential: Client read after second EKU, test complete")
+	// Note: Server hasn't written yet - it's waiting for third c2s signal
+	// So we can't read here. Instead, initiate third EKU first, then read after server writes
+
+	// Third EKU - use callback to wait for completion
+	var thirdEKUResult EKUResult
+	var thirdEKUDone sync.WaitGroup
+	thirdEKUDone.Add(1)
+	t.Log("TestEKUMultipleSequential: Client initiating third EKU")
+	c2s <- true
+	t.Log("TestEKUMultipleSequential: Client sent third c2s")
+	err = client.SendExtendedKeyUpdate(func(result EKUResult) {
+		t.Logf("TestEKUMultipleSequential: Third EKU callback called: Success=%v, Error=%v", result.Success, result.Error)
+		thirdEKUResult = result
+		thirdEKUDone.Done()
+	})
+	t.Logf("TestEKUMultipleSequential: Client third SendExtendedKeyUpdate() returned: err=%v", err)
+	assertNotError(t, err, "Third Extended Key Update should succeed")
+
+	// Wait for third EKU to complete
+	t.Log("TestEKUMultipleSequential: Client waiting for third EKU callback")
+	thirdEKUDone.Wait()
+	assertTrue(t, thirdEKUResult.Success, "Third EKU should succeed")
+	assertNil(t, thirdEKUResult.Error, "Third EKU should not have error")
+	t.Log("TestEKUMultipleSequential: Client third EKU completed successfully")
+	t.Log("TestEKUMultipleSequential: Client writing after third EKU")
+	client.Write(oneBuf)
+	<-s2c
+	t.Log("TestEKUMultipleSequential: Client received fourth s2c")
+	// Server reads our data and sends signal, but doesn't write back
+	// So we don't need to read - test is complete after third EKU
+	t.Log("TestEKUMultipleSequential: Test complete - test complete")
 }
 
 // DTLS Tests
@@ -377,62 +467,154 @@ func TestEKUMultipleSequential(t *testing.T) {
 func TestExtendedKeyUpdateDTLS(t *testing.T) {
 	cConn, sConn := pipe()
 
+	cbConn := newBufferedConn(cConn)
+	sbConn := newBufferedConn(sConn)
+	cbConn.SetAutoflush()
+	sbConn.SetAutoflush()
+
 	conf := basicConfig.Clone()
 	conf.UseDTLS = true
 	conf.EnableExtendedKeyUpdate = true
-	client := Client(cConn, conf)
-	server := Server(sConn, conf)
+	conf.PSKs = &PSKMapCache{} // Force DH
+	client := Client(cbConn, conf)
+	server := Server(sbConn, conf)
 	defer client.Close()
 	defer server.Close()
 
 	oneBuf := []byte{'a'}
 	c2s := make(chan bool)
 	s2c := make(chan bool)
+	serverStateChan := make(chan stateConnected, 2) // Initial state and final state
 
+	// Server goroutine: reads to process EKU messages, waits for client signal
 	go func() {
 		alert := server.Handshake()
 		assertEquals(t, alert, AlertNoAlert)
 		assertTrue(t, server.state.Params.UsingExtendedKeyUpdate, "Server should have EKU negotiated")
 
+		// Capture initial server state
+		serverStateChan <- server.state
+
+		// Send initial data
 		server.Write(oneBuf)
 		s2c <- true
 
-		// Wait for client to initiate EKU
+		// For DTLS, Read() processes handshake messages via consumeRecord()
+		// We need to continuously read to process EKU handshake messages
+		// Start reading in background to process EKU messages
+		buf := make([]byte, 1024)
+		appDataRead := make(chan bool, 1)
+
+		// Background reader processes EKU handshake messages and application data
+		// This runs independently and will process EKU messages automatically
+		go func() {
+			// Continuously read to process EKU handshake messages and application data
+			for {
+				n, err := server.Read(buf)
+				if err != nil && err != AlertWouldBlock {
+					if err == io.EOF || err.Error() == "closed" {
+						return
+					}
+					continue
+				}
+				if err == AlertWouldBlock {
+					// Wait a bit before retrying to avoid busy loop
+					// Read() already waits internally, but we also wait here to be safe
+					time.Sleep(1 * time.Millisecond)
+					continue
+				}
+				if n > 0 {
+					// Application data received
+					select {
+					case appDataRead <- true:
+					default:
+					}
+				}
+				// Note: Read() processes handshake messages (like EKU) via consumeRecord()
+				// even when n==0, so EKU messages are processed automatically
+			}
+		}()
+
+		// Wait for client to signal it's about to initiate EKU
+		// The background reader will process EKU handshake messages automatically
 		<-c2s
 
-		// Read client's EKU messages
-		server.Read(oneBuf)
+		// Background reader processes EKU messages independently
+		// Wait for client to signal EKU is complete (via callback)
+		// Client sends this AFTER EKU completes, so the background reader has already
+		// processed all EKU messages by the time we receive this signal
+		<-c2s
 		s2c <- true
 
-		// Read final message
+		// Client sends application data after EKU completes
 		<-c2s
-		server.Read(oneBuf)
+		<-appDataRead // Wait for background reader to process the data
+
+		// Write response data
+		server.Write([]byte("world"))
+
+		// Capture final server state
+		serverStateChan <- server.state
+
 		s2c <- true
 	}()
 
+	// Client: handshake, read initial data, then initiate EKU
 	alert := client.Handshake()
 	assertEquals(t, alert, AlertNoAlert)
 	assertTrue(t, client.state.Params.UsingExtendedKeyUpdate, "Client should have EKU negotiated")
 
+	// Read initial data from server
 	client.Read(oneBuf)
 	<-s2c
+
+	// Get initial states
+	clientState0 := client.state
+	serverState0 := <-serverStateChan
+
+	// Signal server that we're about to initiate EKU
+	// This allows the server's background reader to be ready
+	c2s <- true
 
 	// Initiate Extended Key Update over DTLS
-	c2s <- true
-	err := client.SendExtendedKeyUpdate()
+	// This will block until EKU completes (4-message exchange)
+	var ekuResult EKUResult
+	var ekuDone sync.WaitGroup
+	ekuDone.Add(1)
+	err := client.SendExtendedKeyUpdate(func(result EKUResult) {
+		ekuResult = result
+		ekuDone.Done()
+		// Signal server that EKU is complete
+		c2s <- true
+	})
 	assertNotError(t, err, "Extended Key Update over DTLS should succeed")
 
-	client.Write(oneBuf)
+	// Wait for EKU to complete
+	ekuDone.Wait()
+	assertTrue(t, ekuResult.Success, "EKU should succeed")
+	assertNil(t, ekuResult.Error, "EKU should not have error")
+
+	// Wait for server to acknowledge EKU completion
 	<-s2c
-	client.Read(oneBuf)
+
+	// Exchange application data to verify new keys work
+	client.Write([]byte("hello"))
+	c2s <- true
+	<-s2c
+
+	// Server writes "world" in its goroutine, read it here
+	buf := make([]byte, 100)
+	n, err := client.Read(buf)
+	assertNotError(t, err, "Client Read should succeed")
+	assertEquals(t, string(buf[:n]), "world")
 
 	// Verify keys have changed
 	clientState1 := client.state
-	serverState1 := server.state
+	serverState1 := <-serverStateChan
 	assertByteEquals(t, clientState1.serverTrafficSecret, serverState1.serverTrafficSecret)
 	assertByteEquals(t, clientState1.clientTrafficSecret, serverState1.clientTrafficSecret)
-
-	c2s <- true
-	<-s2c
+	assertNotByteEquals(t, clientState0.serverTrafficSecret, clientState1.serverTrafficSecret)
+	assertNotByteEquals(t, clientState0.clientTrafficSecret, clientState1.clientTrafficSecret)
+	assertNotByteEquals(t, serverState0.serverTrafficSecret, serverState1.serverTrafficSecret)
+	assertNotByteEquals(t, serverState0.clientTrafficSecret, serverState1.clientTrafficSecret)
 }
-

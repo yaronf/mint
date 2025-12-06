@@ -24,11 +24,14 @@ type pipeConn struct {
 	w      *bytes.Buffer
 	rLock  *sync.Mutex
 	wLock  *sync.Mutex
+	name   string // For debugging: "client" or "server"
 }
 
 func pipe() (client *pipeConn, server *pipeConn) {
 	client = new(pipeConn)
 	server = new(pipeConn)
+	client.name = "client"
+	server.name = "server"
 
 	c2s := bytes.NewBuffer(nil)
 	server.r = c2s
@@ -55,16 +58,20 @@ func (p *pipeConn) Read(data []byte) (n int, err error) {
 	if p.closed {
 		return 0, errors.New("closed")
 	}
+	bufLenBefore := p.r.Len()
 	n, err = p.r.Read(data)
-	// Suppress bytes.Buffer's EOF on an empty buffer
+	bufLenAfter := p.r.Len()
+	// Log buffer state for debugging EKU issues (always log to see empty reads too)
+	logf(logTypeIO, "%s pipeConn.Read: buffer before=%d, read=%d, buffer after=%d, err=%v", p.name, bufLenBefore, n, bufLenAfter, err)
+	// If buffer is empty and connection is closed, return io.EOF
+	// This allows record-layer to properly handle connection closure
+	if n == 0 && err == nil && p.r.Len() == 0 && p.closed {
+		return 0, io.EOF
+	}
+	// Suppress bytes.Buffer's EOF on an empty buffer (but only if connection is not closed)
+	// This allows the record layer to return AlertWouldBlock for empty reads when connection is still open
 	if err == io.EOF {
 		err = nil
-	}
-	// If buffer is empty and we read 0 bytes, check if connection is closed
-	// This helps detect closure when buffer is empty
-	if n == 0 && err == nil && p.r.Len() == 0 {
-		// Don't return error here - let the caller handle empty buffer
-		// The record layer will return AlertWouldBlock for empty reads
 	}
 	return
 }
@@ -75,7 +82,14 @@ func (p *pipeConn) Write(data []byte) (n int, err error) {
 	if p.closed {
 		return 0, errors.New("closed")
 	}
-	return p.w.Write(data)
+	bufLenBefore := p.w.Len()
+	n, err = p.w.Write(data)
+	bufLenAfter := p.w.Len()
+	// Log writes for debugging EKU issues (only log handshake messages to avoid spam)
+	if len(data) > 5 && data[0] == 0x17 { // TLS handshake record
+		logf(logTypeIO, "%s pipeConn.Write: wrote %d bytes (handshake record), buffer before=%d, buffer after=%d", p.name, n, bufLenBefore, bufLenAfter)
+	}
+	return n, err
 }
 
 func (p *pipeConn) Close() error {

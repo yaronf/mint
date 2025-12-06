@@ -16,6 +16,8 @@ type QueueHandshakeMessage struct {
 
 type SendQueuedHandshake struct{}
 
+type ClearQueuedMessages struct{}
+
 type SendEarlyData struct{}
 
 type RekeyIn struct {
@@ -62,7 +64,7 @@ type ConnectionParameters struct {
 	UsingEarlyData         bool
 	RejectedEarlyData      bool
 	UsingClientAuth        bool
-	UsingExtendedKeyUpdate bool // True if Extended Key Update (EKU) was negotiated
+	UsingExtendedKeyUpdate bool       // True if Extended Key Update (EKU) was negotiated
 	NegotiatedGroup        NamedGroup // Group negotiated during initial handshake (for EKU)
 
 	CipherSuite CipherSuite
@@ -159,11 +161,11 @@ func (state *stateConnected) KeyUpdate(request KeyUpdateRequest) ([]HandshakeAct
 //
 // This implements Message 1 of the 4-message EKU exchange: key_update_request.
 // The method:
-//   1. Validates that EKU is negotiated and no EKU is in progress
-//   2. Generates a fresh key share using the negotiated group from the handshake
-//   3. Creates and queues a key_update_request message with the key share
-//   4. Stores the key share and request message for later key derivation
-//   5. Sets ekuInProgress=true and ekuIsInitiator=true
+//  1. Validates that EKU is negotiated and no EKU is in progress
+//  2. Generates a fresh key share using the negotiated group from the handshake
+//  3. Creates and queues a key_update_request message with the key share
+//  4. Stores the key share and request message for later key derivation
+//  5. Sets ekuInProgress=true and ekuIsInitiator=true
 //
 // The caller must take the returned actions (QueueHandshakeMessage, SendQueuedHandshake)
 // to actually send the message. After sending, the initiator waits for:
@@ -294,7 +296,7 @@ func (state stateConnected) ProcessMessageWithRawBytes(hm *HandshakeMessage, raw
 		return nil, nil, AlertUnexpectedMessage
 	}
 
-	logf(logTypeHandshake, "[StateConnected] ProcessMessage: msgType=%v", hm.msgType)
+	logf(logTypeHandshake, "[StateConnected] ProcessMessage: msgType=%v, rawBytes=%v (len=%d)", hm.msgType, rawBytes != nil, len(rawBytes))
 	bodyGeneric, err := hm.ToBody()
 	if err != nil {
 		logf(logTypeHandshake, "[StateConnected] Error decoding message: %v", err)
@@ -376,11 +378,11 @@ func (state stateConnected) ProcessMessageWithRawBytes(hm *HandshakeMessage, raw
 //
 // This implements the key derivation process specified in draft-ietf-tls-extended-key-update-07 Section 7.
 // The process:
-//   1. Computes shared secret from key shares using (EC)DHE
-//   2. Derives main_secret_N+1 using HKDF-Extract with ekuDerivedSecret as salt
-//   3. Derives traffic secrets using Derive-Secret with EKU message binding
-//   4. Updates ekuDerivedSecret for subsequent EKUs
-//   5. Returns RekeyOut action to update send keys
+//  1. Computes shared secret from key shares using (EC)DHE
+//  2. Derives main_secret_N+1 using HKDF-Extract with ekuDerivedSecret as salt
+//  3. Derives traffic secrets using Derive-Secret with EKU message binding
+//  4. Updates ekuDerivedSecret for subsequent EKUs
+//  5. Returns RekeyOut action to update send keys
 //
 // Key Derivation Steps (per draft Section 7):
 //   - main_secret_N+1 = HKDF-Extract(ekuDerivedSecret, shared_secret)
@@ -428,8 +430,36 @@ func (state *stateConnected) deriveEKUKeys(ourKeyShare, peerKeyShare *KeyShareEn
 	logf(logTypeCrypto, "[StateConnected] deriveEKUKeys: main_secret_N+1: [%d] %x", len(mainSecretN1), mainSecretN1)
 
 	// Step c: Derive traffic secrets using concatenated request and response messages as context
-	ekuContext := append(requestMsg, responseMsg...)
-	logf(logTypeCrypto, "[StateConnected] deriveEKUKeys: EKU context length: %d", len(ekuContext))
+	// For DTLS, extract message bodies (skip headers) since sequence numbers can differ between retransmissions
+	// For TLS, use full messages (headers don't include sequence numbers)
+	requestBody := requestMsg
+	responseBody := responseMsg
+	isDTLS := state.hsCtx.hOut != nil && state.hsCtx.hOut.datagram
+	headerLen := handshakeHeaderLenTLS
+	if isDTLS {
+		headerLen = handshakeHeaderLenDTLS
+	}
+	reqPreview := requestMsg[:headerLen]
+	respPreview := responseMsg[:headerLen]
+	logf(logTypeCrypto, "[StateConnected] deriveEKUKeys: isDTLS=%v, requestMsg len=%d (first %d bytes: %x), responseMsg len=%d (first %d bytes: %x)",
+		isDTLS, len(requestMsg), headerLen, reqPreview, len(responseMsg), headerLen, respPreview)
+	if isDTLS {
+		// For DTLS, extract message bodies by skipping the DTLS handshake header
+		requestBody = requestMsg[headerLen:]
+		reqBodyPreview := requestBody[:headerLen]
+		logf(logTypeCrypto, "[StateConnected] deriveEKUKeys: Extracted requestBody, len=%d (skipped %d bytes), first %d bytes: %x",
+			len(requestBody), headerLen, headerLen, reqBodyPreview)
+		responseBody = responseMsg[headerLen:]
+		respBodyPreview := responseBody[:headerLen]
+		logf(logTypeCrypto, "[StateConnected] deriveEKUKeys: Extracted responseBody, len=%d (skipped %d bytes), first %d bytes: %x",
+			len(responseBody), headerLen, headerLen, respBodyPreview)
+	}
+	ekuContext := append(requestBody, responseBody...)
+	logf(logTypeCrypto, "[StateConnected] deriveEKUKeys: EKU context length: %d (using message bodies for DTLS)", len(ekuContext))
+	// Log full message bodies for debugging
+	logf(logTypeCrypto, "[StateConnected] deriveEKUKeys: FULL requestBody (%d bytes): %x", len(requestBody), requestBody)
+	logf(logTypeCrypto, "[StateConnected] deriveEKUKeys: FULL responseBody (%d bytes): %x", len(responseBody), responseBody)
+	logf(logTypeCrypto, "[StateConnected] deriveEKUKeys: FULL ekuContext (%d bytes): %x", len(ekuContext), ekuContext)
 
 	clientApplicationTrafficSecretN1 := deriveSecret(state.cryptoParams, mainSecretN1, labelClientApplicationTrafficSecret, ekuContext)
 	serverApplicationTrafficSecretN1 := deriveSecret(state.cryptoParams, mainSecretN1, labelServerApplicationTrafficSecret, ekuContext)
@@ -456,8 +486,10 @@ func (state *stateConnected) deriveEKUKeys(ourKeyShare, peerKeyShare *KeyShareEn
 	var trafficKeys KeySet
 	if state.isClient {
 		trafficKeys = makeTrafficKeys(state.cryptoParams, state.clientTrafficSecret)
+		logf(logTypeCrypto, "[StateConnected] deriveEKUKeys: Generated trafficKeys (client secret): key=%x iv=%x", trafficKeys.Keys["key"], trafficKeys.Keys["iv"])
 	} else {
 		trafficKeys = makeTrafficKeys(state.cryptoParams, state.serverTrafficSecret)
+		logf(logTypeCrypto, "[StateConnected] deriveEKUKeys: Generated trafficKeys (server secret): key=%x iv=%x", trafficKeys.Keys["key"], trafficKeys.Keys["iv"])
 	}
 
 	logf(logTypeHandshake, "[StateConnected] deriveEKUKeys: Generated traffic keys, returning RekeyOut action")
@@ -508,8 +540,50 @@ func (state *stateConnected) deriveEKUKeysForResponder(ourKeyShare, peerKeyShare
 	logf(logTypeCrypto, "[StateConnected] deriveEKUKeysForResponder: main_secret_N+1: [%d] %x", len(mainSecretN1), mainSecretN1)
 
 	// Derive traffic secrets using concatenated request and response messages as context
-	ekuContext := append(requestMsg, responseMsg...)
-	logf(logTypeCrypto, "[StateConnected] deriveEKUKeysForResponder: EKU context length: %d", len(ekuContext))
+	// For DTLS, extract message bodies (skip headers) since sequence numbers can differ between retransmissions
+	// For TLS, use full messages (headers don't include sequence numbers)
+	requestBody := requestMsg
+	responseBody := responseMsg
+	isDTLS := state.hsCtx.hOut != nil && state.hsCtx.hOut.datagram
+	headerLen := handshakeHeaderLenTLS
+	if isDTLS {
+		headerLen = handshakeHeaderLenDTLS
+	}
+	reqPreview := requestMsg[:headerLen]
+	respPreview := responseMsg[:headerLen]
+	logf(logTypeCrypto, "[StateConnected] deriveEKUKeysForResponder: isDTLS=%v, requestMsg len=%d (first %d bytes: %x), responseMsg len=%d (first %d bytes: %x)",
+		isDTLS, len(requestMsg), headerLen, reqPreview, len(responseMsg), headerLen, respPreview)
+	if isDTLS {
+		// For DTLS, extract message bodies by skipping the DTLS handshake header
+		if len(requestMsg) < headerLen {
+			logf(logTypeCrypto, "[StateConnected] deriveEKUKeysForResponder: ERROR requestMsg too short: len=%d < headerLen=%d", len(requestMsg), headerLen)
+		} else {
+			requestBody = requestMsg[headerLen:]
+			reqBodyPreview := requestBody
+			if len(reqBodyPreview) > 20 {
+				reqBodyPreview = reqBodyPreview[:20]
+			}
+			logf(logTypeCrypto, "[StateConnected] deriveEKUKeysForResponder: Extracted requestBody, len=%d (skipped %d bytes), first 20 bytes: %x",
+				len(requestBody), headerLen, reqBodyPreview)
+		}
+		if len(responseMsg) < headerLen {
+			logf(logTypeCrypto, "[StateConnected] deriveEKUKeysForResponder: ERROR responseMsg too short: len=%d < headerLen=%d", len(responseMsg), headerLen)
+		} else {
+			responseBody = responseMsg[headerLen:]
+			respBodyPreview := responseBody
+			if len(respBodyPreview) > 20 {
+				respBodyPreview = respBodyPreview[:20]
+			}
+			logf(logTypeCrypto, "[StateConnected] deriveEKUKeysForResponder: Extracted responseBody, len=%d (skipped %d bytes), first 20 bytes: %x",
+				len(responseBody), headerLen, respBodyPreview)
+		}
+	}
+	ekuContext := append(requestBody, responseBody...)
+	logf(logTypeCrypto, "[StateConnected] deriveEKUKeysForResponder: EKU context length: %d (using message bodies for DTLS)", len(ekuContext))
+	// Log full message bodies for debugging
+	logf(logTypeCrypto, "[StateConnected] deriveEKUKeysForResponder: FULL requestBody (%d bytes): %x", len(requestBody), requestBody)
+	logf(logTypeCrypto, "[StateConnected] deriveEKUKeysForResponder: FULL responseBody (%d bytes): %x", len(responseBody), responseBody)
+	logf(logTypeCrypto, "[StateConnected] deriveEKUKeysForResponder: FULL ekuContext (%d bytes): %x", len(ekuContext), ekuContext)
 
 	clientApplicationTrafficSecretN1 := deriveSecret(state.cryptoParams, mainSecretN1, labelClientApplicationTrafficSecret, ekuContext)
 	serverApplicationTrafficSecretN1 := deriveSecret(state.cryptoParams, mainSecretN1, labelServerApplicationTrafficSecret, ekuContext)
@@ -535,9 +609,13 @@ func (state *stateConnected) deriveEKUKeysForResponder(ourKeyShare, peerKeyShare
 	if state.isClient {
 		receiveKeys = makeTrafficKeys(state.cryptoParams, state.serverTrafficSecret)
 		sendKeys = makeTrafficKeys(state.cryptoParams, state.clientTrafficSecret)
+		logf(logTypeCrypto, "[StateConnected] deriveEKUKeysForResponder: Generated receiveKeys (server secret): key=%x iv=%x", receiveKeys.Keys["key"], receiveKeys.Keys["iv"])
+		logf(logTypeCrypto, "[StateConnected] deriveEKUKeysForResponder: Generated sendKeys (client secret): key=%x iv=%x", sendKeys.Keys["key"], sendKeys.Keys["iv"])
 	} else {
 		receiveKeys = makeTrafficKeys(state.cryptoParams, state.clientTrafficSecret)
 		sendKeys = makeTrafficKeys(state.cryptoParams, state.serverTrafficSecret)
+		logf(logTypeCrypto, "[StateConnected] deriveEKUKeysForResponder: Generated receiveKeys (client secret): key=%x iv=%x", receiveKeys.Keys["key"], receiveKeys.Keys["iv"])
+		logf(logTypeCrypto, "[StateConnected] deriveEKUKeysForResponder: Generated sendKeys (server secret): key=%x iv=%x", sendKeys.Keys["key"], sendKeys.Keys["iv"])
 	}
 
 	logf(logTypeHandshake, "[StateConnected] deriveEKUKeysForResponder: Generated traffic keys, returning RekeyIn and RekeyOut actions")
@@ -553,7 +631,7 @@ func (state *stateConnected) deriveEKUKeysForResponder(ourKeyShare, peerKeyShare
 func (state *stateConnected) handleExtendedKeyUpdate(hm *HandshakeMessage, body *ExtendedKeyUpdateBody, rawBytes []byte) (HandshakeState, []HandshakeAction, Alert) {
 	logf(logTypeHandshake, "[StateConnected] handleExtendedKeyUpdate: EKUType=%v, UsingExtendedKeyUpdate=%v, NegotiatedGroup=%v, ekuInProgress=%v, ekuIsInitiator=%v",
 		body.EKUType, state.Params.UsingExtendedKeyUpdate, state.Params.NegotiatedGroup, state.ekuInProgress, state.ekuIsInitiator)
-	
+
 	if !state.Params.UsingExtendedKeyUpdate {
 		logf(logTypeHandshake, "[StateConnected] Received ExtendedKeyUpdate but EKU not negotiated")
 		return nil, nil, AlertUnexpectedMessage
@@ -568,9 +646,30 @@ func (state *stateConnected) handleExtendedKeyUpdate(hm *HandshakeMessage, body 
 			return state.handleEKUTieBreaking(hm, body)
 		}
 		// Otherwise, we're the responder - handle request (Message 1)
+		// Clear any stale EKU state before checking if EKU is in progress
+		// This handles the case where Message 4 was sent but state wasn't cleared properly
+		// If ekuInProgress is true but we're not actually in an EKU (no key shares or messages), clear it
 		if state.ekuInProgress {
-			// Already have an EKU in progress - reject concurrent request
-			logf(logTypeHandshake, "[StateConnected] Received EKU request but EKU already in progress")
+			hasActiveState := state.ekuOurKeyShare != nil || state.ekuPeerKeyShare != nil || state.ekuRequestMessage != nil || state.ekuResponseMessage != nil
+			logf(logTypeHandshake, "[StateConnected] Received EKU request, ekuInProgress=true, hasActiveState=%v (OurKeyShare=%v, PeerKeyShare=%v, RequestMsg=%v, ResponseMsg=%v)",
+				hasActiveState, state.ekuOurKeyShare != nil, state.ekuPeerKeyShare != nil, state.ekuRequestMessage != nil, state.ekuResponseMessage != nil)
+			if !hasActiveState {
+				logf(logTypeHandshake, "[StateConnected] Clearing stale EKU state (ekuInProgress=true but no active state fields)")
+				state.ekuInProgress = false
+				state.ekuIsInitiator = false
+				state.ekuOurPrivateKey = nil
+			}
+		}
+
+		if state.ekuInProgress {
+			// Already have an EKU in progress - check if we're waiting to send Message 4
+			// If we've already sent Message 4 (queued and sent), we can clear the state and start a new EKU
+			// But if Message 4 is still queued, we should reject concurrent request
+			// For now, reject concurrent requests - the previous EKU should complete first
+			logf(logTypeHandshake, "[StateConnected] Received EKU request but EKU already in progress (ekuIsInitiator=%v)", state.ekuIsInitiator)
+			// If we're the responder and have Message 4 queued but not sent, reject
+			// Actually, we can't know if Message 4 was sent, so we'll reject concurrent requests
+			// The proper fix would be to track Message 4 send status, but for now reject
 			return nil, nil, AlertUnexpectedMessage
 		}
 
@@ -599,8 +698,18 @@ func (state *stateConnected) handleExtendedKeyUpdate(hm *HandshakeMessage, body 
 		if rawBytes != nil && len(rawBytes) > 0 {
 			state.ekuRequestMessage = make([]byte, len(rawBytes))
 			copy(state.ekuRequestMessage, rawBytes)
+			preview := rawBytes
+			if len(preview) > 24 {
+				preview = preview[:24]
+			}
+			logf(logTypeHandshake, "[StateConnected] Stored ekuRequestMessage from rawBytes: len=%d, first 24 bytes: %x", len(rawBytes), preview)
 		} else {
 			state.ekuRequestMessage = hm.Marshal()
+			preview := state.ekuRequestMessage
+			if len(preview) > 24 {
+				preview = preview[:24]
+			}
+			logf(logTypeHandshake, "[StateConnected] Stored ekuRequestMessage from Marshal(): len=%d, first 24 bytes: %x", len(state.ekuRequestMessage), preview)
 		}
 
 		// Generate fresh key share using negotiated group
@@ -652,6 +761,13 @@ func (state *stateConnected) handleExtendedKeyUpdate(hm *HandshakeMessage, body 
 			return nil, nil, AlertUnexpectedMessage
 		}
 
+		// Check if we've already processed Message 2 (deduplication for DTLS retransmissions)
+		// If ekuResponseMessage is already set, we've already processed Message 2
+		if state.ekuResponseMessage != nil {
+			logf(logTypeHandshake, "[StateConnected] Received duplicate EKU response (Message 2) - already processed, skipping")
+			return state, nil, AlertNoAlert // Return no actions, state unchanged
+		}
+
 		// Validate KeyShare is present
 		if body.KeyShare == nil {
 			logf(logTypeHandshake, "[StateConnected] Received EKU response without KeyShare")
@@ -667,13 +783,38 @@ func (state *stateConnected) handleExtendedKeyUpdate(hm *HandshakeMessage, body 
 		// Store peer's key share and response message
 		state.ekuPeerKeyShare = body.KeyShare
 		// Use raw bytes if provided (from wire), otherwise marshal (for compatibility)
+		logf(logTypeHandshake, "[StateConnected] handleExtendedKeyUpdate: rawBytes=%v, len=%d", rawBytes != nil, len(rawBytes))
 		if rawBytes != nil && len(rawBytes) > 0 {
-			state.ekuResponseMessage = rawBytes
+			state.ekuResponseMessage = make([]byte, len(rawBytes))
+			copy(state.ekuResponseMessage, rawBytes)
+			rawPreview := rawBytes
+			if len(rawPreview) > 30 {
+				rawPreview = rawPreview[:30]
+			}
+			logf(logTypeHandshake, "[StateConnected] Stored ekuResponseMessage from rawBytes: len=%d, first 30 bytes: %x", len(rawBytes), rawPreview)
 		} else {
 			state.ekuResponseMessage = hm.Marshal()
+			marshalPreview := state.ekuResponseMessage
+			if len(marshalPreview) > 30 {
+				marshalPreview = marshalPreview[:30]
+			}
+			logf(logTypeHandshake, "[StateConnected] Stored ekuResponseMessage from Marshal(): len=%d, first 30 bytes: %x (rawBytes was nil or empty, hm.body len=%d)", len(state.ekuResponseMessage), marshalPreview, len(hm.body))
 		}
 
 		// Derive new secrets using EKU key derivation
+		// Log the message lengths and first few bytes to verify correct order
+		reqPreview := state.ekuRequestMessage
+		if len(reqPreview) > 10 {
+			reqPreview = reqPreview[:10]
+		}
+		respPreview := state.ekuResponseMessage
+		if len(respPreview) > 10 {
+			respPreview = respPreview[:10]
+		}
+		logf(logTypeHandshake, "[StateConnected] deriveEKUKeys call: ekuRequestMessage len=%d (first bytes: %x), ekuResponseMessage len=%d (first bytes: %x)",
+			len(state.ekuRequestMessage), reqPreview, len(state.ekuResponseMessage), respPreview)
+		// IMPORTANT: EKU context must be requestMsg || responseMsg (Message 1 || Message 2)
+		// Client stores messages correctly: ekuRequestMessage=Message1, ekuResponseMessage=Message2
 		rekeyActions, alert := state.deriveEKUKeys(state.ekuOurKeyShare, state.ekuPeerKeyShare, state.ekuRequestMessage, state.ekuResponseMessage)
 		if alert != AlertNoAlert {
 			logf(logTypeHandshake, "[StateConnected] Error deriving EKU keys: %v", alert)
@@ -713,7 +854,10 @@ func (state *stateConnected) handleExtendedKeyUpdate(hm *HandshakeMessage, body 
 		// Let me check the draft to see what keys Message 4 should be encrypted with.
 		// For now, let's assume Message 4 should be encrypted with OLD keys, so the initiator can decrypt it with OLD keys,
 		// then do RekeyIn after processing Message 4.
+		// Clear Message 1 from queue (Message 2 implicitly ACKs it)
+		// This must be done BEFORE queuing Message 3, so Message 3 doesn't get cleared
 		toSend := []HandshakeAction{
+			ClearQueuedMessages{}, // Clear Message 1 (ACKed by Message 2)
 			QueueHandshakeMessage{ekuNewMsg},
 			SendQueuedHandshake{},
 		}
@@ -730,7 +874,37 @@ func (state *stateConnected) handleExtendedKeyUpdate(hm *HandshakeMessage, body 
 			// Responder receives initiator's new_key_update (Message 3)
 			logf(logTypeHandshake, "[StateConnected] Responder: Received initiator's new_key_update (Message 3)")
 
+			// IMPORTANT: ekuResponseMessage was marshaled before queuing, so it has the wrong sequence number
+			// We need to re-marshal it after queuing to get the correct sequence number
+			// However, we can't access the queued message directly (queued is not exported)
+			// So we'll update it in the QueueHandshakeMessage action handler instead
+			// For now, note that this might cause a key mismatch if sequence numbers differ
+
 			// Derive new secrets using EKU key derivation
+			// Log the message lengths and first few bytes to verify correct order
+			reqPreview := state.ekuRequestMessage
+			if len(reqPreview) > 10 {
+				reqPreview = reqPreview[:10]
+			}
+			respPreview := state.ekuResponseMessage
+			if len(respPreview) > 10 {
+				respPreview = respPreview[:10]
+			}
+			logf(logTypeHandshake, "[StateConnected] deriveEKUKeysForResponder call: ekuRequestMessage len=%d (first bytes: %x), ekuResponseMessage len=%d (first bytes: %x)",
+				len(state.ekuRequestMessage), reqPreview, len(state.ekuResponseMessage), respPreview)
+			// Log full messages for debugging
+			reqFullPreview := state.ekuRequestMessage
+			if len(reqFullPreview) > 30 {
+				reqFullPreview = reqFullPreview[:30]
+			}
+			respFullPreview := state.ekuResponseMessage
+			if len(respFullPreview) > 30 {
+				respFullPreview = respFullPreview[:30]
+			}
+			logf(logTypeHandshake, "[StateConnected] deriveEKUKeysForResponder call: FULL ekuRequestMessage len=%d (first 30 bytes: %x), FULL ekuResponseMessage len=%d (first 30 bytes: %x)",
+				len(state.ekuRequestMessage), reqFullPreview, len(state.ekuResponseMessage), respFullPreview)
+			// IMPORTANT: Server stores messages correctly: ekuRequestMessage=Message1, ekuResponseMessage=Message2
+			// So we use them in the correct order: Message 1 || Message 2
 			rekeyActions, alert := state.deriveEKUKeysForResponder(state.ekuOurKeyShare, state.ekuPeerKeyShare, state.ekuRequestMessage, state.ekuResponseMessage)
 			if alert != AlertNoAlert {
 				logf(logTypeHandshake, "[StateConnected] Error deriving EKU keys for responder: %v", alert)
@@ -772,20 +946,24 @@ func (state *stateConnected) handleExtendedKeyUpdate(hm *HandshakeMessage, body 
 			}
 			toSend = append(toSend, SendQueuedHandshake{})
 
-		// Clear EKU state after sending Message 4 - exchange is complete
-		state.ekuInProgress = false
-		state.ekuIsInitiator = false
-		state.ekuOurKeyShare = nil
-		state.ekuOurPrivateKey = nil
-		state.ekuPeerKeyShare = nil
-		state.ekuRequestMessage = nil
-		state.ekuResponseMessage = nil
+			// Clear EKU state now that Message 4 is queued
+			// The exchange is effectively complete - Message 4 will be sent and the initiator will process it
+			// We clear the state here so that if a new EKU request arrives before Message 4 is sent,
+			// it can be processed (though in practice Message 4 should be sent immediately)
+			state.ekuInProgress = false
+			state.ekuIsInitiator = false
+			state.ekuOurKeyShare = nil
+			state.ekuOurPrivateKey = nil
+			state.ekuPeerKeyShare = nil
+			state.ekuRequestMessage = nil
+			state.ekuResponseMessage = nil
+			logf(logTypeHandshake, "[StateConnected] Responder: Cleared EKU state after queuing Message 4")
 
-		logf(logTypeHandshake, "[StateConnected] Responder: Queued new_key_update (Message 4) for sending, EKU exchange complete, actions count=%d", len(toSend))
-		for i, action := range toSend {
-			logf(logTypeHandshake, "[StateConnected] Responder: Action[%d]=%T", i, action)
-		}
-		return state, toSend, AlertNoAlert
+			logf(logTypeHandshake, "[StateConnected] Responder: Queued new_key_update (Message 4) for sending, EKU exchange will complete after send, actions count=%d", len(toSend))
+			for i, action := range toSend {
+				logf(logTypeHandshake, "[StateConnected] Responder: Action[%d]=%T", i, action)
+			}
+			return state, toSend, AlertNoAlert
 		} else if state.ekuInProgress && state.ekuIsInitiator {
 			// Initiator receives responder's new_key_update (Message 4)
 			logf(logTypeHandshake, "[StateConnected] Initiator: Received responder's new_key_update (Message 4)")
@@ -849,14 +1027,61 @@ func (state *stateConnected) handleEKUTieBreaking(hm *HandshakeMessage, body *Ex
 		return nil, nil, AlertUnexpectedMessage
 	} else {
 		// Peer's value > local value: Abandon local update, act as responder
+		// Per draft Section 4.1: "the ExtendedKeyUpdate(key_update_request) with the lower
+		// lexicographic order... MUST be ignored" - so we ignore our own request and process peer's
 		logf(logTypeHandshake, "[StateConnected] EKU tie-breaking: peer > local, switching to responder")
+
+		// Clear our initiator state
 		state.ekuInProgress = false
 		state.ekuIsInitiator = false
-		// Clear our state
 		state.ekuOurKeyShare = nil
+		state.ekuOurPrivateKey = nil
 		state.ekuRequestMessage = nil
-		// Process as responder (Phase 5)
-		logf(logTypeHandshake, "[StateConnected] EKU responder processing - Phase 5")
-		return nil, nil, AlertInternalError // TODO: Phase 5
+
+		// Now process peer's request as responder (same as Phase 5 responder path)
+		// Store peer's key share
+		state.ekuPeerKeyShare = body.KeyShare
+
+		// Store marshaled request message for key derivation binding
+		state.ekuRequestMessage = hm.Marshal()
+
+		// Generate fresh key share using negotiated group
+		pub, priv, err := newKeyShare(state.Params.NegotiatedGroup)
+		if err != nil {
+			logf(logTypeHandshake, "[StateConnected] Error generating key share for tie-breaking responder: %v", err)
+			return nil, nil, AlertInternalError
+		}
+
+		ourKeyShare := &KeyShareEntry{
+			Group:       state.Params.NegotiatedGroup,
+			KeyExchange: pub,
+		}
+		state.ekuOurKeyShare = ourKeyShare
+		state.ekuOurPrivateKey = priv
+
+		// Create ExtendedKeyUpdate response message (Message 2)
+		ekuResponseBody := &ExtendedKeyUpdateBody{
+			EKUType:  ExtendedKeyUpdateTypeResponse,
+			KeyShare: ourKeyShare,
+		}
+
+		ekuResponseMsg, err := state.hsCtx.hOut.HandshakeMessageFromBody(ekuResponseBody)
+		if err != nil {
+			logf(logTypeHandshake, "[StateConnected] Error marshaling EKU response for tie-breaking: %v", err)
+			return nil, nil, AlertInternalError
+		}
+
+		// Store marshaled response message for key derivation binding
+		state.ekuResponseMessage = ekuResponseMsg.Marshal()
+
+		// Set responder state
+		state.ekuInProgress = true
+		state.ekuIsInitiator = false
+
+		logf(logTypeHandshake, "[StateConnected] EKU tie-breaking: switched to responder, sending response (Message 2)")
+		return state, []HandshakeAction{
+			QueueHandshakeMessage{ekuResponseMsg},
+			SendQueuedHandshake{},
+		}, AlertNoAlert
 	}
 }

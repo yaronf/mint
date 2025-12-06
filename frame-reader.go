@@ -49,12 +49,13 @@ func (f *frameReader) needed() int {
 	if tmp < 0 {
 		return 0
 	}
+	logf(logTypeFrameReader, "frameReader.needed(): working_len=%d, writeOffset=%d, remainder_len=%d, needed=%d, state=%d", len(f.working), f.writeOffset, len(f.remainder), tmp, f.state)
 	return tmp
 }
 
 func (f *frameReader) addChunk(in []byte) {
 	// Append to the buffer.
-	logf(logTypeFrameReader, "Appending %v", len(in))
+	logf(logTypeFrameReader, "addChunk: Appending %v bytes, remainder_len before=%d, after=%d, state=%d", len(in), len(f.remainder), len(f.remainder)+len(in), f.state)
 	f.remainder = append(f.remainder, in...)
 }
 
@@ -74,7 +75,7 @@ func (f *frameReader) process() (hdr []byte, body []byte, err error) {
 
 		// We have read a full frame
 		if f.state == kFrameReaderBody {
-			logf(logTypeFrameReader, "Returning frame hdr=%#x len=%d buffered=%d", f.header, len(f.body), len(f.remainder))
+			logf(logTypeFrameReader, "Returning frame hdr=%#x len=%d buffered=%d, state transitioning from Body to Hdr", f.header, len(f.body), len(f.remainder))
 			f.state = kFrameReaderHdr
 			f.working = f.header
 			return dup(f.header), dup(f.body), nil
