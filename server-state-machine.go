@@ -700,7 +700,7 @@ func (state serverStateNegotiated) Next(_ handshakeMessageReader) (HandshakeStat
 		logf(logTypeHandshake, "Creating CertVerify: %04x %v", state.certScheme, params.Hash)
 
 		hcv := handshakeHash.Sum(nil)
-		logf(logTypeHandshake, "Handshake Hash to be verified: [%d] %x", len(hcv), hcv)
+		logf(logTypeCrypto, "Handshake Hash to be verified: [%d] %x", len(hcv), hcv)
 
 		err = certificateVerify.Sign(state.cert.PrivateKey, hcv)
 		if err != nil {

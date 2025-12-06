@@ -603,7 +603,7 @@ func (h *HandshakeLayer) WriteMessage(hm *HandshakeMessage) (int, error) {
 func (h *HandshakeLayer) WriteMessages(hms []*HandshakeMessage) (int, error) {
 	written := 0
 	for _, hm := range hms {
-		logf(logTypeHandshake, "WriteMessage [%d] %x", hm.msgType, hm.body)
+		logf(logTypeHandshake, "WriteMessage [%d] len=[%d]", hm.msgType, len(hm.body))
 
 		wrote, err := h.WriteMessage(hm)
 		if err != nil {

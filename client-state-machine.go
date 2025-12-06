@@ -844,7 +844,7 @@ func (state clientStateWaitCV) Next(hr handshakeMessageReader) (HandshakeState, 
 	}
 
 	hcv := state.handshakeHash.Sum(nil)
-	logf(logTypeHandshake, "Handshake Hash to be verified: [%d] %x", len(hcv), hcv)
+	logf(logTypeCrypto, "Handshake Hash to be verified: [%d] %x", len(hcv), hcv)
 
 	serverPublicKey := state.serverCertificate.CertificateList[0].CertData.PublicKey
 	if err := certVerify.Verify(serverPublicKey, hcv); err != nil {
@@ -955,7 +955,7 @@ func (state clientStateWaitFinished) Next(hr handshakeMessageReader) (HandshakeS
 	}
 
 	if !bytes.Equal(fin.VerifyData, serverFinishedData) {
-		logf(logTypeHandshake, "[ClientStateWaitFinished] Server's Finished failed to verify [%x] != [%x]",
+		logf(logTypeCrypto, "[ClientStateWaitFinished] Server's Finished failed to verify [%x] != [%x]",
 			fin.VerifyData, serverFinishedData)
 		return nil, nil, AlertHandshakeFailure
 	}
@@ -1044,7 +1044,7 @@ func (state clientStateWaitFinished) Next(hr handshakeMessageReader) (HandshakeS
 			state.handshakeHash.Write(certm.Marshal())
 
 			hcv := state.handshakeHash.Sum(nil)
-			logf(logTypeHandshake, "Handshake Hash to be verified: [%d] %x", len(hcv), hcv)
+			logf(logTypeCrypto, "Handshake Hash to be verified: [%d] %x", len(hcv), hcv)
 
 			certificateVerify := &CertificateVerifyBody{Algorithm: certScheme}
 			logf(logTypeHandshake, "Creating CertVerify: %04x %v", certScheme, state.cryptoParams.Hash)

@@ -564,7 +564,7 @@ func (r *DefaultRecordLayer) nextRecord(allowOldEpoch bool) (*TLSPlaintext, erro
 			logf(logTypeIO, "%s RecordLayer.ReadRecord: using retried decrypted record, skipping decrypt", r.label)
 		} else {
 			logf(logTypeIO, "%s RecordLayer.ReadRecord BEFORE decrypt: epoch=[%s] seq=[%x] contentType=[%d] ciphertext_len=[%d]", r.label, cipher.epoch.label(), seq, pt.contentType, len(pt.fragment))
-			logf(logTypeIO, "%s RecordLayer.ReadRecord epoch=[%s] seq=[%x] [%d] ciphertext=[%x]", r.label, cipher.epoch.label(), seq, pt.contentType, pt.fragment)
+			logf(logTypeIO, "%s RecordLayer.ReadRecord epoch=[%s] seq=[%x] [%d] ciphertext_len=[%d]", r.label, cipher.epoch.label(), seq, pt.contentType, len(pt.fragment))
 			logCipher := cipher
 			// Save a copy of pt before decrypt, since decrypt might return nil on error
 			// We need the encrypted fragment to cache for retry after RekeyIn
@@ -639,7 +639,7 @@ func (r *DefaultRecordLayer) nextRecord(allowOldEpoch bool) (*TLSPlaintext, erro
 		return nil, fmt.Errorf("tls.record: Plaintext size too big")
 	}
 
-	logf(logTypeIO, "%s RecordLayer.ReadRecord [%d] [%x]", r.label, pt.contentType, pt.fragment)
+	logf(logTypeIO, "%s RecordLayer.ReadRecord [%d] len=[%d]", r.label, pt.contentType, len(pt.fragment))
 
 	r.cachedRecord = pt
 	return pt, nil
@@ -683,7 +683,7 @@ func (r *DefaultRecordLayer) writeRecordWithPadding(pt *TLSPlaintext, cipher *ci
 	if cipher.cipher != nil {
 		seqBeforeIncrement := cipher.seq
 		logf(logTypeIO, "%s RecordLayer.WriteRecord BEFORE encrypt: epoch=[%s] seq=[%x] (cipher.seq before) contentType=[%d] plaintext_len=[%d]", r.label, cipher.epoch.label(), seqBeforeIncrement, pt.contentType, len(pt.fragment))
-		logf(logTypeIO, "%s RecordLayer.WriteRecord epoch=[%s] seq=[%x] [%d] plaintext=[%x]", r.label, cipher.epoch.label(), seqBeforeIncrement, pt.contentType, pt.fragment)
+		logf(logTypeIO, "%s RecordLayer.WriteRecord epoch=[%s] seq=[%x] [%d] plaintext_len=[%d]", r.label, cipher.epoch.label(), seqBeforeIncrement, pt.contentType, len(pt.fragment))
 		ciphertext = r.encrypt(cipher, seq, header, pt, padLen)
 		logf(logTypeIO, "%s RecordLayer.WriteRecord AFTER encrypt: epoch=[%s] seq=[%x] contentType=[%d] ciphertext_len=[%d]", r.label, cipher.epoch.label(), seqBeforeIncrement, pt.contentType, len(ciphertext))
 	} else {
@@ -700,7 +700,7 @@ func (r *DefaultRecordLayer) writeRecordWithPadding(pt *TLSPlaintext, cipher *ci
 	record := append(header, ciphertext...)
 
 	if cipher.cipher != nil {
-		logf(logTypeIO, "%s RecordLayer.WriteRecord epoch=[%s] seq=[%x] [%d] ciphertext=[%x]", r.label, cipher.epoch.label(), cipher.seq, contentType, ciphertext)
+		logf(logTypeIO, "%s RecordLayer.WriteRecord epoch=[%s] seq=[%x] [%d] ciphertext_len=[%d]", r.label, cipher.epoch.label(), cipher.seq, contentType, len(ciphertext))
 	}
 
 	cipher.incrementSequenceNumber()

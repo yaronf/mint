@@ -607,7 +607,6 @@ type KeySet struct {
 }
 
 func makeTrafficKeys(params CipherSuiteParams, secret []byte) KeySet {
-	logf(logTypeCrypto, "making traffic keys: secret=%x", secret)
 	ks := KeySet{Cipher: params.Cipher, Keys: make(map[string][]byte, len(params.KeyLengths))}
 	for label, length := range params.KeyLengths {
 		ks.Keys[label] = HkdfExpandLabel(params.Hash, secret, label, []byte{}, length)

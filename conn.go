@@ -449,13 +449,6 @@ func (c *Conn) consumeRecord() error {
 			// Store raw handshake message bytes (including header) for EKU key derivation binding
 			// This ensures both sides use the exact same bytes for context, not re-marshaled versions
 			rawHandshakeMessage := pt.fragment[start : start+headerLen+hmLen]
-			if hm.msgType == HandshakeTypeExtendedKeyUpdate {
-				previewLen := 12
-				if len(rawHandshakeMessage) < previewLen {
-					previewLen = len(rawHandshakeMessage)
-				}
-				logf(logTypeHandshake, "%s consumeRecord() passing rawHandshakeMessage to ProcessMessageWithRawBytes: len=%d, first %d bytes: %x", c.label(), len(rawHandshakeMessage), previewLen, rawHandshakeMessage[:previewLen])
-			}
 
 			// Handle EKU callback check BEFORE ProcessMessage() updates the state
 			// Check if this is an EKU message we're waiting for
@@ -468,11 +461,9 @@ func (c *Conn) consumeRecord() error {
 						if ekuBody.EKUType == ExtendedKeyUpdateTypeResponse && c.ekuMessageCount == 0 && c.state.ekuInProgress && c.state.ekuIsInitiator {
 							// Message 2: Response to our request (waiting for first message)
 							isEKUResponse = true
-							logf(logTypeHandshake, "%s consumeRecord() ✓ EKU Message 2 (Response) received", c.label())
 						} else if ekuBody.EKUType == ExtendedKeyUpdateTypeNewKeyUpdate && c.ekuMessageCount == 1 && c.state.ekuInProgress && c.state.ekuIsInitiator {
 							// Message 4: Responder's new_key_update (waiting for second message)
 							isEKUResponse = true
-							logf(logTypeHandshake, "%s consumeRecord() ✓ EKU Message 4 (NewKeyUpdate) received", c.label())
 						}
 					}
 				}
@@ -510,11 +501,8 @@ func (c *Conn) consumeRecord() error {
 			// (Similar logic to processHandshakeRecord() but for consumeRecord() path)
 			if isEKUResponse && c.pendingEKUCallback != nil {
 				c.ekuMessageCount++
-				logf(logTypeHandshake, "%s consumeRecord() ✓ EKU message received (count=%d/2, callback=%p)", c.label(), c.ekuMessageCount, c.pendingEKUCallback)
 				if c.ekuMessageCount == 2 {
 					// Both Message 2 and Message 4 received - EKU complete!
-					logf(logTypeHandshake, "%s consumeRecord() ✓✓✓ EKU complete! Invoking callback", c.label())
-
 					// Create result
 					result := EKUResult{
 						Success: true,
@@ -528,9 +516,7 @@ func (c *Conn) consumeRecord() error {
 					c.ekuMessageCount = 0
 
 					if callback != nil {
-						logf(logTypeHandshake, "%s consumeRecord() invoking EKU callback (callback=%p)", c.label(), callback)
 						callback(result) // Invoke callback
-						logf(logTypeHandshake, "%s consumeRecord() EKU callback returned", c.label())
 					}
 				}
 			}
@@ -543,7 +529,7 @@ func (c *Conn) consumeRecord() error {
 			start += headerLen + hmLen
 		}
 	case RecordTypeAlert:
-		logf(logTypeIO, "extended buffer (for alert): [%d] %x", len(c.readBuffer), c.readBuffer)
+		logf(logTypeIO, "extended buffer (for alert): len=[%d]", len(c.readBuffer))
 		if len(pt.fragment) != 2 {
 			c.sendAlert(AlertUnexpectedMessage)
 			return io.EOF
@@ -571,7 +557,7 @@ func (c *Conn) consumeRecord() error {
 
 	case RecordTypeApplicationData:
 		c.readBuffer = append(c.readBuffer, pt.fragment...)
-		logf(logTypeIO, "extended buffer: [%d] %x", len(c.readBuffer), c.readBuffer)
+		logf(logTypeIO, "extended buffer: len=[%d]", len(c.readBuffer))
 
 	}
 
@@ -1011,7 +997,7 @@ func (c *Conn) takeAction(actionGeneric HandshakeAction) Alert {
 		logf(logTypeHandshake, "%s ClearQueuedMessages: clearing queued handshake messages", label)
 		c.hsCtx.hOut.ClearQueuedMessages()
 	case RekeyIn:
-		logf(logTypeHandshake, "%s Rekeying in to %s: %+v", label, action.epoch.label(), action.KeySet)
+		logf(logTypeHandshake, "%s Rekeying in to %s", label, action.epoch.label())
 		if inImpl, ok := c.in.(*DefaultRecordLayer); ok {
 			logf(logTypeHandshake, "%s RekeyIn: current cipher epoch=%s, seq=%x", label, inImpl.cipher.epoch.label(), inImpl.cipher.seq)
 		}
@@ -1030,7 +1016,7 @@ func (c *Conn) takeAction(actionGeneric HandshakeAction) Alert {
 		}
 
 	case RekeyOut:
-		logf(logTypeHandshake, "%s Rekeying out to %s: %+v", label, action.epoch.label(), action.KeySet)
+		logf(logTypeHandshake, "%s Rekeying out to %s", label, action.epoch.label())
 		if outImpl, ok := c.out.(*DefaultRecordLayer); ok {
 			logf(logTypeHandshake, "%s RekeyOut: current cipher epoch=%s, seq=%x", label, outImpl.cipher.epoch.label(), outImpl.cipher.seq)
 		}
@@ -1924,7 +1910,6 @@ func (c *Conn) handleKeyUpdateCommand(cmd controllerCommand) {
 // handleExtendedKeyUpdateCommand processes an Extended Key Update command
 // This handles the 4-message EKU exchange: request -> response -> new_key_update (initiator) -> new_key_update (responder)
 func (c *Conn) handleExtendedKeyUpdateCommand(cmd controllerCommand) {
-	logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() called", c.label())
 	if !c.handshakeComplete {
 		if cmd.callback != nil {
 			cmd.callback(EKUResult{
@@ -1963,7 +1948,6 @@ func (c *Conn) handleExtendedKeyUpdateCommand(cmd controllerCommand) {
 		return
 	}
 
-	logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() calling state.ExtendedKeyUpdateInitiate()", c.label())
 	// Create the EKU request (Message 1) and update state
 	// This will set ekuInProgress = true
 	actions, alert := (&c.state).ExtendedKeyUpdateInitiate()
@@ -1978,10 +1962,8 @@ func (c *Conn) handleExtendedKeyUpdateCommand(cmd controllerCommand) {
 		return
 	}
 
-	logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() taking %d actions", c.label(), len(actions))
 	// Take actions (send key_update_request)
-	for i, action := range actions {
-		logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() taking action %d/%d: %T", c.label(), i+1, len(actions), action)
+	for _, action := range actions {
 		actionAlert := c.takeAction(action)
 		if actionAlert != AlertNoAlert {
 			c.sendAlert(actionAlert)
@@ -1995,14 +1977,9 @@ func (c *Conn) handleExtendedKeyUpdateCommand(cmd controllerCommand) {
 		}
 	}
 
-	logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() setting up wait for EKU response (Message 2)", c.label())
-
 	// Store the callback - we'll invoke it when EKU completes (Message 2 and Message 4 received)
 	c.pendingEKUCallback = cmd.callback
 	c.ekuMessageCount = 0 // 0 = waiting for Message 2, will be incremented to 1 when Message 2 arrives, then 2 when Message 4 arrives
-	logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() stored callback (callback=%p, was_nil=%v), EKU request sent, waiting for Message 2 and Message 4",
-		c.label(), cmd.callback, cmd.callback == nil)
-	logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() returning, EKU will proceed asynchronously", c.label())
 	// Note: SendExtendedKeyUpdate() returns immediately - EKU proceeds in background
 	// The state will be cleared by processHandshakeRecord() when both Message 2 and Message 4 arrive
 }
@@ -2065,7 +2042,6 @@ func (c *Conn) processHandshakeRecord(pt *TLSPlaintext) {
 			}
 			seqBytes := pt.fragment[start+4 : start+6]
 			msgSeq = uint32((int(seqBytes[0]) << 8) + int(seqBytes[1]))
-			logf(logTypeHandshake, "%s processHandshakeRecord() DTLS post-handshake: msgType=%v, msgSeq=%d, postHandshakeMsgSeq=%d", c.label(), hm.msgType, msgSeq, c.postHandshakeMsgSeq)
 
 			// Check if this is a duplicate/retransmission
 			// If seq < postHandshakeMsgSeq, we've already processed this message
@@ -2096,14 +2072,6 @@ func (c *Conn) processHandshakeRecord(pt *TLSPlaintext) {
 		// Store raw handshake message bytes (including header) for EKU key derivation binding
 		// This ensures both sides use the exact same bytes for context, not re-marshaled versions
 		rawHandshakeMessage := pt.fragment[start : start+headerLen+hmLen]
-		if hm.msgType == HandshakeTypeExtendedKeyUpdate {
-			preview := rawHandshakeMessage
-			if len(preview) > 24 {
-				preview = preview[:24]
-			}
-			logf(logTypeHandshake, "%s processHandshakeRecord() storing rawHandshakeMessage for EKU: len=%d, first 12 bytes: %x, hmLen=%d, headerLen=%d",
-				c.label(), len(rawHandshakeMessage), preview, hmLen, headerLen)
-		}
 
 		// Reject standard KeyUpdate if EKU is negotiated (mutually exclusive)
 		if hm.msgType == HandshakeTypeKeyUpdate && c.state.Params.UsingExtendedKeyUpdate {
@@ -2120,54 +2088,36 @@ func (c *Conn) processHandshakeRecord(pt *TLSPlaintext) {
 		// Check if this is a KeyUpdate or ExtendedKeyUpdate message we're waiting for
 		isKeyUpdateResponse := false
 		isEKUResponse := false
-		logf(logTypeHandshake, "%s processHandshakeRecord() calling ToBody() for msgType=%v", c.label(), hm.msgType)
 		bodyGeneric, err := hm.ToBody()
 		if err != nil {
-			logf(logTypeHandshake, "%s processHandshakeRecord() ERROR: ToBody() failed: %v", c.label(), err)
 			// Continue to ProcessMessage which will handle the error
 		} else {
-			logf(logTypeHandshake, "%s processHandshakeRecord() ToBody() succeeded, body type=%T", c.label(), bodyGeneric)
-			if keyUpdateBody, ok := bodyGeneric.(*KeyUpdateBody); ok {
+			if _, ok := bodyGeneric.(*KeyUpdateBody); ok {
 				// This is a KeyUpdate message
-				logf(logTypeHandshake, "%s processHandshakeRecord() received KeyUpdate message, requestUpdate=%v, pendingKeyUpdateResponse=%v",
-					c.label(), keyUpdateBody.KeyUpdateRequest, c.pendingKeyUpdateResponse != nil)
 				// If we're waiting for a response, this is it (peer responds to our requestUpdate=true)
 				// Note: No mutex needed - controller is single-threaded
 				if c.pendingKeyUpdateResponse != nil {
 					isKeyUpdateResponse = true
-					logf(logTypeHandshake, "%s processHandshakeRecord() this is the KeyUpdate response we're waiting for!", c.label())
 				}
 			} else if ekuBody, ok := bodyGeneric.(*ExtendedKeyUpdateBody); ok {
 				// This is an ExtendedKeyUpdate message
-				logf(logTypeHandshake, "%s processHandshakeRecord() RECEIVED ExtendedKeyUpdate message: type=%v, pendingEKUCallback=%v, ekuInProgress=%v, ekuIsInitiator=%v",
-					c.label(), ekuBody.EKUType, c.pendingEKUCallback != nil, c.state.ekuInProgress, c.state.ekuIsInitiator)
 				// If we're waiting for EKU response and we're the initiator:
 				// - Message 2 (Response): Signal after processing
 				// - Message 4 (NewKeyUpdate from responder): Signal after processing
 				if c.pendingEKUCallback != nil {
-					logf(logTypeHandshake, "%s processHandshakeRecord() checking if this EKU message matches what we're waiting for: type=%v, ekuInProgress=%v, ekuIsInitiator=%v",
-						c.label(), ekuBody.EKUType, c.state.ekuInProgress, c.state.ekuIsInitiator)
 					if ekuBody.EKUType == ExtendedKeyUpdateTypeResponse && c.state.ekuInProgress && c.state.ekuIsInitiator {
 						// Message 2: Response to our request
 						isEKUResponse = true
-						logf(logTypeHandshake, "%s processHandshakeRecord() ✓ MATCH: This is Message 2 (Response) we're waiting for!", c.label())
 					} else if ekuBody.EKUType == ExtendedKeyUpdateTypeNewKeyUpdate && c.state.ekuInProgress && c.state.ekuIsInitiator {
 						// Message 4: Responder's new_key_update
 						isEKUResponse = true
-						logf(logTypeHandshake, "%s processHandshakeRecord() ✓ MATCH: This is Message 4 (NewKeyUpdate) we're waiting for!", c.label())
-					} else {
-						logf(logTypeHandshake, "%s processHandshakeRecord() ✗ NO MATCH: EKU message conditions not met: type=%v, pendingEKUCallback=%v, ekuInProgress=%v, ekuIsInitiator=%v",
-							c.label(), ekuBody.EKUType, c.pendingEKUCallback != nil, c.state.ekuInProgress, c.state.ekuIsInitiator)
 					}
-				} else {
-					logf(logTypeHandshake, "%s processHandshakeRecord() received EKU message but pendingEKUCallback is nil (not waiting for response)", c.label())
 				}
 			}
 		}
 
 		// Process message using state machine
 		// Pass raw handshake message bytes for EKU key derivation binding
-		logf(logTypeHandshake, "%s processHandshakeRecord() calling ProcessMessage() for msgType=%v", c.label(), hm.msgType)
 		state, actions, alert := (&c.state).ProcessMessageWithRawBytes(hm, rawHandshakeMessage)
 		if alert != AlertNoAlert {
 			logf(logTypeHandshake, "%s processHandshakeRecord() ERROR in state transition: %v", c.label(), alert)
@@ -2190,11 +2140,8 @@ func (c *Conn) processHandshakeRecord(pt *TLSPlaintext) {
 			}
 			return
 		}
-		logf(logTypeHandshake, "%s processHandshakeRecord() ProcessMessage() succeeded, actions count=%d", c.label(), len(actions))
-
 		// Take actions (rekey, send response, etc.)
 		for i, action := range actions {
-			logf(logTypeHandshake, "%s processHandshakeRecord() executing action[%d]=%T", c.label(), i, action)
 			actionAlert := c.takeAction(action)
 			if actionAlert != AlertNoAlert {
 				logf(logTypeHandshake, "%s processHandshakeRecord() ERROR during handshake action[%d]: %v", c.label(), i, actionAlert)
@@ -2217,7 +2164,6 @@ func (c *Conn) processHandshakeRecord(pt *TLSPlaintext) {
 				}
 				return
 			}
-			logf(logTypeHandshake, "%s processHandshakeRecord() action[%d]=%T completed successfully", c.label(), i, action)
 		}
 
 		// Update state
@@ -2254,12 +2200,8 @@ func (c *Conn) processHandshakeRecord(pt *TLSPlaintext) {
 		if isKeyUpdateResponse {
 			// Note: No mutex needed - controller is single-threaded
 			if c.pendingKeyUpdateResponse != nil {
-				logf(logTypeHandshake, "%s processHandshakeRecord() signaling KeyUpdate response completion", c.label())
 				close(c.pendingKeyUpdateResponse)
 				c.pendingKeyUpdateResponse = nil
-				logf(logTypeHandshake, "%s processHandshakeRecord() KeyUpdate response signal sent", c.label())
-			} else {
-				logf(logTypeHandshake, "%s processHandshakeRecord() WARNING: isKeyUpdateResponse=true but pendingKeyUpdateResponse is nil!", c.label())
 			}
 		}
 
@@ -2268,11 +2210,8 @@ func (c *Conn) processHandshakeRecord(pt *TLSPlaintext) {
 			// Note: No mutex needed - controller is single-threaded
 			if c.pendingEKUCallback != nil {
 				c.ekuMessageCount++
-				logf(logTypeHandshake, "%s processHandshakeRecord() ✓ EKU message received (count=%d/2, callback=%p)", c.label(), c.ekuMessageCount, c.pendingEKUCallback)
 				if c.ekuMessageCount == 2 {
 					// Both Message 2 and Message 4 received - EKU complete!
-					logf(logTypeHandshake, "%s processHandshakeRecord() ✓✓✓ EKU complete! Clearing state", c.label())
-
 					// Create result
 					result := EKUResult{
 						Success: true,
@@ -2286,22 +2225,15 @@ func (c *Conn) processHandshakeRecord(pt *TLSPlaintext) {
 					c.ekuMessageCount = 0
 
 					if callback != nil {
-						logf(logTypeHandshake, "%s processHandshakeRecord() invoking EKU callback (callback=%p)", c.label(), callback)
 						callback(result) // Invoke callback
-						logf(logTypeHandshake, "%s processHandshakeRecord() EKU callback returned", c.label())
-					} else {
-						logf(logTypeHandshake, "%s processHandshakeRecord() WARNING: callback is nil!", c.label())
 					}
 
 					// Clear ekuInProgress in state machine to allow next EKU
 					// Note: The state machine should have already cleared this, but ensure it's cleared here too
 					if c.state.ekuInProgress {
-						logf(logTypeHandshake, "%s processHandshakeRecord() WARNING: ekuInProgress was still true, clearing it", c.label())
 						c.state.ekuInProgress = false
 					}
 				}
-			} else {
-				logf(logTypeHandshake, "%s processHandshakeRecord() ⚠ WARNING: isEKUResponse=true but pendingEKUCallback is nil!", c.label())
 			}
 		}
 
