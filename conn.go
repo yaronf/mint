@@ -945,7 +945,7 @@ func (c *Conn) takeAction(actionGeneric HandshakeAction) Alert {
 
 	switch action := actionGeneric.(type) {
 	case QueueHandshakeMessage:
-		logf(logTypeHandshake, "%s queuing handshake message type=%v", label, action.Message.msgType)
+		logf(logTypeHandshake, "%s queuing handshake message type=%v (msg len=%d)", label, action.Message.msgType, len(action.Message.Marshal()))
 		err := c.hsCtx.hOut.QueueMessage(action.Message)
 		if err != nil {
 			logf(logTypeHandshake, "%s Error writing handshake message: %v", label, err)
@@ -1305,6 +1305,13 @@ func (c *Conn) SendKeyUpdate(requestUpdate bool) error {
 // SendExtendedKeyUpdate initiates an Extended Key Update asynchronously.
 // If callback is non-nil, it will be called when EKU completes (after 2 round trips).
 // If callback is nil, the app will not be notified of completion.
+//
+// IMPORTANT: In tie-breaking scenarios (when both peers initiate EKU simultaneously),
+// one peer will switch to responder role. The callback for the peer that switches to
+// responder will be cleared and will NOT be invoked, even though EKU completes
+// successfully. Only the initiator's callback is guaranteed to be invoked.
+// Applications should not rely on the callback being invoked in all cases when
+// both peers may initiate EKU simultaneously.
 //
 // Returns immediately with an error only if:
 //   - EKU was not negotiated during the handshake
@@ -1980,6 +1987,7 @@ func (c *Conn) handleExtendedKeyUpdateCommand(cmd controllerCommand) {
 	// Store the callback - we'll invoke it when EKU completes (Message 2 and Message 4 received)
 	c.pendingEKUCallback = cmd.callback
 	c.ekuMessageCount = 0 // 0 = waiting for Message 2, will be incremented to 1 when Message 2 arrives, then 2 when Message 4 arrives
+	logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() EKU initiated: ekuInProgress=%v, ekuIsInitiator=%v, pendingEKUCallback=%v", c.label(), c.state.ekuInProgress, c.state.ekuIsInitiator, c.pendingEKUCallback != nil)
 	// Note: SendExtendedKeyUpdate() returns immediately - EKU proceeds in background
 	// The state will be cleared by processHandshakeRecord() when both Message 2 and Message 4 arrive
 }
@@ -2105,12 +2113,17 @@ func (c *Conn) processHandshakeRecord(pt *TLSPlaintext) {
 				// - Message 2 (Response): Signal after processing
 				// - Message 4 (NewKeyUpdate from responder): Signal after processing
 				if c.pendingEKUCallback != nil {
+					logf(logTypeHandshake, "%s processHandshakeRecord() EKU message: type=%v, ekuInProgress=%v, ekuIsInitiator=%v, ekuMessageCount=%d", c.label(), ekuBody.EKUType, c.state.ekuInProgress, c.state.ekuIsInitiator, c.ekuMessageCount)
 					if ekuBody.EKUType == ExtendedKeyUpdateTypeResponse && c.state.ekuInProgress && c.state.ekuIsInitiator {
 						// Message 2: Response to our request
+						logf(logTypeHandshake, "%s processHandshakeRecord() identified as Message 2 (Response)", c.label())
 						isEKUResponse = true
 					} else if ekuBody.EKUType == ExtendedKeyUpdateTypeNewKeyUpdate && c.state.ekuInProgress && c.state.ekuIsInitiator {
 						// Message 4: Responder's new_key_update
+						logf(logTypeHandshake, "%s processHandshakeRecord() identified as Message 4 (NewKeyUpdate)", c.label())
 						isEKUResponse = true
+					} else {
+						logf(logTypeHandshake, "%s processHandshakeRecord() EKU message NOT identified as response (type=%v, ekuInProgress=%v, ekuIsInitiator=%v)", c.label(), ekuBody.EKUType, c.state.ekuInProgress, c.state.ekuIsInitiator)
 					}
 				}
 			}
@@ -2118,6 +2131,8 @@ func (c *Conn) processHandshakeRecord(pt *TLSPlaintext) {
 
 		// Process message using state machine
 		// Pass raw handshake message bytes for EKU key derivation binding
+		// Capture state before processing to detect tie-breaking switch to responder
+		wasInitiatorBefore := c.state.ekuIsInitiator
 		state, actions, alert := (&c.state).ProcessMessageWithRawBytes(hm, rawHandshakeMessage)
 		if alert != AlertNoAlert {
 			logf(logTypeHandshake, "%s processHandshakeRecord() ERROR in state transition: %v", c.label(), alert)
@@ -2139,6 +2154,15 @@ func (c *Conn) processHandshakeRecord(pt *TLSPlaintext) {
 			case <-c.closed:
 			}
 			return
+		}
+
+		// Check if tie-breaking switched us to responder
+		// If we were initiator before and are responder now, clear the callback
+		// (responder doesn't need a callback, only initiator does)
+		if wasInitiatorBefore && c.pendingEKUCallback != nil && !c.state.ekuIsInitiator && c.state.ekuInProgress {
+			logf(logTypeHandshake, "%s processHandshakeRecord() tie-breaking switched us to responder (wasInitiator=%v, nowInitiator=%v) - clearing pendingEKUCallback", c.label(), wasInitiatorBefore, c.state.ekuIsInitiator)
+			c.pendingEKUCallback = nil
+			c.ekuMessageCount = 0
 		}
 		// Take actions (rekey, send response, etc.)
 		for i, action := range actions {
@@ -2209,9 +2233,12 @@ func (c *Conn) processHandshakeRecord(pt *TLSPlaintext) {
 		if isEKUResponse {
 			// Note: No mutex needed - controller is single-threaded
 			if c.pendingEKUCallback != nil {
+				oldCount := c.ekuMessageCount
 				c.ekuMessageCount++
+				logf(logTypeHandshake, "%s processHandshakeRecord() EKU response received: ekuMessageCount %d -> %d", c.label(), oldCount, c.ekuMessageCount)
 				if c.ekuMessageCount == 2 {
 					// Both Message 2 and Message 4 received - EKU complete!
+					logf(logTypeHandshake, "%s processHandshakeRecord() EKU COMPLETE! Invoking callback", c.label())
 					// Create result
 					result := EKUResult{
 						Success: true,
@@ -2233,7 +2260,11 @@ func (c *Conn) processHandshakeRecord(pt *TLSPlaintext) {
 					if c.state.ekuInProgress {
 						c.state.ekuInProgress = false
 					}
+				} else {
+					logf(logTypeHandshake, "%s processHandshakeRecord() EKU response received but not complete yet (count=%d, need 2)", c.label(), c.ekuMessageCount)
 				}
+			} else {
+				logf(logTypeHandshake, "%s processHandshakeRecord() EKU response identified but no pendingEKUCallback", c.label())
 			}
 		}
 

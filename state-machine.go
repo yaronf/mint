@@ -574,8 +574,8 @@ func (state *stateConnected) handleExtendedKeyUpdate(hm *HandshakeMessage, body 
 		// Handle request - could be from initiator (tie-breaking) or responder path
 		if state.ekuInProgress && state.ekuIsInitiator {
 			// We're in initiator state, received a request - tie-breaking needed
-			logf(logTypeHandshake, "[StateConnected] Received EKU request while initiator - tie-breaking")
-			return state.handleEKUTieBreaking(hm, body)
+			logf(logTypeHandshake, "[StateConnected] Received EKU request while initiator - tie-breaking (ekuInProgress=%v, ekuIsInitiator=%v)", state.ekuInProgress, state.ekuIsInitiator)
+			return state.handleEKUTieBreaking(hm, body, rawBytes)
 		}
 		// Otherwise, we're the responder - handle request (Message 1)
 		// Clear any stale EKU state before checking if EKU is in progress
@@ -618,7 +618,7 @@ func (state *stateConnected) handleExtendedKeyUpdate(hm *HandshakeMessage, body 
 		state.ekuPeerKeyShare = body.KeyShare
 		// Use raw bytes if provided (from wire), otherwise marshal (for compatibility)
 		// rawBytes is the raw handshake message bytes from the wire (for key derivation binding)
-		if rawBytes != nil && len(rawBytes) > 0 {
+		if len(rawBytes) > 0 {
 			state.ekuRequestMessage = make([]byte, len(rawBytes))
 			copy(state.ekuRequestMessage, rawBytes)
 		} else {
@@ -694,7 +694,7 @@ func (state *stateConnected) handleExtendedKeyUpdate(hm *HandshakeMessage, body 
 		// Store peer's key share and response message
 		state.ekuPeerKeyShare = body.KeyShare
 		// Use raw bytes if provided (from wire), otherwise marshal (for compatibility)
-		if rawBytes != nil && len(rawBytes) > 0 {
+		if len(rawBytes) > 0 {
 			state.ekuResponseMessage = make([]byte, len(rawBytes))
 			copy(state.ekuResponseMessage, rawBytes)
 		} else {
@@ -829,7 +829,8 @@ func (state *stateConnected) handleExtendedKeyUpdate(hm *HandshakeMessage, body 
 }
 
 // handleEKUTieBreaking handles tie-breaking when both peers initiate EKU simultaneously
-func (state *stateConnected) handleEKUTieBreaking(hm *HandshakeMessage, body *ExtendedKeyUpdateBody) (HandshakeState, []HandshakeAction, Alert) {
+// rawBytes is the raw handshake message bytes from the wire (for key derivation binding)
+func (state *stateConnected) handleEKUTieBreaking(hm *HandshakeMessage, body *ExtendedKeyUpdateBody, rawBytes []byte) (HandshakeState, []HandshakeAction, Alert) {
 	if body.KeyShare == nil {
 		logf(logTypeHandshake, "[StateConnected] Received EKU request without KeyShare")
 		return nil, nil, AlertDecodeError
@@ -842,8 +843,12 @@ func (state *stateConnected) handleEKUTieBreaking(hm *HandshakeMessage, body *Ex
 	compare := bytes.Compare(peerKeyExchange, ourKeyExchange)
 	if compare < 0 {
 		// Peer's value < local value: Ignore peer's request (continue as initiator)
-		logf(logTypeHandshake, "[StateConnected] EKU tie-breaking: peer < local, ignoring peer request")
-		return state, nil, AlertNoAlert
+		// Our Message 1 is already sent/queued, but peer's Message 1 will be ignored
+		// We continue as initiator, so we'll wait for peer's Message 2 (response)
+		// Note: Our Message 1 should already be sent, but clear queue just in case
+		// (peer will send Message 2 in response to our Message 1)
+		logf(logTypeHandshake, "[StateConnected] EKU tie-breaking: peer < local, ignoring peer request (continuing as initiator)")
+		return state, []HandshakeAction{ClearQueuedMessages{}}, AlertNoAlert
 	} else if compare == 0 {
 		// Peer's value == local value: Send "unexpected_message" alert and close connection
 		logf(logTypeHandshake, "[StateConnected] EKU tie-breaking: peer == local, aborting")
@@ -865,8 +870,14 @@ func (state *stateConnected) handleEKUTieBreaking(hm *HandshakeMessage, body *Ex
 		// Store peer's key share
 		state.ekuPeerKeyShare = body.KeyShare
 
-		// Store marshaled request message for key derivation binding
-		state.ekuRequestMessage = hm.Marshal()
+		// Store raw bytes from wire for key derivation binding (same as normal responder path)
+		// This ensures both sides use the exact same bytes for context, not re-marshaled versions
+		if len(rawBytes) > 0 {
+			state.ekuRequestMessage = make([]byte, len(rawBytes))
+			copy(state.ekuRequestMessage, rawBytes)
+		} else {
+			state.ekuRequestMessage = hm.Marshal()
+		}
 
 		// Generate fresh key share using negotiated group
 		pub, priv, err := newKeyShare(state.Params.NegotiatedGroup)
@@ -901,7 +912,7 @@ func (state *stateConnected) handleEKUTieBreaking(hm *HandshakeMessage, body *Ex
 		state.ekuInProgress = true
 		state.ekuIsInitiator = false
 
-		logf(logTypeHandshake, "[StateConnected] EKU tie-breaking: switched to responder, sending response (Message 2)")
+		logf(logTypeHandshake, "[StateConnected] EKU tie-breaking: switched to responder, sending response (Message 2) - response message len=%d", len(ekuResponseMsg.Marshal()))
 		return state, []HandshakeAction{
 			QueueHandshakeMessage{ekuResponseMsg},
 			SendQueuedHandshake{},
