@@ -314,14 +314,15 @@ type Conn struct {
 	hsCtx      *HandshakeContext
 
 	// Controller channels
-	dataToSend     chan []byte
-	dataToReceive  chan []byte
-	commands       chan controllerCommand
-	errors         chan error
-	socketRecords  chan *TLSPlaintext
-	socketErrors   chan error
-	controllerDone chan struct{}
-	closed         chan struct{}
+	dataToSend       chan []byte
+	dataToReceive    chan []byte
+	commands         chan controllerCommand
+	errors           chan error
+	socketRecords    chan *TLSPlaintext
+	socketErrors     chan error
+	controllerDone   chan struct{}
+	socketReaderDone chan struct{}
+	closed           chan struct{}
 
 	// Controller state
 	controllerRunning bool
@@ -350,6 +351,7 @@ func NewConn(conn net.Conn, config *Config, isClient bool) *Conn {
 		socketRecords:            make(chan *TLSPlaintext),        // unbuffered
 		socketErrors:             make(chan error),                // unbuffered
 		controllerDone:           make(chan struct{}),
+		socketReaderDone:         make(chan struct{}),
 		closed:                   make(chan struct{}),
 		controllerRunning:        false,
 		pendingKeyUpdateResponse: nil, // Will be created when needed
@@ -621,6 +623,13 @@ func (c *Conn) Read(buffer []byte) (int, error) {
 		// actions (like RekeyIn) that need to lock c.in, which would deadlock.
 		// consumeRecord() will lock c.in internally when calling ReadRecord().
 		for len(c.readBuffer) == 0 {
+			// Check if connection is closed before attempting to read
+			select {
+			case <-c.closed:
+				return 0, io.EOF
+			default:
+			}
+
 			err := c.consumeRecord()
 
 			// err can be nil if consumeRecord processed a non app-data record
@@ -1564,9 +1573,19 @@ func (c *Conn) startController() {
 
 // socketReaderLoop reads records from the socket and sends them to the controller
 func (c *Conn) socketReaderLoop() {
-	defer logf(logTypeHandshake, "%s socketReaderLoop exiting", c.label())
+	defer func() {
+		logf(logTypeHandshake, "%s socketReaderLoop exiting", c.label())
+		close(c.socketReaderDone)
+	}()
 	logf(logTypeHandshake, "%s socketReaderLoop STARTED", c.label())
 	for {
+		// Check if connection is closed before attempting to read
+		select {
+		case <-c.closed:
+			logf(logTypeHandshake, "%s socketReaderLoop: connection closed, exiting", c.label())
+			return
+		default:
+		}
 		// Read record from socket (blocking)
 		logf(logTypeHandshake, "%s socketReaderLoop: BLOCKING on ReadRecord()", c.label())
 		pt, err := c.in.ReadRecord()
@@ -1692,6 +1711,10 @@ func (c *Conn) controllerLoop() {
 			default:
 				// No pending commands
 			}
+			// Wait for socketReaderLoop to exit before closing controllerDone
+			logf(logTypeHandshake, "%s controllerLoop: waiting for socketReaderLoop to exit", c.label())
+			<-c.socketReaderDone
+			logf(logTypeHandshake, "%s controllerLoop: socketReaderLoop exited, closing controllerDone", c.label())
 			return
 		}
 	}
@@ -1994,6 +2017,9 @@ func (c *Conn) handleExtendedKeyUpdateCommand(cmd controllerCommand) {
 
 // handleCloseCommand processes a Close command
 func (c *Conn) handleCloseCommand(cmd controllerCommand) {
+	// Close socket FIRST to ensure ReadRecord() returns io.EOF and socketReaderLoop can exit
+	c.conn.Close()
+
 	// Close the closed channel to signal shutdown
 	select {
 	case <-c.closed:
@@ -2007,8 +2033,6 @@ func (c *Conn) handleCloseCommand(cmd controllerCommand) {
 	c.sendAlert(AlertCloseNotify)
 	c.out.Unlock()
 
-	// Close socket
-	c.conn.Close()
 	// Signal completion
 	cmd.result <- commandResult{err: nil}
 }

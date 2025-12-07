@@ -13,9 +13,12 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"os"
 	"sync"
 	"testing"
 	"time"
+
+	"go.uber.org/goleak"
 )
 
 type pipeConn struct {
@@ -56,6 +59,12 @@ func (p *pipeConn) Read(data []byte) (n int, err error) {
 	defer p.rLock.Unlock()
 
 	if p.closed {
+		// If closed and buffer is empty, return io.EOF immediately
+		// This allows ReadRecord() to return io.EOF and exit loops properly
+		if p.r.Len() == 0 {
+			return 0, io.EOF
+		}
+		// If closed but buffer has data, read it first, then return io.EOF next time
 		return 0, errors.New("closed")
 	}
 	bufLenBefore := p.r.Len()
@@ -143,7 +152,8 @@ func (p *bufferedConn) Read(data []byte) (n int, err error) {
 	return p.w.Read(data)
 }
 func (p *bufferedConn) Close() error {
-	return nil
+	// Forward Close() to underlying connection so it can signal closure
+	return p.w.Close()
 }
 
 func (p *bufferedConn) LocalAddr() net.Addr                { return nil }
@@ -341,6 +351,17 @@ func init() {
 	}
 }
 
+// TestMain verifies that no goroutines leak after all tests complete
+func TestMain(m *testing.M) {
+	goleak.VerifyTestMain(m,
+		// Ignore common background goroutines that may legitimately remain
+		goleak.IgnoreTopFunction("runtime/pprof.writeRuntimeProfile"),
+		goleak.IgnoreTopFunction("runtime/pprof.writeHeapInternal"),
+		goleak.IgnoreTopFunction("go.uber.org/goleak.(*goroutine).isLeaked"),
+	)
+	os.Exit(m.Run())
+}
+
 func assertKeySetEquals(t *testing.T, k1, k2 KeySet) {
 	t.Helper()
 	// Assume cipher is the same
@@ -463,6 +484,8 @@ func TestExpiredCert(t *testing.T) {
 	client := Client(cConn, clientConfig)
 	// The server uses a self-signed certificate
 	server := Server(sConn, &Config{Certificates: certificates})
+	defer client.Close()
+	defer server.Close()
 
 	done := make(chan bool)
 	go func() {
@@ -473,7 +496,6 @@ func TestExpiredCert(t *testing.T) {
 	clientAlert := client.Handshake()
 	assertEquals(t, clientAlert, AlertBadCertificate)
 
-	server.Close()
 	<-done
 }
 
@@ -528,6 +550,8 @@ func TestVerifyPeerCertificateAccepted(t *testing.T) {
 	client := Client(cConn, clientConfig)
 	// The server uses a self-signed certificate
 	server := Server(sConn, &Config{Certificates: certificates})
+	defer client.Close()
+	defer server.Close()
 
 	var clientAlert, serverAlert Alert
 	done := make(chan bool)
@@ -785,6 +809,8 @@ func TestPSKFlows(t *testing.T) {
 
 		client := Client(cConn, conf)
 		server := Server(sConn, conf)
+		defer client.Close()
+		defer server.Close()
 
 		var clientAlert, serverAlert Alert
 
@@ -803,10 +829,6 @@ func TestPSKFlows(t *testing.T) {
 		checkConsistency(t, client, server)
 
 		assertTrue(t, client.state.Params.UsingPSK, "Session did not use the provided PSK")
-
-		// Close connections before next iteration
-		client.Close()
-		server.Close()
 	}
 }
 
@@ -814,6 +836,7 @@ func TestNonBlockingReadBeforeConnected(t *testing.T) {
 	conn := Client(&bufferedConn{}, &Config{NonBlocking: true})
 	_, err := conn.Read(make([]byte, 10))
 	assertEquals(t, err.Error(), "Read called before the handshake completed")
+	// Don't close - connection was never started (no controller)
 }
 
 func TestResumption(t *testing.T) {
@@ -1184,6 +1207,8 @@ func TestNonblockingHandshakeAndDataFlow(t *testing.T) {
 
 	client := Client(cbConn, nbConfig)
 	server := Server(sbConn, nbConfig)
+	defer client.Close()
+	defer server.Close()
 
 	var clientAlert, serverAlert Alert
 
@@ -1440,6 +1465,8 @@ func TestNonblockingHandshakeAndDataFlowDTLS(t *testing.T) {
 
 	client := Client(cbConn, nbDTLSConfig)
 	server := Server(sbConn, nbDTLSConfig)
+	defer client.Close()
+	defer server.Close()
 
 	var clientAlert, serverAlert Alert
 
@@ -1697,6 +1724,8 @@ func TestAckDTLSNormal(t *testing.T) {
 
 	client := Client(cbConn, nbDTLSConfig)
 	server := Server(sbConn, nbDTLSConfig)
+	defer client.Close()
+	defer server.Close()
 
 	// Send ClientHello
 	hsUntilBlocked(t, client, cbConn)
@@ -1738,6 +1767,8 @@ func TestAckDTLSLoseEE(t *testing.T) {
 
 	client := Client(cbConn, nbDTLSConfig)
 	server := Server(sbConn, nbDTLSConfig)
+	defer client.Close()
+	defer server.Close()
 
 	// Send ClientHello
 	hsUntilBlocked(t, client, cbConn)
