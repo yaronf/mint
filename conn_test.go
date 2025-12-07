@@ -30,6 +30,18 @@ type pipeConn struct {
 	name   string // For debugging: "client" or "server"
 }
 
+// closeAndVerifyNoLeaks closes connections and verifies no goroutine leaks
+func closeAndVerifyNoLeaks(t *testing.T, conns ...*Conn) {
+	for _, conn := range conns {
+		if conn != nil {
+			conn.Close()
+		}
+	}
+	// Give goroutines a moment to exit
+	time.Sleep(10 * time.Millisecond)
+	goleak.VerifyNone(t)
+}
+
 func pipe() (client *pipeConn, server *pipeConn) {
 	client = new(pipeConn)
 	server = new(pipeConn)
@@ -450,6 +462,9 @@ func TestBasicFlows(t *testing.T) {
 	}
 
 	runParametrizedTest(t, params, testConnInner)
+	// Note: testConnInner handles cleanup, so we just check for leaks
+	time.Sleep(10 * time.Millisecond)
+	goleak.VerifyNone(t)
 }
 
 func TestInvalidSelfSigned(t *testing.T) {
@@ -472,6 +487,7 @@ func TestInvalidSelfSigned(t *testing.T) {
 	// Close server explicitly to unblock if handshake is stuck
 	server.Close()
 	<-done
+	closeAndVerifyNoLeaks(t, client, server)
 }
 
 func TestExpiredCert(t *testing.T) {
@@ -497,6 +513,7 @@ func TestExpiredCert(t *testing.T) {
 	assertEquals(t, clientAlert, AlertBadCertificate)
 
 	<-done
+	closeAndVerifyNoLeaks(t, client, server)
 }
 
 func TestRootCAPool(t *testing.T) {
@@ -525,6 +542,7 @@ func TestRootCAPool(t *testing.T) {
 	clientAlert = client.Handshake()
 	assertEquals(t, clientAlert, AlertNoAlert)
 	<-done
+	closeAndVerifyNoLeaks(t, client, server)
 }
 
 func TestVerifyPeerCertificateAccepted(t *testing.T) {
@@ -565,6 +583,7 @@ func TestVerifyPeerCertificateAccepted(t *testing.T) {
 	assertEquals(t, clientAlert, AlertNoAlert)
 	assertEquals(t, verifyCalled, true)
 	<-done
+	closeAndVerifyNoLeaks(t, client, server)
 }
 
 func TestVerifyPeerCertificateInsecureSkipVerify(t *testing.T) {
@@ -599,6 +618,7 @@ func TestVerifyPeerCertificateInsecureSkipVerify(t *testing.T) {
 	assertEquals(t, clientAlert, AlertNoAlert)
 	assertEquals(t, verifyCalled, true)
 	<-done
+	closeAndVerifyNoLeaks(t, client, server)
 }
 
 func TestVerifyPeerCertificateRejected(t *testing.T) {
@@ -632,6 +652,7 @@ func TestVerifyPeerCertificateRejected(t *testing.T) {
 	// Close server explicitly to unblock if handshake is stuck
 	server.Close()
 	<-done
+	closeAndVerifyNoLeaks(t, client, server)
 }
 
 func TestCertChain(t *testing.T) {
@@ -688,6 +709,7 @@ func TestCertChain(t *testing.T) {
 	clientAlert = client.Handshake()
 	assertEquals(t, clientAlert, AlertNoAlert)
 	<-done
+	closeAndVerifyNoLeaks(t, client, server)
 }
 
 // TODO(#90): Add a test with mismatching server name
@@ -724,6 +746,7 @@ func TestClientAuth(t *testing.T) {
 
 	checkConsistency(t, client, server)
 	assertTrue(t, client.state.Params.UsingClientAuth, "Session did not negotiate client auth")
+	closeAndVerifyNoLeaks(t, client, server)
 }
 
 func TestClientAuthVerifyPeerAccepted(t *testing.T) {
@@ -766,6 +789,7 @@ func TestClientAuthVerifyPeerAccepted(t *testing.T) {
 	assertEquals(t, verifyCalled, true)
 
 	<-done
+	closeAndVerifyNoLeaks(t, client, server)
 }
 
 func TestClientAuthVerifyPeerRejected(t *testing.T) {
@@ -801,6 +825,7 @@ func TestClientAuthVerifyPeerRejected(t *testing.T) {
 	assertEquals(t, verifyCalled, true)
 
 	<-done
+	closeAndVerifyNoLeaks(t, client, server)
 }
 
 func TestPSKFlows(t *testing.T) {
@@ -829,7 +854,14 @@ func TestPSKFlows(t *testing.T) {
 		checkConsistency(t, client, server)
 
 		assertTrue(t, client.state.Params.UsingPSK, "Session did not use the provided PSK")
+
+		// Close connections explicitly before checking for leaks
+		client.Close()
+		server.Close()
 	}
+	// Give goroutines a moment to exit
+	time.Sleep(10 * time.Millisecond)
+	goleak.VerifyNone(t)
 }
 
 func TestNonBlockingReadBeforeConnected(t *testing.T) {
@@ -837,6 +869,8 @@ func TestNonBlockingReadBeforeConnected(t *testing.T) {
 	_, err := conn.Read(make([]byte, 10))
 	assertEquals(t, err.Error(), "Read called before the handshake completed")
 	// Don't close - connection was never started (no controller)
+	time.Sleep(10 * time.Millisecond)
+	goleak.VerifyNone(t)
 }
 
 func TestResumption(t *testing.T) {
@@ -920,6 +954,7 @@ func TestResumption(t *testing.T) {
 
 	checkConsistency(t, client2, server2)
 	assertTrue(t, client2.state.Params.UsingPSK, "Session did not use the provided PSK")
+	closeAndVerifyNoLeaks(t, client1, server1, client2, server2)
 }
 
 func test0xRTT(t *testing.T, name string, p testInstanceState) {
@@ -965,6 +1000,9 @@ func Test0xRTT(t *testing.T) {
 		"dtls": {"true", "false"},
 	}
 	runParametrizedTest(t, params, test0xRTT)
+	// Note: test0xRTT handles cleanup, so we just check for leaks
+	time.Sleep(10 * time.Millisecond)
+	goleak.VerifyNone(t)
 }
 
 func Test0xRTTFailure(t *testing.T) {
@@ -1001,6 +1039,7 @@ func Test0xRTTFailure(t *testing.T) {
 	assertEquals(t, alert, AlertNoAlert)
 
 	<-done
+	closeAndVerifyNoLeaks(t, client, server)
 }
 
 func TestKeyUpdate(t *testing.T) {
@@ -1009,8 +1048,6 @@ func TestKeyUpdate(t *testing.T) {
 	conf := basicConfig
 	client := Client(cConn, conf)
 	server := Server(sConn, conf)
-	defer client.Close()
-	defer server.Close()
 
 	oneBuf := []byte{'a'}
 	c2s := make(chan bool)
@@ -1096,6 +1133,7 @@ func TestKeyUpdate(t *testing.T) {
 	assertByteEquals(t, clientState3.clientTrafficSecret, serverState3.clientTrafficSecret)
 	assertNotByteEquals(t, serverState2.serverTrafficSecret, serverState3.serverTrafficSecret)
 	assertNotByteEquals(t, clientState2.clientTrafficSecret, clientState3.clientTrafficSecret)
+	closeAndVerifyNoLeaks(t, client, server)
 }
 
 func TestKeyUpdateMultipleSequential(t *testing.T) {
@@ -1109,13 +1147,13 @@ func TestKeyUpdateMultipleSequential(t *testing.T) {
 	conf := basicConfig
 	client := Client(cConn, conf)
 	server := Server(sConn, conf)
-	defer client.Close()
-	defer server.Close()
 
 	oneBuf := []byte{'a'}
 	c2s := make(chan bool)
 	s2c := make(chan bool)
+	serverDone := make(chan bool)
 	go func(t *testing.T) {
+		defer func() { serverDone <- true }()
 		alert := server.Handshake()
 		assertEquals(t, alert, AlertNoAlert)
 
@@ -1196,6 +1234,9 @@ func TestKeyUpdateMultipleSequential(t *testing.T) {
 		prevClientState = clientState
 		prevServerState = serverState
 	}
+	// Wait for server goroutine to finish
+	<-serverDone
+	closeAndVerifyNoLeaks(t, client, server)
 }
 
 func TestNonblockingHandshakeAndDataFlow(t *testing.T) {
@@ -1268,6 +1309,7 @@ func TestNonblockingHandshakeAndDataFlow(t *testing.T) {
 
 	// read := make([]byte, 5)
 	// n, err = server.Read(buf)
+	closeAndVerifyNoLeaks(t, client, server)
 }
 
 type testExtensionHandler struct {
@@ -1379,6 +1421,7 @@ func TestExternalExtensions(t *testing.T) {
 		HandshakeTypeServerHello,
 		HandshakeTypeEncryptedExtensions,
 	})
+	closeAndVerifyNoLeaks(t, client, server)
 }
 
 func TestConnectionState(t *testing.T) {
@@ -1417,6 +1460,7 @@ func TestConnectionState(t *testing.T) {
 	assertDeepEquals(t, clientCS.PeerCertificates, []*x509.Certificate{serverCert})
 	assertEquals(t, serverCS.CipherSuite.Suite, serverConfig.CipherSuites[0])
 	assertDeepEquals(t, serverCS.PeerCertificates, []*x509.Certificate{clientCert})
+	closeAndVerifyNoLeaks(t, client, server)
 }
 
 func TestDTLS(t *testing.T) {
@@ -1454,6 +1498,7 @@ func TestDTLS(t *testing.T) {
 		HandshakeTypeServerHello,
 		HandshakeTypeEncryptedExtensions,
 	})
+	closeAndVerifyNoLeaks(t, client, server)
 }
 
 func TestNonblockingHandshakeAndDataFlowDTLS(t *testing.T) {
@@ -1526,6 +1571,7 @@ func TestNonblockingHandshakeAndDataFlowDTLS(t *testing.T) {
 
 	// read := make([]byte, 5)
 	// n, err = server.Read(buf)
+	closeAndVerifyNoLeaks(t, client, server)
 }
 
 func TestTimeoutAndRetransmissionDTLS(t *testing.T) {
@@ -1754,6 +1800,7 @@ func TestAckDTLSNormal(t *testing.T) {
 
 	// Client will now have no timers
 	checkTimersEqualLabels(t, client, []string{})
+	closeAndVerifyNoLeaks(t, client, server)
 }
 
 func TestAckDTLSLoseEE(t *testing.T) {
@@ -1795,6 +1842,7 @@ func TestAckDTLSLoseEE(t *testing.T) {
 	// Now run the client and server to completion
 	hsUntilComplete(t, client)
 	hsUntilComplete(t, server)
+	closeAndVerifyNoLeaks(t, client, server)
 }
 
 func readWriteExpectFail(t *testing.T, c *Conn) {
@@ -1834,6 +1882,7 @@ func TestEarlyIOFail(t *testing.T) {
 	server.Handshake()
 	readWriteExpectFail(t, client)
 	readWriteExpectFail(t, server)
+	closeAndVerifyNoLeaks(t, client, server)
 }
 
 func TestDTLSOutOfEpochHSFail(t *testing.T) {
@@ -1861,6 +1910,7 @@ func TestDTLSOutOfEpochHSFail(t *testing.T) {
 	// This causes an error because it's an unexpected record type.
 	err := server.Handshake()
 	assertEquals(t, err, AlertCloseNotify)
+	closeAndVerifyNoLeaks(t, client, server)
 }
 
 func TestDTLSOutOfEpochPostHSDiscard(t *testing.T) {
@@ -1889,6 +1939,7 @@ func TestDTLSOutOfEpochPostHSDiscard(t *testing.T) {
 	tmp := make([]byte, 10)
 	_, err := server.Read(tmp)
 	assertEquals(t, err, AlertWouldBlock)
+	closeAndVerifyNoLeaks(t, client, server)
 }
 
 func TestHRRRecordVersion(t *testing.T) {
@@ -1923,6 +1974,7 @@ func TestHRRRecordVersion(t *testing.T) {
 		byte(tls12Version & 0xff),
 	}
 	assertByteEquals(t, p, expectedRecord)
+	closeAndVerifyNoLeaks(t, client, server)
 }
 
 // Test for issue #175.
@@ -1942,6 +1994,7 @@ func TestEarlyDataWithHRR(t *testing.T) {
 	defer server.Close()
 
 	hsRunHandshakeOneThread(t, client, server)
+	closeAndVerifyNoLeaks(t, client, server)
 }
 
 func TestEarlyDataNotWritableAfterHRR(t *testing.T) {
@@ -1980,6 +2033,7 @@ func TestEarlyDataNotWritableAfterHRR(t *testing.T) {
 
 	// Finish handshake
 	hsRunHandshakeOneThread(t, client, server)
+	closeAndVerifyNoLeaks(t, client, server)
 }
 
 func TestHandshakeMessageAcrossBoundary(t *testing.T) {
@@ -2038,4 +2092,5 @@ func TestHandshakeMessageAcrossBoundary(t *testing.T) {
 
 	err = client.Handshake()
 	assertEquals(t, AlertDecodeError, err)
+	closeAndVerifyNoLeaks(t, client, server)
 }

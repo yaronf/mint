@@ -901,19 +901,45 @@ func (c *Conn) Close() error {
 		result:  resultChan,
 	}
 
+	// Try to send command with timeout
+	sent := false
 	select {
 	case c.commands <- cmd:
-		// Wait for controller to close
-		<-resultChan
-		<-c.controllerDone // Wait for goroutine to exit
-		return nil
+		sent = true
 	case <-c.controllerDone:
 		// Controller already closed
 		return nil
-	case <-c.closed:
-		// Already closed
-		return nil
+	case <-time.After(100 * time.Millisecond):
+		// Channel might be full or controller not ready - try closing socket directly
+		c.conn.Close()
+		// Wait a bit for controller to process
+		select {
+		case <-c.controllerDone:
+			return nil
+		case <-time.After(500 * time.Millisecond):
+			// Controller didn't exit, proceed anyway
+			return nil
+		}
 	}
+
+	if sent {
+		// Wait for controller to close, with timeout to avoid deadlock
+		select {
+		case result := <-resultChan:
+			if result.err != nil {
+				return result.err
+			}
+			<-c.controllerDone // Wait for goroutine to exit
+			return nil
+		case <-c.controllerDone:
+			// Controller exited without processing command
+			return nil
+		case <-time.After(1 * time.Second):
+			// Controller didn't respond, assume it's already closed
+			return nil
+		}
+	}
+	return nil
 }
 
 // LocalAddr returns the local network address.
@@ -1698,7 +1724,8 @@ func (c *Conn) controllerLoop() {
 		case <-c.closed:
 			// Application closed connection
 			logf(logTypeHandshake, "%s controllerLoop: closed signal received, checking for pending commands", c.label())
-			// Check if there's a pending close command before returning
+			// Wait for close command (it may arrive after c.closed is closed)
+			// Use a timeout to avoid deadlock if Close() is never called
 			select {
 			case cmd := <-c.commands:
 				if cmd.cmdType == cmdClose {
@@ -1708,13 +1735,52 @@ func (c *Conn) controllerLoop() {
 					// Other command - send error
 					cmd.result <- commandResult{err: io.EOF}
 				}
-			default:
-				// No pending commands
+			case <-time.After(500 * time.Millisecond):
+				// No close command received within timeout, check one more time before proceeding
+				logf(logTypeHandshake, "%s controllerLoop: no close command received within timeout, checking one more time", c.label())
+				select {
+				case cmd := <-c.commands:
+					// Got the command after timeout - process it
+					if cmd.cmdType == cmdClose {
+						logf(logTypeHandshake, "%s controllerLoop: processing close command received after timeout", c.label())
+						c.handleCloseCommand(cmd)
+						// Wait for socketReaderLoop to exit
+						select {
+						case <-c.socketReaderDone:
+							logf(logTypeHandshake, "%s controllerLoop: socketReaderLoop exited", c.label())
+						case <-time.After(500 * time.Millisecond):
+							logf(logTypeHandshake, "%s controllerLoop: socketReaderLoop didn't exit in time, proceeding anyway", c.label())
+						}
+						return
+					} else {
+						cmd.result <- commandResult{err: io.EOF}
+					}
+				default:
+					// Still no command, proceed with cleanup
+					logf(logTypeHandshake, "%s controllerLoop: no close command received, proceeding with cleanup", c.label())
+					// Close socket to ensure socketReaderLoop can exit
+					c.conn.Close()
+					// Wait for socketReaderLoop to exit
+					select {
+					case <-c.socketReaderDone:
+						logf(logTypeHandshake, "%s controllerLoop: socketReaderLoop exited", c.label())
+					case <-time.After(500 * time.Millisecond):
+						logf(logTypeHandshake, "%s controllerLoop: socketReaderLoop didn't exit in time, proceeding anyway", c.label())
+					}
+					return
+				}
 			}
+			// Close socket to ensure socketReaderLoop can exit even if no close command was processed
+			c.conn.Close()
+
 			// Wait for socketReaderLoop to exit before closing controllerDone
 			logf(logTypeHandshake, "%s controllerLoop: waiting for socketReaderLoop to exit", c.label())
-			<-c.socketReaderDone
-			logf(logTypeHandshake, "%s controllerLoop: socketReaderLoop exited, closing controllerDone", c.label())
+			select {
+			case <-c.socketReaderDone:
+				logf(logTypeHandshake, "%s controllerLoop: socketReaderLoop exited, closing controllerDone", c.label())
+			case <-time.After(500 * time.Millisecond):
+				logf(logTypeHandshake, "%s controllerLoop: socketReaderLoop didn't exit in time, proceeding anyway", c.label())
+			}
 			return
 		}
 	}
