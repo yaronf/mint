@@ -304,6 +304,7 @@ type Conn struct {
 	isClient bool
 
 	state             stateConnected
+	stateUpdates      chan stateConnected // Channel for controller to send state updates to API readers
 	hState            HandshakeState
 	handshakeMutex    sync.Mutex
 	handshakeAlert    Alert
@@ -327,10 +328,10 @@ type Conn struct {
 	// Controller state
 	controllerRunning bool
 
-	// KeyUpdate waiting state
-	pendingKeyUpdateResponse chan struct{} // Signals when KeyUpdate response is received
+	// KeyUpdate waiting state (controller is single-threaded, so no mutex needed)
+	pendingKeyUpdateResult chan commandResult // Channel to send result when KeyUpdate response received
 
-	// ExtendedKeyUpdate waiting state
+	// ExtendedKeyUpdate waiting state (controller is single-threaded, so no mutex needed)
 	pendingEKUCallback EKUCallback // Callback to invoke when EKU completes
 	ekuMessageCount    int         // Count of EKU messages received (0=waiting for Message 2, 1=waiting for Message 4)
 
@@ -340,23 +341,24 @@ type Conn struct {
 
 func NewConn(conn net.Conn, config *Config, isClient bool) *Conn {
 	c := &Conn{
-		conn:                     conn,
-		config:                   config,
-		isClient:                 isClient,
-		hsCtx:                    &HandshakeContext{},
-		dataToSend:               make(chan []byte),               // unbuffered - Write() blocks until controller processes
-		dataToReceive:            make(chan []byte, 65536),        // 64KB buffer
-		commands:                 make(chan controllerCommand, 1), // buffered, size 1 - allows non-blocking sends
-		errors:                   make(chan error, 1),             // buffered, size 1
-		socketRecords:            make(chan *TLSPlaintext),        // unbuffered
-		socketErrors:             make(chan error),                // unbuffered
-		controllerDone:           make(chan struct{}),
-		socketReaderDone:         make(chan struct{}),
-		closed:                   make(chan struct{}),
-		controllerRunning:        false,
-		pendingKeyUpdateResponse: nil, // Will be created when needed
-		pendingEKUCallback:       nil, // Callback to invoke when EKU completes
-		ekuMessageCount:          0,   // Count of EKU messages received
+		conn:                   conn,
+		config:                 config,
+		isClient:               isClient,
+		hsCtx:                  &HandshakeContext{},
+		dataToSend:             make(chan []byte),               // unbuffered - Write() blocks until controller processes
+		dataToReceive:          make(chan []byte, 65536),        // 64KB buffer
+		commands:               make(chan controllerCommand, 1), // buffered, size 1 - allows non-blocking sends
+		errors:                 make(chan error, 1),             // buffered, size 1
+		socketRecords:          make(chan *TLSPlaintext),        // unbuffered
+		socketErrors:           make(chan error),                // unbuffered
+		controllerDone:         make(chan struct{}),
+		socketReaderDone:       make(chan struct{}),
+		closed:                 make(chan struct{}),
+		stateUpdates:           make(chan stateConnected, 1), // Buffered size 1 for latest state snapshot
+		controllerRunning:      false,
+		pendingKeyUpdateResult: nil, // Will be set when waiting for KeyUpdate response
+		pendingEKUCallback:     nil, // Callback to invoke when EKU completes
+		ekuMessageCount:        0,   // Count of EKU messages received
 	}
 	if !config.UseDTLS {
 		if config.RecordLayer == nil {
@@ -454,16 +456,19 @@ func (c *Conn) consumeRecord() error {
 
 			// Handle EKU callback check BEFORE ProcessMessage() updates the state
 			// Check if this is an EKU message we're waiting for
+			// Controller is single-threaded, so no mutex needed
 			var isEKUResponse bool
-			if hm.msgType == HandshakeTypeExtendedKeyUpdate && c.pendingEKUCallback != nil {
+			hasPendingCallback := c.pendingEKUCallback != nil
+			ekuMsgCount := c.ekuMessageCount
+			if hm.msgType == HandshakeTypeExtendedKeyUpdate && hasPendingCallback {
 				bodyGeneric, err := hm.ToBody()
 				if err == nil {
 					if ekuBody, ok := bodyGeneric.(*ExtendedKeyUpdateBody); ok {
 						// Check state BEFORE ProcessMessage() - use ekuMessageCount to determine which message we're waiting for
-						if ekuBody.EKUType == ExtendedKeyUpdateTypeResponse && c.ekuMessageCount == 0 && c.state.ekuInProgress && c.state.ekuIsInitiator {
+						if ekuBody.EKUType == ExtendedKeyUpdateTypeResponse && ekuMsgCount == 0 && c.state.ekuInProgress && c.state.ekuIsInitiator {
 							// Message 2: Response to our request (waiting for first message)
 							isEKUResponse = true
-						} else if ekuBody.EKUType == ExtendedKeyUpdateTypeNewKeyUpdate && c.ekuMessageCount == 1 && c.state.ekuInProgress && c.state.ekuIsInitiator {
+						} else if ekuBody.EKUType == ExtendedKeyUpdateTypeNewKeyUpdate && ekuMsgCount == 1 && c.state.ekuInProgress && c.state.ekuIsInitiator {
 							// Message 4: Responder's new_key_update (waiting for second message)
 							isEKUResponse = true
 						}
@@ -501,24 +506,27 @@ func (c *Conn) consumeRecord() error {
 
 			// Handle EKU callback if this is an EKU message we're waiting for
 			// (Similar logic to processHandshakeRecord() but for consumeRecord() path)
-			if isEKUResponse && c.pendingEKUCallback != nil {
-				c.ekuMessageCount++
-				if c.ekuMessageCount == 2 {
-					// Both Message 2 and Message 4 received - EKU complete!
-					// Create result
-					result := EKUResult{
-						Success: true,
-						Error:   nil,
-					}
+			// Controller is single-threaded, so no mutex needed
+			if isEKUResponse {
+				if c.pendingEKUCallback != nil {
+					c.ekuMessageCount++
+					if c.ekuMessageCount == 2 {
+						// Both Message 2 and Message 4 received - EKU complete!
+						// Create result
+						result := EKUResult{
+							Success: true,
+							Error:   nil,
+						}
 
-					// Invoke callback if provided
-					// Save callback and clear state BEFORE invoking (in case callback starts new EKU)
-					callback := c.pendingEKUCallback
-					c.pendingEKUCallback = nil
-					c.ekuMessageCount = 0
+						// Invoke callback if provided
+						// Save callback and clear state BEFORE invoking (in case callback starts new EKU)
+						callback := c.pendingEKUCallback
+						c.pendingEKUCallback = nil
+						c.ekuMessageCount = 0
 
-					if callback != nil {
-						callback(result) // Invoke callback
+						if callback != nil {
+							callback(result) // Invoke callback
+						}
 					}
 				}
 			}
@@ -598,7 +606,6 @@ func (c *Conn) Read(buffer []byte) (int, error) {
 	}
 
 	// The handshake is now connected.
-	logf(logTypeHandshake, "conn.Read with buffer = %d", len(buffer))
 
 	// DTLS: Read directly from record layer (no controller, no Handshake() call needed)
 	if c.config.UseDTLS {
@@ -614,7 +621,6 @@ func (c *Conn) Read(buffer []byte) (int, error) {
 		if len(c.readBuffer) > 0 {
 			n := copy(buffer, c.readBuffer)
 			c.readBuffer = c.readBuffer[n:]
-			logf(logTypeHandshake, "%s Read() returning buffered data, n=%d", c.label(), n)
 			return n, nil
 		}
 
@@ -663,15 +669,11 @@ func (c *Conn) Read(buffer []byte) (int, error) {
 
 	// TLS: Use controller
 	// Ensure handshake is complete
-	logf(logTypeHandshake, "%s Read() calling Handshake()", c.label())
 	if alert := c.Handshake(); alert != AlertNoAlert {
-		logf(logTypeHandshake, "%s Read() Handshake() returned alert=%v", c.label(), alert)
 		return 0, alert
 	}
-	logf(logTypeHandshake, "%s Read() Handshake() completed", c.label())
 
 	if len(buffer) == 0 {
-		logf(logTypeHandshake, "%s Read() buffer is empty, returning 0", c.label())
 		return 0, nil
 	}
 
@@ -679,17 +681,13 @@ func (c *Conn) Read(buffer []byte) (int, error) {
 	if len(c.readBuffer) > 0 {
 		n := copy(buffer, c.readBuffer)
 		c.readBuffer = c.readBuffer[n:]
-		logf(logTypeHandshake, "%s Read() returning buffered data, n=%d", c.label(), n)
 		return n, nil
 	}
 
 	// Ensure controller is running
 	if !c.controllerRunning {
-		logf(logTypeHandshake, "%s Read() ERROR: controller not running", c.label())
 		return 0, errors.New("read called before controller started")
 	}
-
-	logf(logTypeHandshake, "%s Read() BLOCKING: waiting for data from dataToReceive channel", c.label())
 	// Wait for data from controller
 	// Since application is synchronous, only one Read() can be active at a time
 	if c.config.NonBlocking {
@@ -716,14 +714,11 @@ func (c *Conn) Read(buffer []byte) (int, error) {
 		select {
 		case data := <-c.dataToReceive:
 			// Copy data to buffer (may be partial read)
-			logf(logTypeHandshake, "%s Read() received data from dataToReceive, len=%d", c.label(), len(data))
 			n := copy(buffer, data)
 			// Buffer remainder if data is larger than buffer
 			if len(data) > n {
 				c.readBuffer = append(c.readBuffer, data[n:]...)
-				logf(logTypeHandshake, "%s Read() buffered %d remaining bytes", c.label(), len(data)-n)
 			}
-			logf(logTypeHandshake, "%s Read() returning, n=%d", c.label(), n)
 			return n, nil
 		case err := <-c.errors:
 			return 0, err
@@ -735,14 +730,12 @@ func (c *Conn) Read(buffer []byte) (int, error) {
 
 // Write application data
 func (c *Conn) Write(buffer []byte) (int, error) {
-	logf(logTypeHandshake, "%s Write() START: called, len=%d", c.label(), len(buffer))
 	if !c.Writable() {
 		return 0, errors.New("Write called before the handshake completed (and early data not in use)")
 	}
 
 	// Handle early data writes (before controller starts)
 	if c.isClient && c.out.Epoch() == EpochEarlyData {
-		logf(logTypeHandshake, "%s Write() handling early data", c.label())
 		// Early data: write directly to record layer (not through controller)
 		c.out.Lock()
 		defer c.out.Unlock()
@@ -807,15 +800,12 @@ func (c *Conn) Write(buffer []byte) (int, error) {
 	// TLS: Use controller
 	// Ensure controller is running for post-handshake writes
 	if !c.controllerRunning {
-		logf(logTypeHandshake, "%s Write() ERROR: controller not running!", c.label())
 		return 0, errors.New("write called before controller started")
 	}
 
-	logf(logTypeHandshake, "%s Write() TLS: controller is running, about to send to dataToSend channel, len=%d (channel len=%d, cap=%d)", c.label(), len(buffer), len(c.dataToSend), cap(c.dataToSend))
 	// Send data to controller
 	// Since application is synchronous, only one Write() can be active at a time
 	if c.config.NonBlocking {
-		logf(logTypeHandshake, "%s Write() NonBlocking mode: attempting to send", c.label())
 		// Non-blocking mode: return immediately if channel is full
 		select {
 		case c.dataToSend <- buffer:
@@ -833,13 +823,9 @@ func (c *Conn) Write(buffer []byte) (int, error) {
 		}
 	} else {
 		// Blocking mode: wait until controller accepts data
-		logf(logTypeHandshake, "%s Write() Blocking mode: BLOCKING on select, waiting for controller to read from dataToSend", c.label())
 		select {
 		case c.dataToSend <- buffer:
 			// Data sent successfully - controller will encrypt and send to socket
-			// Note: This blocks until controller reads from channel (or channel has capacity)
-			// With 64KB buffer, channel should rarely be full
-			logf(logTypeHandshake, "%s Write() Blocking: ✓✓✓ SUCCESS: sent to dataToSend, returning", c.label())
 			return len(buffer), nil
 		case err := <-c.errors:
 			// Error from controller
@@ -929,8 +915,14 @@ func (c *Conn) Close() error {
 			if result.err != nil {
 				return result.err
 			}
-			<-c.controllerDone // Wait for goroutine to exit
-			return nil
+			// Wait for goroutine to exit with timeout
+			select {
+			case <-c.controllerDone:
+				return nil
+			case <-time.After(500 * time.Millisecond):
+				// Controller didn't exit in time, proceed anyway
+				return nil
+			}
 		case <-c.controllerDone:
 			// Controller exited without processing command
 			return nil
@@ -1240,6 +1232,14 @@ func (c *Conn) Handshake() Alert {
 		_, connected = state.(stateConnected)
 		if connected {
 			c.state = state.(stateConnected)
+			// Send initial state to channel
+			select {
+			case c.stateUpdates <- c.state:
+			default:
+				// Channel full, replace with latest state
+				<-c.stateUpdates
+				c.stateUpdates <- c.state
+			}
 			c.handshakeComplete = true
 
 			// Start the TLS Controller goroutine after handshake completes
@@ -1599,32 +1599,26 @@ func (c *Conn) startController() {
 
 // socketReaderLoop reads records from the socket and sends them to the controller
 func (c *Conn) socketReaderLoop() {
-	defer func() {
-		logf(logTypeHandshake, "%s socketReaderLoop exiting", c.label())
-		close(c.socketReaderDone)
-	}()
-	logf(logTypeHandshake, "%s socketReaderLoop STARTED", c.label())
+	defer close(c.socketReaderDone)
 	for {
 		// Check if connection is closed before attempting to read
 		select {
 		case <-c.closed:
-			logf(logTypeHandshake, "%s socketReaderLoop: connection closed, exiting", c.label())
 			return
 		default:
 		}
 		// Read record from socket (blocking)
-		logf(logTypeHandshake, "%s socketReaderLoop: BLOCKING on ReadRecord()", c.label())
+		// Lock c.in for ReadRecord() to prevent race with Rekey() in controllerLoop
+		c.in.Lock()
 		pt, err := c.in.ReadRecord()
+		c.in.Unlock()
 		if err != nil {
-			logf(logTypeHandshake, "%s socketReaderLoop: ReadRecord() returned error=%v", c.label(), err)
 			// io.EOF means connection closed - exit gracefully
 			if err == io.EOF {
-				logf(logTypeHandshake, "%s socketReaderLoop: ReadRecord returned io.EOF (connection closed), exiting", c.label())
 				return
 			}
 			// AlertWouldBlock means no data available yet
 			if err == AlertWouldBlock {
-				logf(logTypeHandshake, "%s socketReaderLoop: ReadRecord returned AlertWouldBlock, waiting", c.label())
 				// pipeConn.Read() doesn't block, so we need to wait a bit before retrying
 				// to avoid busy-looping. Use a very short delay to be responsive.
 				// The controller processes writes synchronously, so data should arrive quickly.
@@ -1639,11 +1633,8 @@ func (c *Conn) socketReaderLoop() {
 			// Check if this is a DecryptError for application data that might be due to KeyUpdate
 			// After KeyUpdate, application data is encrypted with new keys, but we might
 			// try to decrypt with old keys before processing the KeyUpdate handshake
-			if decryptErr, ok := err.(DecryptError); ok {
-				logf(logTypeHandshake, "%s socketReaderLoop: DecryptError received: %v - might be due to KeyUpdate, sending to controller", c.label(), decryptErr)
-				// Send a special "decrypt error" record to controller
-				// Controller can check if there's a pending KeyUpdate handshake and handle it
-				// For now, send error - proper fix would queue record and process KeyUpdate first
+			if _, ok := err.(DecryptError); ok {
+				// Send error to controller - proper fix would queue record and process KeyUpdate first
 				select {
 				case c.socketErrors <- err:
 				case <-c.closed:
@@ -1652,7 +1643,7 @@ func (c *Conn) socketReaderLoop() {
 				return
 			}
 			// Other errors are fatal
-			logf(logTypeHandshake, "%s socketReaderLoop: FATAL ReadRecord error: %v", c.label(), err)
+			logf(logTypeHandshake, "%s socketReaderLoop: ReadRecord error: %v", c.label(), err)
 			select {
 			case c.socketErrors <- err:
 			case <-c.closed:
@@ -1662,21 +1653,13 @@ func (c *Conn) socketReaderLoop() {
 		}
 
 		if pt == nil {
-			logf(logTypeHandshake, "%s socketReaderLoop: ReadRecord returned nil pt with no error", c.label())
 			return
 		}
 
-		logf(logTypeHandshake, "%s socketReaderLoop: ✓✓✓ ReadRecord success, contentType=%v, epoch=%v, fragment_len=%d, sending to controller", c.label(), pt.contentType, pt.epoch, len(pt.fragment))
-		if inImpl, ok := c.in.(*DefaultRecordLayer); ok {
-			logf(logTypeHandshake, "%s socketReaderLoop: current in.cipher epoch=%s seq=%x", c.label(), inImpl.cipher.epoch.label(), inImpl.cipher.seq)
-		}
 		// Send record to controller (blocks until controller receives it)
-		logf(logTypeHandshake, "%s socketReaderLoop: BLOCKING: sending record to socketRecords channel (len=%d, cap=%d)", c.label(), len(c.socketRecords), cap(c.socketRecords))
 		select {
 		case c.socketRecords <- pt:
-			logf(logTypeHandshake, "%s socketReaderLoop: ✓✓✓✓✓ SUCCESS: sent record to controller, controller should process it now", c.label())
 		case <-c.closed:
-			logf(logTypeHandshake, "%s socketReaderLoop: connection closed while sending record", c.label())
 			return
 		}
 	}
@@ -1690,24 +1673,17 @@ func (c *Conn) controllerLoop() {
 	go c.socketReaderLoop()
 
 	for {
-		logf(logTypeHandshake, "%s controllerLoop: waiting on select (dataToSend=%d buffered, socketRecords=%d buffered)", c.label(), len(c.dataToSend), len(c.socketRecords))
 		select {
 		case data := <-c.dataToSend:
 			// Encrypt and send data
-			logf(logTypeHandshake, "%s controllerLoop: ✓✓✓ RECEIVED data from dataToSend, len=%d", c.label(), len(data))
 			c.handleDataToSend(data)
-			logf(logTypeHandshake, "%s controllerLoop: ✓✓✓ finished handling dataToSend, len=%d", c.label(), len(data))
 
 		case pt := <-c.socketRecords:
 			// Record received from socket
-			logf(logTypeHandshake, "%s controllerLoop: ✓✓✓ RECEIVED record from socketReaderLoop, contentType=%v, epoch=%v, fragment_len=%d", c.label(), pt.contentType, pt.epoch, len(pt.fragment))
 			c.handleSocketRecord(pt)
-			logf(logTypeHandshake, "%s controllerLoop: ✓✓✓ finished processing record, contentType=%v", c.label(), pt.contentType)
 
 		case err := <-c.socketErrors:
-			// Socket error
-			logf(logTypeHandshake, "%s controllerLoop: received socket error: %v", c.label(), err)
-			// All errors are fatal for now
+			// Socket error - all errors are fatal for now
 			// TODO: Handle DecryptError that might be due to KeyUpdate by processing KeyUpdate first
 			select {
 			case c.errors <- err:
@@ -1717,19 +1693,15 @@ func (c *Conn) controllerLoop() {
 
 		case cmd := <-c.commands:
 			// Handle command
-			logf(logTypeHandshake, "%s controllerLoop: received command, type=%v", c.label(), cmd.cmdType)
 			c.handleCommand(cmd)
-			logf(logTypeHandshake, "%s controllerLoop: finished handling command", c.label())
 
 		case <-c.closed:
 			// Application closed connection
-			logf(logTypeHandshake, "%s controllerLoop: closed signal received, checking for pending commands", c.label())
 			// Wait for close command (it may arrive after c.closed is closed)
 			// Use a timeout to avoid deadlock if Close() is never called
 			select {
 			case cmd := <-c.commands:
 				if cmd.cmdType == cmdClose {
-					logf(logTypeHandshake, "%s controllerLoop: processing pending close command", c.label())
 					c.handleCloseCommand(cmd)
 				} else {
 					// Other command - send error
@@ -1737,19 +1709,15 @@ func (c *Conn) controllerLoop() {
 				}
 			case <-time.After(500 * time.Millisecond):
 				// No close command received within timeout, check one more time before proceeding
-				logf(logTypeHandshake, "%s controllerLoop: no close command received within timeout, checking one more time", c.label())
 				select {
 				case cmd := <-c.commands:
 					// Got the command after timeout - process it
 					if cmd.cmdType == cmdClose {
-						logf(logTypeHandshake, "%s controllerLoop: processing close command received after timeout", c.label())
 						c.handleCloseCommand(cmd)
 						// Wait for socketReaderLoop to exit
 						select {
 						case <-c.socketReaderDone:
-							logf(logTypeHandshake, "%s controllerLoop: socketReaderLoop exited", c.label())
 						case <-time.After(500 * time.Millisecond):
-							logf(logTypeHandshake, "%s controllerLoop: socketReaderLoop didn't exit in time, proceeding anyway", c.label())
 						}
 						return
 					} else {
@@ -1757,15 +1725,12 @@ func (c *Conn) controllerLoop() {
 					}
 				default:
 					// Still no command, proceed with cleanup
-					logf(logTypeHandshake, "%s controllerLoop: no close command received, proceeding with cleanup", c.label())
 					// Close socket to ensure socketReaderLoop can exit
 					c.conn.Close()
 					// Wait for socketReaderLoop to exit
 					select {
 					case <-c.socketReaderDone:
-						logf(logTypeHandshake, "%s controllerLoop: socketReaderLoop exited", c.label())
 					case <-time.After(500 * time.Millisecond):
-						logf(logTypeHandshake, "%s controllerLoop: socketReaderLoop didn't exit in time, proceeding anyway", c.label())
 					}
 					return
 				}
@@ -1774,12 +1739,9 @@ func (c *Conn) controllerLoop() {
 			c.conn.Close()
 
 			// Wait for socketReaderLoop to exit before closing controllerDone
-			logf(logTypeHandshake, "%s controllerLoop: waiting for socketReaderLoop to exit", c.label())
 			select {
 			case <-c.socketReaderDone:
-				logf(logTypeHandshake, "%s controllerLoop: socketReaderLoop exited, closing controllerDone", c.label())
 			case <-time.After(500 * time.Millisecond):
-				logf(logTypeHandshake, "%s controllerLoop: socketReaderLoop didn't exit in time, proceeding anyway", c.label())
 			}
 			return
 		}
@@ -1788,36 +1750,23 @@ func (c *Conn) controllerLoop() {
 
 // handleSocketRecord processes a record received from the socket
 func (c *Conn) handleSocketRecord(pt *TLSPlaintext) {
-	logf(logTypeHandshake, "%s handleSocketRecord() called: contentType=%v, len=%d, epoch=%v", c.label(), pt.contentType, len(pt.fragment), pt.epoch)
-	if inImpl, ok := c.in.(*DefaultRecordLayer); ok {
-		logf(logTypeHandshake, "%s handleSocketRecord() current in.cipher epoch=%s seq=%x", c.label(), inImpl.cipher.epoch.label(), inImpl.cipher.seq)
-	}
 	switch pt.contentType {
 	case RecordTypeHandshake:
 		// Process handshake message (KeyUpdate, etc.)
-		logf(logTypeHandshake, "%s handleSocketRecord() processing handshake record, fragment_len=%d", c.label(), len(pt.fragment))
 		c.processHandshakeRecord(pt)
-		logf(logTypeHandshake, "%s handleSocketRecord() finished processing handshake record", c.label())
 
 	case RecordTypeApplicationData:
 		// Decrypt and send to application
-		logf(logTypeHandshake, "%s handleSocketRecord() ✓✓✓ processing application data, len=%d, epoch=%v", c.label(), len(pt.fragment), pt.epoch)
-		if inImpl, ok := c.in.(*DefaultRecordLayer); ok {
-			logf(logTypeHandshake, "%s handleSocketRecord() current in.cipher epoch=%s seq=%x (before decryptRecord)", c.label(), inImpl.cipher.epoch.label(), inImpl.cipher.seq)
-		}
 		decrypted := c.decryptRecord(pt)
-		logf(logTypeHandshake, "%s handleSocketRecord() ✓✓✓ decrypted, len=%d, about to send to dataToReceive (channel len=%d, cap=%d)", c.label(), len(decrypted), len(c.dataToReceive), cap(c.dataToReceive))
 		select {
 		case c.dataToReceive <- decrypted:
 			// Successfully queued for application
-			logf(logTypeHandshake, "%s handleSocketRecord() ✓✓✓✓✓ SUCCESS: sent application data to dataToReceive channel, len=%d", c.label(), len(decrypted))
 		case <-c.closed:
 			// Connection closed, discard data
-			logf(logTypeHandshake, "%s handleSocketRecord() connection closed, discarding data", c.label())
 		default:
 			// Channel is full - should not happen in normal operation with 64KB buffer
 			// Send error to application
-			logf(logTypeHandshake, "%s handleSocketRecord() ⚠⚠⚠ WARNING: dataToReceive channel full! len=%d, cap=%d", c.label(), len(c.dataToReceive), cap(c.dataToReceive))
+			logf(logTypeHandshake, "%s handleSocketRecord() WARNING: dataToReceive channel full! len=%d, cap=%d", c.label(), len(c.dataToReceive), cap(c.dataToReceive))
 			select {
 			case c.errors <- errors.New("dataToReceive channel full"):
 			case <-c.closed:
@@ -1826,17 +1775,12 @@ func (c *Conn) handleSocketRecord(pt *TLSPlaintext) {
 
 	case RecordTypeAlert:
 		// Handle alert
-		logf(logTypeHandshake, "%s Processing alert record", c.label())
 		c.handleAlert(pt)
 	}
 }
 
 // handleDataToSend encrypts and sends data to the socket
 func (c *Conn) handleDataToSend(data []byte) {
-	logf(logTypeHandshake, "%s handleDataToSend() START: called, len=%d", c.label(), len(data))
-	if outImpl, ok := c.out.(*DefaultRecordLayer); ok {
-		logf(logTypeHandshake, "%s handleDataToSend() current out.cipher epoch=%s seq=%x", c.label(), outImpl.cipher.epoch.label(), outImpl.cipher.seq)
-	}
 	// Lock the output channel for thread safety
 	c.out.Lock()
 	defer c.out.Unlock()
@@ -1844,7 +1788,6 @@ func (c *Conn) handleDataToSend(data []byte) {
 	// Send full-size fragments
 	var start int
 	for start = 0; len(data)-start >= maxFragmentLen; start += maxFragmentLen {
-		logf(logTypeHandshake, "%s handleDataToSend() writing fragment [%d:%d], len=%d", c.label(), start, start+maxFragmentLen, maxFragmentLen)
 		err := c.out.WriteRecord(&TLSPlaintext{
 			contentType: RecordTypeApplicationData,
 			fragment:    data[start : start+maxFragmentLen],
@@ -1857,12 +1800,10 @@ func (c *Conn) handleDataToSend(data []byte) {
 			}
 			return
 		}
-		logf(logTypeHandshake, "%s handleDataToSend() ✓ wrote fragment [%d:%d]", c.label(), start, start+maxFragmentLen)
 	}
 
 	// Send a final partial fragment if necessary
 	if start < len(data) {
-		logf(logTypeHandshake, "%s handleDataToSend() writing final fragment [%d:%d], len=%d", c.label(), start, len(data), len(data)-start)
 		err := c.out.WriteRecord(&TLSPlaintext{
 			contentType: RecordTypeApplicationData,
 			fragment:    data[start:],
@@ -1875,16 +1816,11 @@ func (c *Conn) handleDataToSend(data []byte) {
 			}
 			return
 		}
-		logf(logTypeHandshake, "%s handleDataToSend() ✓ wrote final fragment [%d:%d]", c.label(), start, len(data))
 	}
-
-	logf(logTypeHandshake, "%s handleDataToSend() COMPLETE: sent all %d bytes to socket", c.label(), len(data))
-	return
 }
 
 // handleCommand processes a command from the application
 func (c *Conn) handleCommand(cmd controllerCommand) {
-	logf(logTypeHandshake, "%s handleCommand() called, cmdType=%v", c.label(), cmd.cmdType)
 	switch cmd.cmdType {
 	case cmdKeyUpdate:
 		c.handleKeyUpdateCommand(cmd)
@@ -1895,12 +1831,10 @@ func (c *Conn) handleCommand(cmd controllerCommand) {
 	default:
 		cmd.result <- commandResult{err: errors.New("unknown command")}
 	}
-	logf(logTypeHandshake, "%s handleCommand() returning", c.label())
 }
 
 // handleKeyUpdateCommand processes a KeyUpdate command
 func (c *Conn) handleKeyUpdateCommand(cmd controllerCommand) {
-	logf(logTypeHandshake, "%s handleKeyUpdateCommand() called, requestUpdate=%v", c.label(), cmd.requestUpdate)
 	if !c.handshakeComplete {
 		cmd.result <- commandResult{err: errors.New("cannot update keys until after handshake")}
 		return
@@ -1918,7 +1852,6 @@ func (c *Conn) handleKeyUpdateCommand(cmd controllerCommand) {
 		request = KeyUpdateRequested
 	}
 
-	logf(logTypeHandshake, "%s handleKeyUpdateCommand() calling state.KeyUpdate()", c.label())
 	// Create the key update and update state
 	actions, alert := (&c.state).KeyUpdate(request)
 	if alert != AlertNoAlert {
@@ -1927,76 +1860,28 @@ func (c *Conn) handleKeyUpdateCommand(cmd controllerCommand) {
 		return
 	}
 
-	logf(logTypeHandshake, "%s handleKeyUpdateCommand() taking %d actions", c.label(), len(actions))
-	if inImpl, ok := c.in.(*DefaultRecordLayer); ok {
-		if outImpl, ok2 := c.out.(*DefaultRecordLayer); ok2 {
-			logf(logTypeHandshake, "%s handleKeyUpdateCommand() BEFORE actions: in.epoch=%s in.seq=%x, out.epoch=%s out.seq=%x",
-				c.label(), inImpl.cipher.epoch.label(), inImpl.cipher.seq, outImpl.cipher.epoch.label(), outImpl.cipher.seq)
-		}
-	}
 	// Take actions (send key update and rekey)
-	for i, action := range actions {
-		logf(logTypeHandshake, "%s handleKeyUpdateCommand() taking action %d/%d: %T", c.label(), i+1, len(actions), action)
+	for _, action := range actions {
 		actionAlert := c.takeAction(action)
 		if actionAlert != AlertNoAlert {
 			c.sendAlert(actionAlert)
 			cmd.result <- commandResult{err: fmt.Errorf("alert during key update actions: %v", actionAlert)}
 			return
 		}
-		if inImpl, ok := c.in.(*DefaultRecordLayer); ok {
-			if outImpl, ok2 := c.out.(*DefaultRecordLayer); ok2 {
-				logf(logTypeHandshake, "%s handleKeyUpdateCommand() after action %d: in.epoch=%s in.seq=%x, out.epoch=%s out.seq=%x",
-					c.label(), i+1, inImpl.cipher.epoch.label(), inImpl.cipher.seq, outImpl.cipher.epoch.label(), outImpl.cipher.seq)
-			}
-		}
-	}
-	logf(logTypeHandshake, "%s handleKeyUpdateCommand() finished taking actions", c.label())
-	if inImpl, ok := c.in.(*DefaultRecordLayer); ok {
-		if outImpl, ok2 := c.out.(*DefaultRecordLayer); ok2 {
-			logf(logTypeHandshake, "%s handleKeyUpdateCommand() AFTER actions: in.epoch=%s in.seq=%x, out.epoch=%s out.seq=%x",
-				c.label(), inImpl.cipher.epoch.label(), inImpl.cipher.seq, outImpl.cipher.epoch.label(), outImpl.cipher.seq)
-		}
 	}
 
 	// If requestUpdate=true, we need to wait for peer's KeyUpdate response
 	if cmd.requestUpdate {
-		logf(logTypeHandshake, "%s handleKeyUpdateCommand() setting up wait for peer response", c.label())
-		// Create channel to wait for peer's KeyUpdate response
-		// Note: No mutex needed - controller is single-threaded and API is synchronous
-		if c.pendingKeyUpdateResponse != nil {
+		// Store result channel - will be signaled by processHandshakeRecord when response arrives
+		// Controller is single-threaded, so no mutex needed
+		if c.pendingKeyUpdateResult != nil {
 			// Already waiting for a KeyUpdate response - error
-			logf(logTypeHandshake, "%s handleKeyUpdateCommand() ERROR: already waiting for KeyUpdate response", c.label())
 			cmd.result <- commandResult{err: errors.New("KeyUpdate already in progress")}
 			return
 		}
-		c.pendingKeyUpdateResponse = make(chan struct{})
-		logf(logTypeHandshake, "%s handleKeyUpdateCommand() created pendingKeyUpdateResponse channel, KeyUpdate sent, waiting for peer response", c.label())
-
-		// Spawn a goroutine to wait for the response so we don't block the controller loop
-		// The controller loop must continue to process incoming socket records (including the KeyUpdate response)
-		go func() {
-			logf(logTypeHandshake, "%s handleKeyUpdateCommand() goroutine started, waiting for KeyUpdate response", c.label())
-			// Wait for peer's KeyUpdate response
-			// This will be signaled by processHandshakeRecord when it receives the KeyUpdate message
-			select {
-			case <-c.pendingKeyUpdateResponse:
-				// Peer's KeyUpdate response received and processed
-				logf(logTypeHandshake, "%s handleKeyUpdateCommand() goroutine: received KeyUpdate response signal!", c.label())
-				c.pendingKeyUpdateResponse = nil
-				cmd.result <- commandResult{err: nil}
-			case err := <-c.errors:
-				// Error occurred while waiting
-				logf(logTypeHandshake, "%s handleKeyUpdateCommand() goroutine: error while waiting: %v", c.label(), err)
-				c.pendingKeyUpdateResponse = nil
-				cmd.result <- commandResult{err: err}
-			case <-c.closed:
-				// Connection closed
-				logf(logTypeHandshake, "%s handleKeyUpdateCommand() goroutine: connection closed while waiting", c.label())
-				c.pendingKeyUpdateResponse = nil
-				cmd.result <- commandResult{err: io.EOF}
-			}
-		}()
-		logf(logTypeHandshake, "%s handleKeyUpdateCommand() returning, controller can continue processing", c.label())
+		c.pendingKeyUpdateResult = cmd.result
+		// Don't return - controller will continue processing and signal via pendingKeyUpdateResult
+		// when the response arrives in processHandshakeRecord
 		return
 	}
 
@@ -2033,6 +1918,7 @@ func (c *Conn) handleExtendedKeyUpdateCommand(cmd controllerCommand) {
 		cmd.result <- commandResult{err: errors.New("Extended Key Update already in progress")}
 		return
 	}
+	// Controller is single-threaded, so no mutex needed
 	if c.pendingEKUCallback != nil {
 		logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() ERROR: pendingEKUCallback already exists", c.label())
 		if cmd.callback != nil {
@@ -2074,6 +1960,7 @@ func (c *Conn) handleExtendedKeyUpdateCommand(cmd controllerCommand) {
 	}
 
 	// Store the callback - we'll invoke it when EKU completes (Message 2 and Message 4 received)
+	// Controller is single-threaded, so no mutex needed
 	c.pendingEKUCallback = cmd.callback
 	c.ekuMessageCount = 0 // 0 = waiting for Message 2, will be incremented to 1 when Message 2 arrives, then 2 when Message 4 arrives
 	logf(logTypeHandshake, "%s handleExtendedKeyUpdateCommand() EKU initiated: ekuInProgress=%v, ekuIsInitiator=%v, pendingEKUCallback=%v", c.label(), c.state.ekuInProgress, c.state.ekuIsInitiator, c.pendingEKUCallback != nil)
@@ -2193,8 +2080,8 @@ func (c *Conn) processHandshakeRecord(pt *TLSPlaintext) {
 			if _, ok := bodyGeneric.(*KeyUpdateBody); ok {
 				// This is a KeyUpdate message
 				// If we're waiting for a response, this is it (peer responds to our requestUpdate=true)
-				// Note: No mutex needed - controller is single-threaded
-				if c.pendingKeyUpdateResponse != nil {
+				// Controller is single-threaded, so no mutex needed
+				if c.pendingKeyUpdateResult != nil {
 					isKeyUpdateResponse = true
 				}
 			} else if ekuBody, ok := bodyGeneric.(*ExtendedKeyUpdateBody); ok {
@@ -2202,8 +2089,11 @@ func (c *Conn) processHandshakeRecord(pt *TLSPlaintext) {
 				// If we're waiting for EKU response and we're the initiator:
 				// - Message 2 (Response): Signal after processing
 				// - Message 4 (NewKeyUpdate from responder): Signal after processing
-				if c.pendingEKUCallback != nil {
-					logf(logTypeHandshake, "%s processHandshakeRecord() EKU message: type=%v, ekuInProgress=%v, ekuIsInitiator=%v, ekuMessageCount=%d", c.label(), ekuBody.EKUType, c.state.ekuInProgress, c.state.ekuIsInitiator, c.ekuMessageCount)
+				// Controller is single-threaded, so no mutex needed
+				hasPendingCallback := c.pendingEKUCallback != nil
+				ekuMsgCount := c.ekuMessageCount
+				if hasPendingCallback {
+					logf(logTypeHandshake, "%s processHandshakeRecord() EKU message: type=%v, ekuInProgress=%v, ekuIsInitiator=%v, ekuMessageCount=%d", c.label(), ekuBody.EKUType, c.state.ekuInProgress, c.state.ekuIsInitiator, ekuMsgCount)
 					if ekuBody.EKUType == ExtendedKeyUpdateTypeResponse && c.state.ekuInProgress && c.state.ekuIsInitiator {
 						// Message 2: Response to our request
 						logf(logTypeHandshake, "%s processHandshakeRecord() identified as Message 2 (Response)", c.label())
@@ -2228,15 +2118,17 @@ func (c *Conn) processHandshakeRecord(pt *TLSPlaintext) {
 			logf(logTypeHandshake, "%s processHandshakeRecord() ERROR in state transition: %v", c.label(), alert)
 			c.sendAlert(alert)
 			// Clean up pending EKU callback if EKU was in progress
-			if c.pendingEKUCallback != nil {
+			// Controller is single-threaded, so no mutex needed
+			callback := c.pendingEKUCallback
+			c.pendingEKUCallback = nil
+			c.ekuMessageCount = 0
+			if callback != nil {
 				logf(logTypeHandshake, "%s processHandshakeRecord() cleaning up pendingEKUCallback due to error", c.label())
 				result := EKUResult{
 					Success: false,
 					Error:   fmt.Errorf("EKU failed: %v", alert),
 				}
-				c.pendingEKUCallback(result)
-				c.pendingEKUCallback = nil
-				c.ekuMessageCount = 0
+				callback(result)
 			}
 			// No pending EKU command, send to errors channel for other error handlers
 			select {
@@ -2249,10 +2141,13 @@ func (c *Conn) processHandshakeRecord(pt *TLSPlaintext) {
 		// Check if tie-breaking switched us to responder
 		// If we were initiator before and are responder now, clear the callback
 		// (responder doesn't need a callback, only initiator does)
-		if wasInitiatorBefore && c.pendingEKUCallback != nil && !c.state.ekuIsInitiator && c.state.ekuInProgress {
-			logf(logTypeHandshake, "%s processHandshakeRecord() tie-breaking switched us to responder (wasInitiator=%v, nowInitiator=%v) - clearing pendingEKUCallback", c.label(), wasInitiatorBefore, c.state.ekuIsInitiator)
-			c.pendingEKUCallback = nil
-			c.ekuMessageCount = 0
+		// Controller is single-threaded, so no mutex needed
+		if wasInitiatorBefore && !c.state.ekuIsInitiator && c.state.ekuInProgress {
+			if c.pendingEKUCallback != nil {
+				c.pendingEKUCallback = nil
+				c.ekuMessageCount = 0
+				logf(logTypeHandshake, "%s processHandshakeRecord() tie-breaking switched us to responder (wasInitiator=%v, nowInitiator=%v) - clearing pendingEKUCallback", c.label(), wasInitiatorBefore, c.state.ekuIsInitiator)
+			}
 		}
 		// Take actions (rekey, send response, etc.)
 		for i, action := range actions {
@@ -2261,15 +2156,17 @@ func (c *Conn) processHandshakeRecord(pt *TLSPlaintext) {
 				logf(logTypeHandshake, "%s processHandshakeRecord() ERROR during handshake action[%d]: %v", c.label(), i, actionAlert)
 				c.sendAlert(actionAlert)
 				// Clean up pending EKU callback if EKU was in progress
-				if c.pendingEKUCallback != nil {
+				// Controller is single-threaded, so no mutex needed
+				callback := c.pendingEKUCallback
+				c.pendingEKUCallback = nil
+				c.ekuMessageCount = 0
+				if callback != nil {
 					logf(logTypeHandshake, "%s processHandshakeRecord() cleaning up pendingEKUCallback due to action error", c.label())
 					result := EKUResult{
 						Success: false,
 						Error:   fmt.Errorf("EKU failed during action: %v", actionAlert),
 					}
-					c.pendingEKUCallback(result)
-					c.pendingEKUCallback = nil
-					c.ekuMessageCount = 0
+					callback(result)
 				}
 				// No pending EKU command, send to errors channel for other error handlers
 				select {
@@ -2280,9 +2177,19 @@ func (c *Conn) processHandshakeRecord(pt *TLSPlaintext) {
 			}
 		}
 
-		// Update state
+		// Update state (controller is single-threaded)
 		var connected bool
 		c.state, connected = state.(stateConnected)
+		// Send state update to channel for API readers (non-blocking, drops old value if channel full)
+		if connected {
+			select {
+			case c.stateUpdates <- c.state:
+			default:
+				// Channel full, replace with latest state
+				<-c.stateUpdates
+				c.stateUpdates <- c.state
+			}
+		}
 		if !connected {
 			logf(logTypeHandshake, "Disconnected after state transition: state type=%T, alert=%v", state, alert)
 			// Log more details about what went wrong
@@ -2292,15 +2199,17 @@ func (c *Conn) processHandshakeRecord(pt *TLSPlaintext) {
 				logf(logTypeHandshake, "State is not stateConnected: %T", state)
 			}
 			// Clean up pending EKU callback if EKU was in progress
-			if c.pendingEKUCallback != nil {
+			// Controller is single-threaded, so no mutex needed
+			callback := c.pendingEKUCallback
+			c.pendingEKUCallback = nil
+			c.ekuMessageCount = 0
+			if callback != nil {
 				logf(logTypeHandshake, "%s processHandshakeRecord() cleaning up pendingEKUCallback due to disconnection", c.label())
 				result := EKUResult{
 					Success: false,
 					Error:   fmt.Errorf("disconnected after state transition: state type=%T", state),
 				}
-				c.pendingEKUCallback(result)
-				c.pendingEKUCallback = nil
-				c.ekuMessageCount = 0
+				callback(result)
 			}
 			// No pending EKU command, send to errors channel for other error handlers
 			select {
@@ -2312,16 +2221,21 @@ func (c *Conn) processHandshakeRecord(pt *TLSPlaintext) {
 
 		// If this was a KeyUpdate response we were waiting for, signal completion
 		if isKeyUpdateResponse {
-			// Note: No mutex needed - controller is single-threaded
-			if c.pendingKeyUpdateResponse != nil {
-				close(c.pendingKeyUpdateResponse)
-				c.pendingKeyUpdateResponse = nil
+			// Controller is single-threaded, so no mutex needed
+			if c.pendingKeyUpdateResult != nil {
+				resultChan := c.pendingKeyUpdateResult
+				c.pendingKeyUpdateResult = nil
+				select {
+				case resultChan <- commandResult{err: nil}:
+				default:
+					// Channel already closed or result already sent
+				}
 			}
 		}
 
 		// If this was an EKU message we were waiting for, signal completion
+		// Controller is single-threaded, so no mutex needed
 		if isEKUResponse {
-			// Note: No mutex needed - controller is single-threaded
 			if c.pendingEKUCallback != nil {
 				oldCount := c.ekuMessageCount
 				c.ekuMessageCount++
@@ -2427,38 +2341,62 @@ func (c *Conn) handleAlert(pt *TLSPlaintext) {
 	}
 }
 
+// getLatestState returns the latest state snapshot from the channel, or current state if channel is empty
+// The channel (buffered size 1) always contains the latest state snapshot from the controller
+func (c *Conn) getLatestState() stateConnected {
+	select {
+	case state := <-c.stateUpdates:
+		// Got latest state from channel, put it back immediately for other readers
+		// This ensures the channel always contains the latest state
+		select {
+		case c.stateUpdates <- state:
+		default:
+			// Shouldn't happen since channel is size 1 and we just read from it
+		}
+		return state
+	default:
+		// Channel empty (controller hasn't started or no updates yet), use current state
+		return c.state
+	}
+}
+
 func (c *Conn) ComputeExporter(label string, context []byte, keyLength int) ([]byte, error) {
 	_, connected := c.hState.(stateConnected)
 	if !connected {
 		return nil, fmt.Errorf("Cannot compute exporter when state is not connected")
 	}
 
-	if c.state.exporterSecret == nil {
+	state := c.getLatestState()
+	if state.exporterSecret == nil {
 		return nil, fmt.Errorf("Internal error: no exporter secret")
 	}
 
-	h0 := c.state.cryptoParams.Hash.New().Sum(nil)
-	tmpSecret := deriveSecret(c.state.cryptoParams, c.state.exporterSecret, label, h0)
+	cryptoParams := state.cryptoParams
+	exporterSecret := state.exporterSecret
 
-	hc := c.state.cryptoParams.Hash.New().Sum(context)
-	return HkdfExpandLabel(c.state.cryptoParams.Hash, tmpSecret, "exporter", hc, keyLength), nil
+	h0 := cryptoParams.Hash.New().Sum(nil)
+	tmpSecret := deriveSecret(cryptoParams, exporterSecret, label, h0)
+
+	hc := cryptoParams.Hash.New().Sum(context)
+	return HkdfExpandLabel(cryptoParams.Hash, tmpSecret, "exporter", hc, keyLength), nil
 }
 
 func (c *Conn) ConnectionState() ConnectionState {
-	state := ConnectionState{
+	result := ConnectionState{
 		HandshakeState: c.GetHsState(),
 	}
 
 	if c.handshakeComplete {
-		state.CipherSuite = cipherSuiteMap[c.state.Params.CipherSuite]
-		state.NextProto = c.state.Params.NextProto
-		state.VerifiedChains = c.state.verifiedChains
-		state.PeerCertificates = c.state.peerCertificates
-		state.UsingPSK = c.state.Params.UsingPSK
-		state.UsingEarlyData = c.state.Params.UsingEarlyData
+		state := c.getLatestState()
+		result.CipherSuite = cipherSuiteMap[state.Params.CipherSuite]
+		result.NextProto = state.Params.NextProto
+		result.VerifiedChains = state.verifiedChains
+		result.PeerCertificates = state.peerCertificates
+		result.UsingPSK = state.Params.UsingPSK
+		result.UsingEarlyData = state.Params.UsingEarlyData
 	}
 
-	return state
+	return result
 }
 
 func (c *Conn) Writable() bool {
